@@ -1,6 +1,6 @@
-## NBTCA TUI 服务中心（ICS 日历模块）
+# TUT - TUI Utility Tools (WIP)
 
-使用 C++ 编写的终端 TUI 程序，从 `https://ical.nbtca.space/nbtca.ics` 获取 iCal 日历，解析并以 ncurses 在终端中直观展示**未来一个月**的活动。
+This project, "TUT," is a collection of TUI (Terminal User Interface) utility modules written in C++. The initial focus is on the integrated **ICS Calendar Module**. This module fetches, parses, and displays iCal calendar events from `https://ical.nbtca.space/nbtca.ics` using `ncurses` to show upcoming activities within the next month.
 
 ### 依赖
 
