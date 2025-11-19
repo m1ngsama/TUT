@@ -53,10 +53,10 @@ RM = /opt/homebrew/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /Users/m1ng/code/lab/TUT
+CMAKE_SOURCE_DIR = /Users/m1ng/code/github/m1ngsama/TUT
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /Users/m1ng/code/lab/TUT/build
+CMAKE_BINARY_DIR = /Users/m1ng/code/github/m1ngsama/TUT/build
 
 # Include any dependencies generated for this target.
 include CMakeFiles/nbtca_tui.dir/depend.make
@@ -73,67 +73,82 @@ CMakeFiles/nbtca_tui.dir/codegen:
 .PHONY : CMakeFiles/nbtca_tui.dir/codegen
 
 CMakeFiles/nbtca_tui.dir/src/main.cpp.o: CMakeFiles/nbtca_tui.dir/flags.make
-CMakeFiles/nbtca_tui.dir/src/main.cpp.o: /Users/m1ng/code/lab/TUT/src/main.cpp
+CMakeFiles/nbtca_tui.dir/src/main.cpp.o: /Users/m1ng/code/github/m1ngsama/TUT/src/main.cpp
 CMakeFiles/nbtca_tui.dir/src/main.cpp.o: CMakeFiles/nbtca_tui.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/nbtca_tui.dir/src/main.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/main.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/main.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/main.cpp.o -c /Users/m1ng/code/lab/TUT/src/main.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/nbtca_tui.dir/src/main.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/main.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/main.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/main.cpp.o -c /Users/m1ng/code/github/m1ngsama/TUT/src/main.cpp
 
 CMakeFiles/nbtca_tui.dir/src/main.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/nbtca_tui.dir/src/main.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/lab/TUT/src/main.cpp > CMakeFiles/nbtca_tui.dir/src/main.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/github/m1ngsama/TUT/src/main.cpp > CMakeFiles/nbtca_tui.dir/src/main.cpp.i
 
 CMakeFiles/nbtca_tui.dir/src/main.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/nbtca_tui.dir/src/main.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/lab/TUT/src/main.cpp -o CMakeFiles/nbtca_tui.dir/src/main.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/github/m1ngsama/TUT/src/main.cpp -o CMakeFiles/nbtca_tui.dir/src/main.cpp.s
 
 CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o: CMakeFiles/nbtca_tui.dir/flags.make
-CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o: /Users/m1ng/code/lab/TUT/src/ics_fetcher.cpp
+CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o: /Users/m1ng/code/github/m1ngsama/TUT/src/ics_fetcher.cpp
 CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o: CMakeFiles/nbtca_tui.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o -c /Users/m1ng/code/lab/TUT/src/ics_fetcher.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o -c /Users/m1ng/code/github/m1ngsama/TUT/src/ics_fetcher.cpp
 
 CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/lab/TUT/src/ics_fetcher.cpp > CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/github/m1ngsama/TUT/src/ics_fetcher.cpp > CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.i
 
 CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/lab/TUT/src/ics_fetcher.cpp -o CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/github/m1ngsama/TUT/src/ics_fetcher.cpp -o CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.s
 
 CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o: CMakeFiles/nbtca_tui.dir/flags.make
-CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o: /Users/m1ng/code/lab/TUT/src/ics_parser.cpp
+CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o: /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.cpp
 CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o: CMakeFiles/nbtca_tui.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o -c /Users/m1ng/code/lab/TUT/src/ics_parser.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o -c /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.cpp
 
 CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/lab/TUT/src/ics_parser.cpp > CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.cpp > CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.i
 
 CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/lab/TUT/src/ics_parser.cpp -o CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.cpp -o CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.s
 
 CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o: CMakeFiles/nbtca_tui.dir/flags.make
-CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o: /Users/m1ng/code/lab/TUT/src/tui_view.cpp
+CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o: /Users/m1ng/code/github/m1ngsama/TUT/src/tui_view.cpp
 CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o: CMakeFiles/nbtca_tui.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o -c /Users/m1ng/code/lab/TUT/src/tui_view.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o -c /Users/m1ng/code/github/m1ngsama/TUT/src/tui_view.cpp
 
 CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/lab/TUT/src/tui_view.cpp > CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/github/m1ngsama/TUT/src/tui_view.cpp > CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.i
 
 CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/lab/TUT/src/tui_view.cpp -o CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/github/m1ngsama/TUT/src/tui_view.cpp -o CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.s
+
+CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o: CMakeFiles/nbtca_tui.dir/flags.make
+CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o: /Users/m1ng/code/github/m1ngsama/TUT/src/calendar.cpp
+CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o: CMakeFiles/nbtca_tui.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building CXX object CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o -MF CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o.d -o CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o -c /Users/m1ng/code/github/m1ngsama/TUT/src/calendar.cpp
+
+CMakeFiles/nbtca_tui.dir/src/calendar.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/nbtca_tui.dir/src/calendar.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/m1ng/code/github/m1ngsama/TUT/src/calendar.cpp > CMakeFiles/nbtca_tui.dir/src/calendar.cpp.i
+
+CMakeFiles/nbtca_tui.dir/src/calendar.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/nbtca_tui.dir/src/calendar.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/m1ng/code/github/m1ngsama/TUT/src/calendar.cpp -o CMakeFiles/nbtca_tui.dir/src/calendar.cpp.s
 
 # Object files for target nbtca_tui
 nbtca_tui_OBJECTS = \
 "CMakeFiles/nbtca_tui.dir/src/main.cpp.o" \
 "CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o" \
 "CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o" \
-"CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o"
+"CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o" \
+"CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o"
 
 # External object files for target nbtca_tui
 nbtca_tui_EXTERNAL_OBJECTS =
@@ -142,13 +157,14 @@ nbtca_tui: CMakeFiles/nbtca_tui.dir/src/main.cpp.o
 nbtca_tui: CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o
 nbtca_tui: CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o
 nbtca_tui: CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o
+nbtca_tui: CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o
 nbtca_tui: CMakeFiles/nbtca_tui.dir/build.make
-nbtca_tui: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd
-nbtca_tui: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libform.tbd
+nbtca_tui: /opt/homebrew/opt/ncurses/lib/libncursesw.dylib
+nbtca_tui: /opt/homebrew/opt/ncurses/lib/libformw.dylib
 nbtca_tui: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd
 nbtca_tui: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd
 nbtca_tui: CMakeFiles/nbtca_tui.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX executable nbtca_tui"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Linking CXX executable nbtca_tui"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/nbtca_tui.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
@@ -160,6 +176,6 @@ CMakeFiles/nbtca_tui.dir/clean:
 .PHONY : CMakeFiles/nbtca_tui.dir/clean
 
 CMakeFiles/nbtca_tui.dir/depend:
-	cd /Users/m1ng/code/lab/TUT/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /Users/m1ng/code/lab/TUT /Users/m1ng/code/lab/TUT /Users/m1ng/code/lab/TUT/build /Users/m1ng/code/lab/TUT/build /Users/m1ng/code/lab/TUT/build/CMakeFiles/nbtca_tui.dir/DependInfo.cmake "--color=$(COLOR)"
+	cd /Users/m1ng/code/github/m1ngsama/TUT/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /Users/m1ng/code/github/m1ngsama/TUT /Users/m1ng/code/github/m1ngsama/TUT /Users/m1ng/code/github/m1ngsama/TUT/build /Users/m1ng/code/github/m1ngsama/TUT/build /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/nbtca_tui.dir/DependInfo.cmake "--color=$(COLOR)"
 .PHONY : CMakeFiles/nbtca_tui.dir/depend
 

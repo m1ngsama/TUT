@@ -57,10 +57,10 @@ RM = /opt/homebrew/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /Users/m1ng/code/lab/TUT
+CMAKE_SOURCE_DIR = /Users/m1ng/code/github/m1ngsama/TUT
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /Users/m1ng/code/lab/TUT/build
+CMAKE_BINARY_DIR = /Users/m1ng/code/github/m1ngsama/TUT/build
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /Users/m1ng/code/lab/TUT/build/CMakeFiles /Users/m1ng/code/lab/TUT/build//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles /Users/m1ng/code/github/m1ngsama/TUT/build//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /Users/m1ng/code/lab/TUT/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -128,6 +128,30 @@ nbtca_tui: cmake_check_build_system
 nbtca_tui/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/nbtca_tui.dir/build.make CMakeFiles/nbtca_tui.dir/build
 .PHONY : nbtca_tui/fast
+
+src/calendar.o: src/calendar.cpp.o
+.PHONY : src/calendar.o
+
+# target to build an object file
+src/calendar.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/nbtca_tui.dir/build.make CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o
+.PHONY : src/calendar.cpp.o
+
+src/calendar.i: src/calendar.cpp.i
+.PHONY : src/calendar.i
+
+# target to preprocess a source file
+src/calendar.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/nbtca_tui.dir/build.make CMakeFiles/nbtca_tui.dir/src/calendar.cpp.i
+.PHONY : src/calendar.cpp.i
+
+src/calendar.s: src/calendar.cpp.s
+.PHONY : src/calendar.s
+
+# target to generate assembly for a file
+src/calendar.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/nbtca_tui.dir/build.make CMakeFiles/nbtca_tui.dir/src/calendar.cpp.s
+.PHONY : src/calendar.cpp.s
 
 src/ics_fetcher.o: src/ics_fetcher.cpp.o
 .PHONY : src/ics_fetcher.o
@@ -234,6 +258,9 @@ help:
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
 	@echo "... nbtca_tui"
+	@echo "... src/calendar.o"
+	@echo "... src/calendar.i"
+	@echo "... src/calendar.s"
 	@echo "... src/ics_fetcher.o"
 	@echo "... src/ics_fetcher.i"
 	@echo "... src/ics_fetcher.s"
