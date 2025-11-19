@@ -1,7 +1,7 @@
 CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o: \
-  /Users/m1ng/code/lab/TUT/src/tui_view.cpp \
-  /Users/m1ng/code/lab/TUT/src/tui_view.h \
-  /Users/m1ng/code/lab/TUT/src/ics_parser.h \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/tui_view.cpp \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/tui_view.h \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/chrono \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__assert \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__assertion_handler \
@@ -947,11 +947,10 @@ CMakeFiles/nbtca_tui.dir/src/tui_view.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__functional/pointer_to_binary_function.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__functional/pointer_to_unary_function.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__functional/unary_negate.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/curses.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ncurses_dll.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/AvailabilityMacros.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/TargetConditionals.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/unctrl.h \
+  /opt/homebrew/opt/ncurses/include/curses.h \
+  /opt/homebrew/opt/ncurses/include/ncursesw/ncurses_dll.h \
+  /opt/homebrew/opt/ncurses/include/ncursesw/unctrl.h \
+  /opt/homebrew/opt/ncurses/include/ncursesw/curses.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/iomanip \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/istream \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/ostream \

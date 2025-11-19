@@ -103,4 +103,59 @@ void run_tui(const std::vector<IcsEvent> &events) {
     endwin();
 }
 
+int run_portal_tui() {
+    setlocale(LC_ALL, "");
+
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(0);
+
+    std::vector<std::string> menu_items = {"Calendar", "Exit"};
+    int selected = 0;
+    int choice = -1;
+
+    while (choice == -1) {
+        clear();
+        mvprintw(0, 0, "TUT - Feature Portal (q or Enter to select)");
+
+        for (size_t i = 0; i < menu_items.size(); ++i) {
+            if ((int)i == selected) {
+                attron(A_REVERSE);
+            }
+            mvprintw(i + 2, 2, "%s", menu_items[i].c_str());
+            if ((int)i == selected) {
+                attroff(A_REVERSE);
+            }
+        }
+
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case KEY_UP:
+                if (selected > 0) {
+                    selected--;
+                }
+                break;
+            case KEY_DOWN:
+                if (selected < (int)menu_items.size() - 1) {
+                    selected++;
+                }
+                break;
+            case 'q':
+            case 'Q':
+                choice = 1; // Corresponds to "Exit"
+                break;
+            case 10: // Enter key
+                choice = selected;
+                break;
+        }
+    }
+
+    endwin();
+    return choice;
+}
+
 
