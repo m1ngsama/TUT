@@ -10,3 +10,6 @@ void run_tui(const std::vector<IcsEvent> &events);
 // 运行 ncurses TUI for the portal
 int run_portal_tui();
 
+// 显示启动画面
+void display_splash_screen();
+
