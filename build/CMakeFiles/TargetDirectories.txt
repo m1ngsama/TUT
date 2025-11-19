@@ -1,0 +1,3 @@
+/Users/m1ng/code/lab/TUT/build/CMakeFiles/nbtca_tui.dir
+/Users/m1ng/code/lab/TUT/build/CMakeFiles/edit_cache.dir
+/Users/m1ng/code/lab/TUT/build/CMakeFiles/rebuild_cache.dir
