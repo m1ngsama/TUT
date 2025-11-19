@@ -93,9 +93,9 @@ void run_tui(const std::vector<IcsEvent> &events) {
         int ch = getch();
         if (ch == 'q' || ch == 'Q') {
             break;
-        } else if (ch == KEY_UP) {
+        } else if (ch == KEY_UP || ch == 'k') {
             if (selected > 0) selected--;
-        } else if (ch == KEY_DOWN) {
+        } else if (ch == KEY_DOWN || ch == 'j') {
             if (selected + 1 < (int)events.size()) selected++;
         }
     }
@@ -135,11 +135,13 @@ int run_portal_tui() {
         int ch = getch();
         switch (ch) {
             case KEY_UP:
+            case 'k':
                 if (selected > 0) {
                     selected--;
                 }
                 break;
             case KEY_DOWN:
+            case 'j':
                 if (selected < (int)menu_items.size() - 1) {
                     selected++;
                 }
