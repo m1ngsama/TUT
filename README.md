@@ -48,6 +48,21 @@ cmake --build .
 - `↑` / `↓`：上下移动选中事件
 - `q`：退出程序
 
+### Developer Guide
+
+For contributors and developers, follow these guidelines:
+
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/m1ngsama/TUT.git
+    cd TUT
+    ```
+2.  **Build Environment Setup:** Ensure all [Dependencies](#dependencies) are installed.
+3.  **Local Build:** Follow the [构建](#构建) instructions.
+4.  **Code Style:** Adhere to the existing code style in `src/`.
+5.  **Testing:** Currently, there are no automated tests. Please manually verify changes.
+6.  **Contributing:** Submit Pull Requests for new features or bug fixes.
+
 ### 版本 (Version)
 
 - `v0.0.1`
