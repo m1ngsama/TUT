@@ -16,6 +16,7 @@ add_executable(nbtca_tui
     src/ics_fetcher.cpp
     src/ics_parser.cpp
     src/tui_view.cpp
+    src/calendar.cpp
 )
 
 target_include_directories(nbtca_tui PRIVATE ${CURSES_INCLUDE_DIR})

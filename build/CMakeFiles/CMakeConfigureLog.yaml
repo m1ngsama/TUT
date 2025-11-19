@@ -294,7 +294,7 @@ events:
       Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "a.out"
       
       The CXX compiler identification is AppleClang, found in:
-        /Users/m1ng/code/lab/TUT/build/CMakeFiles/4.1.2/CompilerIdCXX/a.out
+        /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/4.1.2/CompilerIdCXX/a.out
       
   -
     kind: "message-v1"
@@ -1133,8 +1133,8 @@ events:
     checks:
       - "Detecting CXX compiler ABI info"
     directories:
-      source: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI"
-      binary: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI"
+      source: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM"
+      binary: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM"
     cmakeVariables:
       CMAKE_CXX_FLAGS: ""
       CMAKE_CXX_FLAGS_DEBUG: "-g"
@@ -1147,19 +1147,19 @@ events:
       variable: "CMAKE_CXX_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: '/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI'
+        Change Dir: '/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM'
         
-        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_81beb/fast
-        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_81beb.dir/build.make CMakeFiles/cmTC_81beb.dir/build
-        Building CXX object CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o
-        /usr/bin/c++   -arch arm64   -v -Wl,-v -MD -MT CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -c /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_67f08/fast
+        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_67f08.dir/build.make CMakeFiles/cmTC_67f08.dir/build
+        Building CXX object CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o
+        /usr/bin/c++   -arch arm64   -v -Wl,-v -MD -MT CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -c /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp
         Apple clang version 16.0.0 (clang-1600.0.26.6)
         Target: arm64-apple-darwin24.2.0
         Thread model: posix
         InstalledDir: /Library/Developer/CommandLineTools/usr/bin
         clang++: warning: -Wl,-v: 'linker' input unused [-Wunused-command-line-argument]
         ignoring nonexistent directory "/Library/Developer/CommandLineTools/usr/bin/../include/c++/v1"
-         "/Library/Developer/CommandLineTools/usr/bin/clang" -cc1 -triple arm64-apple-macosx15.0.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -mrelax-all -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -target-sdk-version=15.2 -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +crc -target-feature +dotprod -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +lse -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sha2 -target-feature +sha3 -target-feature +neon -target-feature +zcm -target-feature +zcz -target-feature +fullfp16 -target-abi darwinpcs -debugger-tuning=lldb -target-linker-version 1115.7.3 -v -fcoverage-compilation-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI -resource-dir /Library/Developer/CommandLineTools/usr/lib/clang/16 -dependency-file CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1 -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/usr/lib/clang/16/include -internal-externc-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include -internal-externc-isystem /Library/Developer/CommandLineTools/usr/include -Wno-reorder-init-list -Wno-implicit-int-float-conversion -Wno-c99-designator -Wno-final-dtor-non-final-class -Wno-extra-semi-stmt -Wno-misleading-indentation -Wno-quoted-include-in-framework-header -Wno-implicit-fallthrough -Wno-enum-enum-conversion -Wno-enum-float-conversion -Wno-elaborated-enum-base -Wno-reserved-identifier -Wno-gnu-folding-constant -fdeprecated-macro -fdebug-compilation-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fno-cxx-modules -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -x c++ /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp
+         "/Library/Developer/CommandLineTools/usr/bin/clang" -cc1 -triple arm64-apple-macosx15.0.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -mrelax-all -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -target-sdk-version=15.2 -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +crc -target-feature +dotprod -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +lse -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sha2 -target-feature +sha3 -target-feature +neon -target-feature +zcm -target-feature +zcz -target-feature +fullfp16 -target-abi darwinpcs -debugger-tuning=lldb -target-linker-version 1115.7.3 -v -fcoverage-compilation-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM -resource-dir /Library/Developer/CommandLineTools/usr/lib/clang/16 -dependency-file CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1 -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/usr/lib/clang/16/include -internal-externc-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include -internal-externc-isystem /Library/Developer/CommandLineTools/usr/include -Wno-reorder-init-list -Wno-implicit-int-float-conversion -Wno-c99-designator -Wno-final-dtor-non-final-class -Wno-extra-semi-stmt -Wno-misleading-indentation -Wno-quoted-include-in-framework-header -Wno-implicit-fallthrough -Wno-enum-enum-conversion -Wno-enum-float-conversion -Wno-elaborated-enum-base -Wno-reserved-identifier -Wno-gnu-folding-constant -fdeprecated-macro -fdebug-compilation-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fno-cxx-modules -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -x c++ /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp
         clang -cc1 version 16.0.0 (clang-1600.0.26.6) default target arm64-apple-darwin24.2.0
         ignoring nonexistent directory "/usr/local/include"
         ignoring nonexistent directory "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/local/include"
@@ -1172,13 +1172,13 @@ events:
          /Library/Developer/CommandLineTools/usr/include
          /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks (framework directory)
         End of search list.
-        Linking CXX executable cmTC_81beb
-        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_81beb.dir/link.txt --verbose=1
+        Linking CXX executable cmTC_67f08
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_67f08.dir/link.txt --verbose=1
         Apple clang version 16.0.0 (clang-1600.0.26.6)
         Target: arm64-apple-darwin24.2.0
         Thread model: posix
         InstalledDir: /Library/Developer/CommandLineTools/usr/bin
-         "/Library/Developer/CommandLineTools/usr/bin/ld" -demangle -lto_library /Library/Developer/CommandLineTools/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 15.0.0 15.2 -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_81beb -L/usr/local/lib -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -lc++ -lSystem /Library/Developer/CommandLineTools/usr/lib/clang/16/lib/darwin/libclang_rt.osx.a
+         "/Library/Developer/CommandLineTools/usr/bin/ld" -demangle -lto_library /Library/Developer/CommandLineTools/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 15.0.0 15.2 -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_67f08 -L/usr/local/lib -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -lc++ -lSystem /Library/Developer/CommandLineTools/usr/lib/clang/16/lib/darwin/libclang_rt.osx.a
         @(#)PROGRAM:ld PROJECT:ld-1115.7.3
         BUILD 23:52:02 Dec  5 2024
         configured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em
@@ -1190,7 +1190,7 @@ events:
         	/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/swift
         Framework search paths:
         	/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks
-        /usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names  -v -Wl,-v CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -o cmTC_81beb
+        /usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names  -v -Wl,-v CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -o cmTC_67f08
         
       exitCode: 0
   -
@@ -1234,19 +1234,19 @@ events:
       Parsed CXX implicit link information:
         link line regex: [^( *|.*[/\\])(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
         linker tool regex: [^[ 	]*(->|")?[ 	]*(([^"]*[/\\])?(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)))("|,| |$)]
-        ignore line: [Change Dir: '/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI']
+        ignore line: [Change Dir: '/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM']
         ignore line: []
-        ignore line: [Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_81beb/fast]
-        ignore line: [/Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_81beb.dir/build.make CMakeFiles/cmTC_81beb.dir/build]
-        ignore line: [Building CXX object CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o]
-        ignore line: [/usr/bin/c++   -arch arm64   -v -Wl -v -MD -MT CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -c /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_67f08/fast]
+        ignore line: [/Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_67f08.dir/build.make CMakeFiles/cmTC_67f08.dir/build]
+        ignore line: [Building CXX object CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o]
+        ignore line: [/usr/bin/c++   -arch arm64   -v -Wl -v -MD -MT CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -c /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp]
         ignore line: [Apple clang version 16.0.0 (clang-1600.0.26.6)]
         ignore line: [Target: arm64-apple-darwin24.2.0]
         ignore line: [Thread model: posix]
         ignore line: [InstalledDir: /Library/Developer/CommandLineTools/usr/bin]
         ignore line: [clang++: warning: -Wl -v: 'linker' input unused [-Wunused-command-line-argument]]
         ignore line: [ignoring nonexistent directory "/Library/Developer/CommandLineTools/usr/bin/../include/c++/v1"]
-        ignore line: [ "/Library/Developer/CommandLineTools/usr/bin/clang" -cc1 -triple arm64-apple-macosx15.0.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -mrelax-all -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -target-sdk-version=15.2 -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +crc -target-feature +dotprod -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +lse -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sha2 -target-feature +sha3 -target-feature +neon -target-feature +zcm -target-feature +zcz -target-feature +fullfp16 -target-abi darwinpcs -debugger-tuning=lldb -target-linker-version 1115.7.3 -v -fcoverage-compilation-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI -resource-dir /Library/Developer/CommandLineTools/usr/lib/clang/16 -dependency-file CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1 -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/usr/lib/clang/16/include -internal-externc-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include -internal-externc-isystem /Library/Developer/CommandLineTools/usr/include -Wno-reorder-init-list -Wno-implicit-int-float-conversion -Wno-c99-designator -Wno-final-dtor-non-final-class -Wno-extra-semi-stmt -Wno-misleading-indentation -Wno-quoted-include-in-framework-header -Wno-implicit-fallthrough -Wno-enum-enum-conversion -Wno-enum-float-conversion -Wno-elaborated-enum-base -Wno-reserved-identifier -Wno-gnu-folding-constant -fdeprecated-macro -fdebug-compilation-dir=/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-y0soNI -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fno-cxx-modules -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -x c++ /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [ "/Library/Developer/CommandLineTools/usr/bin/clang" -cc1 -triple arm64-apple-macosx15.0.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -mrelax-all -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -target-sdk-version=15.2 -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +crc -target-feature +dotprod -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +lse -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sha2 -target-feature +sha3 -target-feature +neon -target-feature +zcm -target-feature +zcz -target-feature +fullfp16 -target-abi darwinpcs -debugger-tuning=lldb -target-linker-version 1115.7.3 -v -fcoverage-compilation-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM -resource-dir /Library/Developer/CommandLineTools/usr/lib/clang/16 -dependency-file CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1 -internal-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/local/include -internal-isystem /Library/Developer/CommandLineTools/usr/lib/clang/16/include -internal-externc-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include -internal-externc-isystem /Library/Developer/CommandLineTools/usr/include -Wno-reorder-init-list -Wno-implicit-int-float-conversion -Wno-c99-designator -Wno-final-dtor-non-final-class -Wno-extra-semi-stmt -Wno-misleading-indentation -Wno-quoted-include-in-framework-header -Wno-implicit-fallthrough -Wno-enum-enum-conversion -Wno-enum-float-conversion -Wno-elaborated-enum-base -Wno-reserved-identifier -Wno-gnu-folding-constant -fdeprecated-macro -fdebug-compilation-dir=/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-BhOELM -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fno-cxx-modules -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -x c++ /opt/homebrew/share/cmake/Modules/CMakeCXXCompilerABI.cpp]
         ignore line: [clang -cc1 version 16.0.0 (clang-1600.0.26.6) default target arm64-apple-darwin24.2.0]
         ignore line: [ignoring nonexistent directory "/usr/local/include"]
         ignore line: [ignoring nonexistent directory "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/local/include"]
@@ -1259,13 +1259,13 @@ events:
         ignore line: [ /Library/Developer/CommandLineTools/usr/include]
         ignore line: [ /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks (framework directory)]
         ignore line: [End of search list.]
-        ignore line: [Linking CXX executable cmTC_81beb]
-        ignore line: [/opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_81beb.dir/link.txt --verbose=1]
+        ignore line: [Linking CXX executable cmTC_67f08]
+        ignore line: [/opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_67f08.dir/link.txt --verbose=1]
         ignore line: [Apple clang version 16.0.0 (clang-1600.0.26.6)]
         ignore line: [Target: arm64-apple-darwin24.2.0]
         ignore line: [Thread model: posix]
         ignore line: [InstalledDir: /Library/Developer/CommandLineTools/usr/bin]
-        link line: [ "/Library/Developer/CommandLineTools/usr/bin/ld" -demangle -lto_library /Library/Developer/CommandLineTools/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 15.0.0 15.2 -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_81beb -L/usr/local/lib -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o -lc++ -lSystem /Library/Developer/CommandLineTools/usr/lib/clang/16/lib/darwin/libclang_rt.osx.a]
+        link line: [ "/Library/Developer/CommandLineTools/usr/bin/ld" -demangle -lto_library /Library/Developer/CommandLineTools/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 15.0.0 15.2 -syslibroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_67f08 -L/usr/local/lib -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o -lc++ -lSystem /Library/Developer/CommandLineTools/usr/lib/clang/16/lib/darwin/libclang_rt.osx.a]
           arg [/Library/Developer/CommandLineTools/usr/bin/ld] ==> ignore
           arg [-demangle] ==> ignore
           arg [-lto_library] ==> ignore, skip following value
@@ -1282,12 +1282,12 @@ events:
           arg [-mllvm] ==> ignore
           arg [-enable-linkonceodr-outlining] ==> ignore
           arg [-o] ==> ignore
-          arg [cmTC_81beb] ==> ignore
+          arg [cmTC_67f08] ==> ignore
           arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
           arg [-search_paths_first] ==> ignore
           arg [-headerpad_max_install_names] ==> ignore
           arg [-v] ==> ignore
-          arg [CMakeFiles/cmTC_81beb.dir/CMakeCXXCompilerABI.cpp.o] ==> ignore
+          arg [CMakeFiles/cmTC_67f08.dir/CMakeCXXCompilerABI.cpp.o] ==> ignore
           arg [-lc++] ==> lib [c++]
           arg [-lSystem] ==> lib [System]
           arg [/Library/Developer/CommandLineTools/usr/lib/clang/16/lib/darwin/libclang_rt.osx.a] ==> lib [/Library/Developer/CommandLineTools/usr/lib/clang/16/lib/darwin/libclang_rt.osx.a]
@@ -1325,7 +1325,7 @@ events:
     kind: "find-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:126 (find_library)"
-      - "CMakeLists.txt:7 (find_package)"
+      - "CMakeLists.txt:11 (find_package)"
     mode: "library"
     variable: "CURSES_CURSES_LIBRARY"
     description: "Path to a library."
@@ -1340,6 +1340,8 @@ events:
     names:
       - "curses"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
       - "/opt/homebrew/sbin/"
@@ -1365,22 +1367,10 @@ events:
       - "/Library/Developer/CommandLineTools/Library/Frameworks/"
       - "/Library/Frameworks/"
       - "/System/Library/Frameworks/"
-    searched_directories:
-      - "/Users/m1ng/Library/pnpm/"
-      - "/opt/homebrew/bin/"
-      - "/opt/homebrew/sbin/"
-      - "/opt/homebrew/opt/openjdk/bin/"
-      - "/usr/local/bin/"
-      - "/System/Cryptexes/App/usr/bin/"
-      - "/usr/bin/"
-      - "/bin/"
-      - "/usr/sbin/"
-      - "/sbin/"
-      - "/Library/Apple/usr/bin/"
-      - "/Library/TeX/texbin/"
-      - "/Applications/iTerm.app/Contents/Resources/utilities/"
-    found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurses.tbd"
+    found: "/opt/homebrew/opt/ncurses/lib/libcurses.dylib"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -1430,7 +1420,7 @@ events:
     kind: "find-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:128 (find_library)"
-      - "CMakeLists.txt:7 (find_package)"
+      - "CMakeLists.txt:11 (find_package)"
     mode: "library"
     variable: "CURSES_NCURSES_LIBRARY"
     description: "Path to a library."
@@ -1443,8 +1433,10 @@ events:
       CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
       CMAKE_FIND_USE_INSTALL_PREFIX: true
     names:
-      - "ncurses"
+      - "ncursesw"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
       - "/opt/homebrew/sbin/"
@@ -1470,22 +1462,10 @@ events:
       - "/Library/Developer/CommandLineTools/Library/Frameworks/"
       - "/Library/Frameworks/"
       - "/System/Library/Frameworks/"
-    searched_directories:
-      - "/Users/m1ng/Library/pnpm/"
-      - "/opt/homebrew/bin/"
-      - "/opt/homebrew/sbin/"
-      - "/opt/homebrew/opt/openjdk/bin/"
-      - "/usr/local/bin/"
-      - "/System/Cryptexes/App/usr/bin/"
-      - "/usr/bin/"
-      - "/bin/"
-      - "/usr/sbin/"
-      - "/sbin/"
-      - "/Library/Apple/usr/bin/"
-      - "/Library/TeX/texbin/"
-      - "/Applications/iTerm.app/Contents/Resources/utilities/"
-    found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd"
+    found: "/opt/homebrew/opt/ncurses/lib/libncursesw.dylib"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -1532,10 +1512,43 @@ events:
         - "/Network/Library/Frameworks"
         - "/System/Library/Frameworks"
   -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:166 (check_library_exists)"
+      - "CMakeLists.txt:11 (find_package)"
+    checks:
+      - "Looking for wsyncup in /opt/homebrew/opt/ncurses/lib/libcurses.dylib"
+    directories:
+      source: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-b53MzW"
+      binary: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-b53MzW"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: ""
+      CMAKE_OSX_SYSROOT: ""
+    buildResult:
+      variable: "CURSES_CURSES_HAS_WSYNCUP"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-b53MzW'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_1b87d/fast
+        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_1b87d.dir/build.make CMakeFiles/cmTC_1b87d.dir/build
+        Building CXX object CMakeFiles/cmTC_1b87d.dir/CheckFunctionExists.cxx.o
+        /usr/bin/c++   -DCHECK_FUNCTION_EXISTS=wsyncup -std=gnu++17 -arch arm64 -MD -MT CMakeFiles/cmTC_1b87d.dir/CheckFunctionExists.cxx.o -MF CMakeFiles/cmTC_1b87d.dir/CheckFunctionExists.cxx.o.d -o CMakeFiles/cmTC_1b87d.dir/CheckFunctionExists.cxx.o -c /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-b53MzW/CheckFunctionExists.cxx
+        Linking CXX executable cmTC_1b87d
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_1b87d.dir/link.txt --verbose=1
+        /usr/bin/c++  -DCHECK_FUNCTION_EXISTS=wsyncup -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_1b87d.dir/CheckFunctionExists.cxx.o -o cmTC_1b87d  /opt/homebrew/opt/ncurses/lib/libcurses.dylib
+        
+      exitCode: 0
+  -
     kind: "find-v1"
     backtrace:
-      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:239 (find_path)"
-      - "CMakeLists.txt:7 (find_package)"
+      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:203 (find_path)"
+      - "CMakeLists.txt:11 (find_package)"
     mode: "path"
     variable: "CURSES_INCLUDE_PATH"
     description: "Path to a file."
@@ -1548,9 +1561,14 @@ events:
       CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
       CMAKE_FIND_USE_INSTALL_PREFIX: true
     names:
-      - "curses.h"
+      - "ncursesw/ncurses.h"
+      - "ncursesw/curses.h"
+      - "ncursesw.h"
+      - "cursesw.h"
     candidate_directories:
-      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
+      - "/opt/homebrew/opt/ncurses/include/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/include/"
       - "/Users/m1ng/Library/pnpm/"
       - "/usr/local/mysql/bin/"
       - "/opt/homebrew/bin/"
@@ -1596,8 +1614,107 @@ events:
       - "/Library/Frameworks/"
       - "/Network/Library/Frameworks/"
       - "/System/Library/Frameworks/"
-    found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
+    searched_directories:
+      - "/opt/homebrew/opt/ncurses/include/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/opt/ncurses/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/opt/ncurses/include/ncursesw.framework/Headers/ncurses.h"
+      - "/Users/m1ng/Library/pnpm/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/local/mysql/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/sbin/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/opt/openjdk/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/local/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/System/Cryptexes/App/usr/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/sbin/ncursesw.framework/Headers/ncurses.h"
+      - "/sbin/ncursesw.framework/Headers/ncurses.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Apple/usr/bin/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/TeX/texbin/ncursesw.framework/Headers/ncurses.h"
+      - "/Applications/iTerm.app/Contents/Resources/utilities/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/include/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/local/include/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/local/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/include/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/ncursesw.framework/Headers/ncurses.h"
+      - "/include/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/X11R6/include/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/X11R6/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/pkg/include/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/pkg/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/include/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/ncursesw.framework/Headers/ncurses.h"
+      - "/sw/include/ncursesw.framework/Headers/ncurses.h"
+      - "/sw/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/local/include/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/local/ncursesw.framework/Headers/ncurses.h"
+      - "/usr/include/X11/ncursesw.framework/Headers/ncurses.h"
+      - "/Users/m1ng/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Developer/CommandLineTools/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/Network/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/System/Library/Frameworks/ncursesw.framework/Headers/ncurses.h"
+      - "/opt/homebrew/opt/ncurses/include/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/opt/ncurses/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/opt/ncurses/include/ncursesw.framework/Headers/curses.h"
+      - "/Users/m1ng/Library/pnpm/ncursesw.framework/Headers/curses.h"
+      - "/usr/local/mysql/bin/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/bin/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/sbin/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/opt/openjdk/bin/ncursesw.framework/Headers/curses.h"
+      - "/usr/local/bin/ncursesw.framework/Headers/curses.h"
+      - "/System/Cryptexes/App/usr/bin/ncursesw.framework/Headers/curses.h"
+      - "/usr/bin/ncursesw.framework/Headers/curses.h"
+      - "/bin/ncursesw.framework/Headers/curses.h"
+      - "/usr/sbin/ncursesw.framework/Headers/curses.h"
+      - "/sbin/ncursesw.framework/Headers/curses.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin/ncursesw.framework/Headers/curses.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin/ncursesw.framework/Headers/curses.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin/ncursesw.framework/Headers/curses.h"
+      - "/Library/Apple/usr/bin/ncursesw.framework/Headers/curses.h"
+      - "/Library/TeX/texbin/ncursesw.framework/Headers/curses.h"
+      - "/Applications/iTerm.app/Contents/Resources/utilities/ncursesw.framework/Headers/curses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ncursesw.framework/Headers/curses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/include/ncursesw.framework/Headers/curses.h"
+      - "/opt/homebrew/ncursesw.framework/Headers/curses.h"
+      - "/usr/local/include/ncursesw.framework/Headers/curses.h"
+      - "/usr/local/ncursesw.framework/Headers/curses.h"
+      - "/usr/include/ncursesw.framework/Headers/curses.h"
+      - "/usr/ncursesw.framework/Headers/curses.h"
+      - "/include/ncursesw.framework/Headers/curses.h"
+      - "/usr/X11R6/include/ncursesw.framework/Headers/curses.h"
+      - "/usr/X11R6/ncursesw.framework/Headers/curses.h"
+      - "/usr/pkg/include/ncursesw.framework/Headers/curses.h"
+      - "/usr/pkg/ncursesw.framework/Headers/curses.h"
+      - "/opt/include/ncursesw.framework/Headers/curses.h"
+      - "/opt/ncursesw.framework/Headers/curses.h"
+      - "/sw/include/ncursesw.framework/Headers/curses.h"
+      - "/sw/ncursesw.framework/Headers/curses.h"
+      - "/opt/local/include/ncursesw.framework/Headers/curses.h"
+      - "/opt/local/ncursesw.framework/Headers/curses.h"
+      - "/usr/include/X11/ncursesw.framework/Headers/curses.h"
+      - "/Users/m1ng/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/Library/Developer/CommandLineTools/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/Network/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+      - "/System/Library/Frameworks/ncursesw.framework/Headers/curses.h"
+    found: "/opt/homebrew/opt/ncurses/include/"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -1644,10 +1761,76 @@ events:
         - "/Network/Library/Frameworks"
         - "/System/Library/Frameworks"
   -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:220 (check_library_exists)"
+      - "CMakeLists.txt:11 (find_package)"
+    checks:
+      - "Looking for cbreak in /opt/homebrew/opt/ncurses/lib/libncursesw.dylib"
+    directories:
+      source: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-qtCVLA"
+      binary: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-qtCVLA"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: ""
+      CMAKE_OSX_SYSROOT: ""
+    buildResult:
+      variable: "CURSES_NCURSES_HAS_CBREAK"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-qtCVLA'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_42ae7/fast
+        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_42ae7.dir/build.make CMakeFiles/cmTC_42ae7.dir/build
+        Building CXX object CMakeFiles/cmTC_42ae7.dir/CheckFunctionExists.cxx.o
+        /usr/bin/c++   -DCHECK_FUNCTION_EXISTS=cbreak -std=gnu++17 -arch arm64 -MD -MT CMakeFiles/cmTC_42ae7.dir/CheckFunctionExists.cxx.o -MF CMakeFiles/cmTC_42ae7.dir/CheckFunctionExists.cxx.o.d -o CMakeFiles/cmTC_42ae7.dir/CheckFunctionExists.cxx.o -c /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-qtCVLA/CheckFunctionExists.cxx
+        Linking CXX executable cmTC_42ae7
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_42ae7.dir/link.txt --verbose=1
+        /usr/bin/c++  -DCHECK_FUNCTION_EXISTS=cbreak -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_42ae7.dir/CheckFunctionExists.cxx.o -o cmTC_42ae7  /opt/homebrew/opt/ncurses/lib/libncursesw.dylib
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
+      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:222 (check_library_exists)"
+      - "CMakeLists.txt:11 (find_package)"
+    checks:
+      - "Looking for nodelay in /opt/homebrew/opt/ncurses/lib/libncursesw.dylib"
+    directories:
+      source: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-k8cp8K"
+      binary: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-k8cp8K"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: ""
+      CMAKE_OSX_SYSROOT: ""
+    buildResult:
+      variable: "CURSES_NCURSES_HAS_NODELAY"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-k8cp8K'
+        
+        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_d419f/fast
+        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_d419f.dir/build.make CMakeFiles/cmTC_d419f.dir/build
+        Building CXX object CMakeFiles/cmTC_d419f.dir/CheckFunctionExists.cxx.o
+        /usr/bin/c++   -DCHECK_FUNCTION_EXISTS=nodelay -std=gnu++17 -arch arm64 -MD -MT CMakeFiles/cmTC_d419f.dir/CheckFunctionExists.cxx.o -MF CMakeFiles/cmTC_d419f.dir/CheckFunctionExists.cxx.o.d -o CMakeFiles/cmTC_d419f.dir/CheckFunctionExists.cxx.o -c /Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/CMakeScratch/TryCompile-k8cp8K/CheckFunctionExists.cxx
+        Linking CXX executable cmTC_d419f
+        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_d419f.dir/link.txt --verbose=1
+        /usr/bin/c++  -DCHECK_FUNCTION_EXISTS=nodelay -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_d419f.dir/CheckFunctionExists.cxx.o -o cmTC_d419f  /opt/homebrew/opt/ncurses/lib/libncursesw.dylib
+        
+      exitCode: 0
+  -
     kind: "find-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:297 (find_library)"
-      - "CMakeLists.txt:7 (find_package)"
+      - "CMakeLists.txt:11 (find_package)"
     mode: "library"
     variable: "CURSES_FORM_LIBRARY"
     description: "Path to a library."
@@ -1660,9 +1843,11 @@ events:
       CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
       CMAKE_FIND_USE_INSTALL_PREFIX: true
     names:
-      - "form"
+      - "formw"
     candidate_directories:
-      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/lib/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
       - "/opt/homebrew/sbin/"
@@ -1688,8 +1873,10 @@ events:
       - "/Library/Developer/CommandLineTools/Library/Frameworks/"
       - "/Library/Frameworks/"
       - "/System/Library/Frameworks/"
-    found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libform.tbd"
+    found: "/opt/homebrew/opt/ncurses/lib/libformw.dylib"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -1740,7 +1927,7 @@ events:
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:69 (find_program)"
       - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:320 (find_package)"
-      - "CMakeLists.txt:7 (find_package)"
+      - "CMakeLists.txt:11 (find_package)"
     mode: "program"
     variable: "PKG_CONFIG_EXECUTABLE"
     description: "pkg-config executable"
@@ -1756,6 +1943,9 @@ events:
       - "pkg-config"
       - "pkgconf"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/bin/"
+      - "/opt/homebrew/opt/ncurses/sbin/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/Users/m1ng/Library/pnpm/"
       - "/usr/local/mysql/bin/"
       - "/opt/homebrew/bin/"
@@ -1805,12 +1995,20 @@ events:
       - "/Users/m1ng/Applications/"
       - "/Applications/"
     searched_directories:
+      - "/opt/homebrew/opt/ncurses/bin/pkg-config"
+      - "/opt/homebrew/opt/ncurses/bin/pkgconf"
+      - "/opt/homebrew/opt/ncurses/sbin/pkg-config"
+      - "/opt/homebrew/opt/ncurses/sbin/pkgconf"
+      - "/opt/homebrew/opt/ncurses/pkg-config"
+      - "/opt/homebrew/opt/ncurses/pkgconf"
       - "/Users/m1ng/Library/pnpm/pkg-config"
       - "/Users/m1ng/Library/pnpm/pkgconf"
       - "/usr/local/mysql/bin/pkg-config"
       - "/usr/local/mysql/bin/pkgconf"
     found: "/opt/homebrew/bin/pkg-config"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -1855,9 +2053,9 @@ events:
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:695 (_pkg_recalculate)"
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:867 (_pkg_check_modules_internal)"
       - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:322 (pkg_check_modules)"
-      - "CMakeLists.txt:7 (find_package)"
+      - "CMakeLists.txt:11 (find_package)"
     mode: "library"
-    variable: "pkgcfg_lib_NCURSES_ncurses"
+    variable: "pkgcfg_lib_NCURSES_ncursesw"
     description: "Path to a library."
     settings:
       SearchFramework: "FIRST"
@@ -1868,122 +2066,13 @@ events:
       CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
       CMAKE_FIND_USE_INSTALL_PREFIX: true
     names:
-      - "ncurses"
+      - "ncursesw"
     candidate_directories:
-      - "/usr/lib/"
-    searched_directories:
-      - "/usr/lib/"
-    found: false
+      - "/opt/homebrew/Cellar/ncurses/6.5/lib/"
+    found: "/opt/homebrew/Cellar/ncurses/6.5/lib/libncursesw.dylib"
     search_context:
-      ENV{PATH}:
-        - "/Users/m1ng/Library/pnpm"
-        - "/usr/local/mysql/bin"
-        - "/opt/homebrew/bin"
-        - "/opt/homebrew/sbin"
-        - "/opt/homebrew/opt/openjdk/bin"
-        - "/usr/local/bin"
-        - "/System/Cryptexes/App/usr/bin"
-        - "/usr/bin"
-        - "/bin"
-        - "/usr/sbin"
-        - "/sbin"
-        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin"
-        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin"
-        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin"
-        - "/Library/Apple/usr/bin"
-        - "/opt/homebrew/bin"
-        - "/Library/TeX/texbin"
-        - "/Applications/iTerm.app/Contents/Resources/utilities"
-      CMAKE_INSTALL_PREFIX: "/usr/local"
-      CMAKE_SYSTEM_PREFIX_PATH:
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr"
-        - "/opt/homebrew"
-        - "/usr/local"
-        - "/usr"
-        - "/"
-        - "/opt/homebrew"
-        - "/usr/local"
-        - "/usr/X11R6"
-        - "/usr/pkg"
-        - "/opt"
-        - "/sw"
-        - "/opt/local"
-      CMAKE_SYSTEM_LIBRARY_PATH:
-        - "/usr/lib/X11"
-      CMAKE_SYSTEM_FRAMEWORK_PATH:
-        - "~/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/Library/Frameworks"
-        - "/Library/Frameworks"
-        - "/Network/Library/Frameworks"
-        - "/System/Library/Frameworks"
-  -
-    kind: "find-v1"
-    backtrace:
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:311 (find_library)"
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:357 (_pkg_find_libs)"
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:695 (_pkg_recalculate)"
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:867 (_pkg_check_modules_internal)"
-      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:322 (pkg_check_modules)"
-      - "CMakeLists.txt:7 (find_package)"
-    mode: "library"
-    variable: "pkgcfg_lib_NCURSES_ncurses"
-    description: "Path to a library."
-    settings:
-      SearchFramework: "FIRST"
-      SearchAppBundle: "FIRST"
-      CMAKE_FIND_USE_CMAKE_PATH: true
-      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
-      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
-      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
-      CMAKE_FIND_USE_INSTALL_PREFIX: true
-    names:
-      - "ncurses"
-    candidate_directories:
-      - "/Users/m1ng/Library/pnpm/"
-      - "/opt/homebrew/bin/"
-      - "/opt/homebrew/sbin/"
-      - "/opt/homebrew/opt/openjdk/bin/"
-      - "/usr/local/bin/"
-      - "/System/Cryptexes/App/usr/bin/"
-      - "/usr/bin/"
-      - "/bin/"
-      - "/usr/sbin/"
-      - "/sbin/"
-      - "/Library/Apple/usr/bin/"
-      - "/Library/TeX/texbin/"
-      - "/Applications/iTerm.app/Contents/Resources/utilities/"
-      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/"
-      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/"
-      - "/opt/homebrew/lib/"
-      - "/opt/homebrew/"
-      - "/usr/local/"
-      - "/usr/lib/"
-      - "/usr/"
-      - "/opt/"
-      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/"
-      - "/Library/Developer/CommandLineTools/Library/Frameworks/"
-      - "/Library/Frameworks/"
-      - "/System/Library/Frameworks/"
-    searched_directories:
-      - "/Users/m1ng/Library/pnpm/"
-      - "/opt/homebrew/bin/"
-      - "/opt/homebrew/sbin/"
-      - "/opt/homebrew/opt/openjdk/bin/"
-      - "/usr/local/bin/"
-      - "/System/Cryptexes/App/usr/bin/"
-      - "/usr/bin/"
-      - "/bin/"
-      - "/usr/sbin/"
-      - "/sbin/"
-      - "/Library/Apple/usr/bin/"
-      - "/Library/TeX/texbin/"
-      - "/Applications/iTerm.app/Contents/Resources/utilities/"
-    found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd"
-    search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -2033,7 +2122,7 @@ events:
     kind: "find_package-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCURL.cmake:170 (find_package)"
-      - "CMakeLists.txt:8 (find_package)"
+      - "CMakeLists.txt:12 (find_package)"
     name: "CURL"
     configs:
       -
@@ -2066,11 +2155,19 @@ events:
         CMAKE_FIND_ROOT_PATH_MODE: "BOTH"
     candidates:
       -
-        path: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/pkgRedirects/CURLConfig.cmake"
+        path: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/pkgRedirects/CURLConfig.cmake"
         mode: "config"
         reason: "no_exist"
       -
-        path: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/pkgRedirects/curl-config.cmake"
+        path: "/Users/m1ng/code/github/m1ngsama/TUT/build/CMakeFiles/pkgRedirects/curl-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/ncurses/CURLConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/ncurses/curl-config.cmake"
         mode: "config"
         reason: "no_exist"
       -
@@ -2219,6 +2316,8 @@ events:
         reason: "no_exist"
     found: null
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -2270,7 +2369,7 @@ events:
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:695 (_pkg_recalculate)"
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:867 (_pkg_check_modules_internal)"
       - "/opt/homebrew/share/cmake/Modules/FindCURL.cmake:187 (pkg_check_modules)"
-      - "CMakeLists.txt:8 (find_package)"
+      - "CMakeLists.txt:12 (find_package)"
     mode: "library"
     variable: "pkgcfg_lib_PC_CURL_curl"
     description: "Path to a library."
@@ -2290,6 +2389,8 @@ events:
       - "/usr/lib/"
     found: false
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -2343,7 +2444,7 @@ events:
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:695 (_pkg_recalculate)"
       - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:867 (_pkg_check_modules_internal)"
       - "/opt/homebrew/share/cmake/Modules/FindCURL.cmake:187 (pkg_check_modules)"
-      - "CMakeLists.txt:8 (find_package)"
+      - "CMakeLists.txt:12 (find_package)"
     mode: "library"
     variable: "pkgcfg_lib_PC_CURL_curl"
     description: "Path to a library."
@@ -2358,6 +2459,8 @@ events:
     names:
       - "curl"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
       - "/opt/homebrew/sbin/"
@@ -2384,6 +2487,8 @@ events:
       - "/Library/Frameworks/"
       - "/System/Library/Frameworks/"
     searched_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
       - "/opt/homebrew/sbin/"
@@ -2399,6 +2504,8 @@ events:
       - "/Applications/iTerm.app/Contents/Resources/utilities/"
     found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -2448,7 +2555,7 @@ events:
     kind: "find-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCURL.cmake:197 (find_path)"
-      - "CMakeLists.txt:8 (find_package)"
+      - "CMakeLists.txt:12 (find_package)"
     mode: "path"
     variable: "CURL_INCLUDE_DIR"
     description: "Path to a file."
@@ -2463,6 +2570,8 @@ events:
     names:
       - "curl/curl.h"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/include/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/Users/m1ng/Library/pnpm/"
       - "/usr/local/mysql/bin/"
       - "/opt/homebrew/bin/"
@@ -2509,6 +2618,8 @@ events:
       - "/Network/Library/Frameworks/"
       - "/System/Library/Frameworks/"
     searched_directories:
+      - "/opt/homebrew/opt/ncurses/include/curl.framework/Headers/curl.h"
+      - "/opt/homebrew/opt/ncurses/curl.framework/Headers/curl.h"
       - "/Users/m1ng/Library/pnpm/curl.framework/Headers/curl.h"
       - "/usr/local/mysql/bin/curl.framework/Headers/curl.h"
       - "/opt/homebrew/bin/curl.framework/Headers/curl.h"
@@ -2554,6 +2665,8 @@ events:
       - "/Library/Frameworks/curl.framework/Headers/curl.h"
       - "/Network/Library/Frameworks/curl.framework/Headers/curl.h"
       - "/System/Library/Frameworks/curl.framework/Headers/curl.h"
+      - "/opt/homebrew/opt/ncurses/include/curl/curl.h"
+      - "/opt/homebrew/opt/ncurses/curl/curl.h"
       - "/Users/m1ng/Library/pnpm/curl/curl.h"
       - "/usr/local/mysql/bin/curl/curl.h"
       - "/opt/homebrew/bin/curl/curl.h"
@@ -2573,6 +2686,8 @@ events:
       - "/Applications/iTerm.app/Contents/Resources/utilities/curl/curl.h"
     found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -2622,7 +2737,7 @@ events:
     kind: "find-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCURL.cmake:204 (find_library)"
-      - "CMakeLists.txt:8 (find_package)"
+      - "CMakeLists.txt:12 (find_package)"
     mode: "library"
     variable: "CURL_LIBRARY_RELEASE"
     description: "Path to a library."
@@ -2642,6 +2757,8 @@ events:
       - "libcurl"
       - "libcurl_a"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/usr/lib/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
@@ -2669,6 +2786,18 @@ events:
       - "/Library/Frameworks/"
       - "/System/Library/Frameworks/"
     searched_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/usr/lib/"
       - "/usr/lib/"
       - "/usr/lib/"
@@ -2755,6 +2884,8 @@ events:
       - "/Applications/iTerm.app/Contents/Resources/utilities/"
     found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd"
     search_context:
+      CMAKE_PREFIX_PATH:
+        - "/opt/homebrew/opt/ncurses"
       ENV{PATH}:
         - "/Users/m1ng/Library/pnpm"
         - "/usr/local/mysql/bin"
@@ -2804,7 +2935,7 @@ events:
     kind: "find-v1"
     backtrace:
       - "/opt/homebrew/share/cmake/Modules/FindCURL.cmake:219 (find_library)"
-      - "CMakeLists.txt:8 (find_package)"
+      - "CMakeLists.txt:12 (find_package)"
     mode: "library"
     variable: "CURL_LIBRARY_DEBUG"
     description: "Path to a library."
@@ -2820,6 +2951,8 @@ events:
       - "libcurl-d_imp"
       - "libcurl-d"
     candidate_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/usr/lib/"
       - "/Users/m1ng/Library/pnpm/"
       - "/opt/homebrew/bin/"
@@ -2847,6 +2980,10 @@ events:
       - "/Library/Frameworks/"
       - "/System/Library/Frameworks/"
     searched_directories:
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/lib/"
+      - "/opt/homebrew/opt/ncurses/"
+      - "/opt/homebrew/opt/ncurses/"
       - "/usr/lib/"
       - "/usr/lib/"
       - "/Users/m1ng/Library/pnpm/"
@@ -2900,180 +3037,6 @@ events:
       - "/System/Library/Frameworks/"
       - "/System/Library/Frameworks/"
     found: false
-    search_context:
-      ENV{PATH}:
-        - "/Users/m1ng/Library/pnpm"
-        - "/usr/local/mysql/bin"
-        - "/opt/homebrew/bin"
-        - "/opt/homebrew/sbin"
-        - "/opt/homebrew/opt/openjdk/bin"
-        - "/usr/local/bin"
-        - "/System/Cryptexes/App/usr/bin"
-        - "/usr/bin"
-        - "/bin"
-        - "/usr/sbin"
-        - "/sbin"
-        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin"
-        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin"
-        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin"
-        - "/Library/Apple/usr/bin"
-        - "/opt/homebrew/bin"
-        - "/Library/TeX/texbin"
-        - "/Applications/iTerm.app/Contents/Resources/utilities"
-      CMAKE_INSTALL_PREFIX: "/usr/local"
-      CMAKE_SYSTEM_PREFIX_PATH:
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr"
-        - "/opt/homebrew"
-        - "/usr/local"
-        - "/usr"
-        - "/"
-        - "/opt/homebrew"
-        - "/usr/local"
-        - "/usr/X11R6"
-        - "/usr/pkg"
-        - "/opt"
-        - "/sw"
-        - "/opt/local"
-      CMAKE_SYSTEM_LIBRARY_PATH:
-        - "/usr/lib/X11"
-      CMAKE_SYSTEM_FRAMEWORK_PATH:
-        - "~/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/Library/Frameworks"
-        - "/Library/Developer/CommandLineTools/Library/Frameworks"
-        - "/Library/Frameworks"
-        - "/Network/Library/Frameworks"
-        - "/System/Library/Frameworks"
-...
-
----
-events:
-  -
-    kind: "try_compile-v1"
-    backtrace:
-      - "/opt/homebrew/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
-      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:166 (check_library_exists)"
-      - "CMakeLists.txt:11 (find_package)"
-    checks:
-      - "Looking for wsyncup in /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurses.tbd"
-    directories:
-      source: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-0dXgDj"
-      binary: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-0dXgDj"
-    cmakeVariables:
-      CMAKE_CXX_FLAGS: ""
-      CMAKE_CXX_FLAGS_DEBUG: "-g"
-      CMAKE_EXE_LINKER_FLAGS: ""
-      CMAKE_OSX_ARCHITECTURES: ""
-      CMAKE_OSX_DEPLOYMENT_TARGET: ""
-      CMAKE_OSX_SYSROOT: ""
-    buildResult:
-      variable: "CURSES_CURSES_HAS_WSYNCUP"
-      cached: true
-      stdout: |
-        Change Dir: '/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-0dXgDj'
-        
-        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_5a025/fast
-        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_5a025.dir/build.make CMakeFiles/cmTC_5a025.dir/build
-        Building CXX object CMakeFiles/cmTC_5a025.dir/CheckFunctionExists.cxx.o
-        /usr/bin/c++   -DCHECK_FUNCTION_EXISTS=wsyncup -std=gnu++17 -arch arm64 -MD -MT CMakeFiles/cmTC_5a025.dir/CheckFunctionExists.cxx.o -MF CMakeFiles/cmTC_5a025.dir/CheckFunctionExists.cxx.o.d -o CMakeFiles/cmTC_5a025.dir/CheckFunctionExists.cxx.o -c /Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-0dXgDj/CheckFunctionExists.cxx
-        Linking CXX executable cmTC_5a025
-        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5a025.dir/link.txt --verbose=1
-        /usr/bin/c++  -DCHECK_FUNCTION_EXISTS=wsyncup -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_5a025.dir/CheckFunctionExists.cxx.o -o cmTC_5a025  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurses.tbd
-        
-      exitCode: 0
-  -
-    kind: "try_compile-v1"
-    backtrace:
-      - "/opt/homebrew/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
-      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:220 (check_library_exists)"
-      - "CMakeLists.txt:11 (find_package)"
-    checks:
-      - "Looking for cbreak in /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd"
-    directories:
-      source: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-fkeqYX"
-      binary: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-fkeqYX"
-    cmakeVariables:
-      CMAKE_CXX_FLAGS: ""
-      CMAKE_CXX_FLAGS_DEBUG: "-g"
-      CMAKE_EXE_LINKER_FLAGS: ""
-      CMAKE_OSX_ARCHITECTURES: ""
-      CMAKE_OSX_DEPLOYMENT_TARGET: ""
-      CMAKE_OSX_SYSROOT: ""
-    buildResult:
-      variable: "CURSES_NCURSES_HAS_CBREAK"
-      cached: true
-      stdout: |
-        Change Dir: '/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-fkeqYX'
-        
-        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_c3cc0/fast
-        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_c3cc0.dir/build.make CMakeFiles/cmTC_c3cc0.dir/build
-        Building CXX object CMakeFiles/cmTC_c3cc0.dir/CheckFunctionExists.cxx.o
-        /usr/bin/c++   -DCHECK_FUNCTION_EXISTS=cbreak -std=gnu++17 -arch arm64 -MD -MT CMakeFiles/cmTC_c3cc0.dir/CheckFunctionExists.cxx.o -MF CMakeFiles/cmTC_c3cc0.dir/CheckFunctionExists.cxx.o.d -o CMakeFiles/cmTC_c3cc0.dir/CheckFunctionExists.cxx.o -c /Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-fkeqYX/CheckFunctionExists.cxx
-        Linking CXX executable cmTC_c3cc0
-        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_c3cc0.dir/link.txt --verbose=1
-        /usr/bin/c++  -DCHECK_FUNCTION_EXISTS=cbreak -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_c3cc0.dir/CheckFunctionExists.cxx.o -o cmTC_c3cc0  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd
-        
-      exitCode: 0
-  -
-    kind: "try_compile-v1"
-    backtrace:
-      - "/opt/homebrew/share/cmake/Modules/CheckLibraryExists.cmake:154 (try_compile)"
-      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:222 (check_library_exists)"
-      - "CMakeLists.txt:11 (find_package)"
-    checks:
-      - "Looking for nodelay in /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd"
-    directories:
-      source: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-HeZpOc"
-      binary: "/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-HeZpOc"
-    cmakeVariables:
-      CMAKE_CXX_FLAGS: ""
-      CMAKE_CXX_FLAGS_DEBUG: "-g"
-      CMAKE_EXE_LINKER_FLAGS: ""
-      CMAKE_OSX_ARCHITECTURES: ""
-      CMAKE_OSX_DEPLOYMENT_TARGET: ""
-      CMAKE_OSX_SYSROOT: ""
-    buildResult:
-      variable: "CURSES_NCURSES_HAS_NODELAY"
-      cached: true
-      stdout: |
-        Change Dir: '/Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-HeZpOc'
-        
-        Run Build Command(s): /opt/homebrew/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_9e47d/fast
-        /Library/Developer/CommandLineTools/usr/bin/make  -f CMakeFiles/cmTC_9e47d.dir/build.make CMakeFiles/cmTC_9e47d.dir/build
-        Building CXX object CMakeFiles/cmTC_9e47d.dir/CheckFunctionExists.cxx.o
-        /usr/bin/c++   -DCHECK_FUNCTION_EXISTS=nodelay -std=gnu++17 -arch arm64 -MD -MT CMakeFiles/cmTC_9e47d.dir/CheckFunctionExists.cxx.o -MF CMakeFiles/cmTC_9e47d.dir/CheckFunctionExists.cxx.o.d -o CMakeFiles/cmTC_9e47d.dir/CheckFunctionExists.cxx.o -c /Users/m1ng/code/lab/TUT/build/CMakeFiles/CMakeScratch/TryCompile-HeZpOc/CheckFunctionExists.cxx
-        Linking CXX executable cmTC_9e47d
-        /opt/homebrew/bin/cmake -E cmake_link_script CMakeFiles/cmTC_9e47d.dir/link.txt --verbose=1
-        /usr/bin/c++  -DCHECK_FUNCTION_EXISTS=nodelay -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_9e47d.dir/CheckFunctionExists.cxx.o -o cmTC_9e47d  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libncurses.tbd
-        
-      exitCode: 0
-  -
-    kind: "find-v1"
-    backtrace:
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:307 (find_library)"
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:357 (_pkg_find_libs)"
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:695 (_pkg_recalculate)"
-      - "/opt/homebrew/share/cmake/Modules/FindPkgConfig.cmake:867 (_pkg_check_modules_internal)"
-      - "/opt/homebrew/share/cmake/Modules/FindCurses.cmake:322 (pkg_check_modules)"
-      - "CMakeLists.txt:11 (find_package)"
-    mode: "library"
-    variable: "pkgcfg_lib_NCURSES_ncursesw"
-    description: "Path to a library."
-    settings:
-      SearchFramework: "FIRST"
-      SearchAppBundle: "FIRST"
-      CMAKE_FIND_USE_CMAKE_PATH: true
-      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
-      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
-      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
-      CMAKE_FIND_USE_INSTALL_PREFIX: true
-    names:
-      - "ncursesw"
-    candidate_directories:
-      - "/opt/homebrew/Cellar/ncurses/6.5/lib/"
-    found: "/opt/homebrew/Cellar/ncurses/6.5/lib/libncursesw.dylib"
     search_context:
       CMAKE_PREFIX_PATH:
         - "/opt/homebrew/opt/ncurses"
