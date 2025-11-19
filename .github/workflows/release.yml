@@ -1,0 +1,51 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*' # Trigger on pushes to tags like v1.0.0
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  build_and_release:
+    runs-on: macos-latest # Using macOS due to existing brew dependencies
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        brew update
+        brew install cmake ncurses curl
+
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake ..
+
+    - name: Build project
+      run: |
+        cd build
+        cmake --build .
+
+    - name: Get executable path
+      id: get_exe_path
+      run: |
+        echo "EXECUTABLE_NAME=$(find build -name 'nbtca_tui' -type f | head -n 1)" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          Automated release for ${{ github.ref }}
+          See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/README.md) for build and usage instructions.
+        draft: false
+        prerelease: false
+
