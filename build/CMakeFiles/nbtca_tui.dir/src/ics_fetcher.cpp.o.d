@@ -1,6 +1,6 @@
 CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o: \
-  /Users/m1ng/code/lab/TUT/src/ics_fetcher.cpp \
-  /Users/m1ng/code/lab/TUT/src/ics_fetcher.h \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/ics_fetcher.cpp \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/ics_fetcher.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/string \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__algorithm/max.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__algorithm/comp.h \

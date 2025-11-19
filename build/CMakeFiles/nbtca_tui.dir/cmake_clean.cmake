@@ -1,4 +1,6 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o"
+  "CMakeFiles/nbtca_tui.dir/src/calendar.cpp.o.d"
   "CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o"
   "CMakeFiles/nbtca_tui.dir/src/ics_fetcher.cpp.o.d"
   "CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o"
