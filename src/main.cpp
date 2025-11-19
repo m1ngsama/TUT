@@ -2,6 +2,8 @@
 #include "calendar.h"
 
 int main() {
+    display_splash_screen(); // Display splash screen at startup
+
     while (true) {
         int choice = run_portal_tui();
 
