@@ -1,6 +1,6 @@
 CMakeFiles/nbtca_tui.dir/src/ics_parser.cpp.o: \
-  /Users/m1ng/code/lab/TUT/src/ics_parser.cpp \
-  /Users/m1ng/code/lab/TUT/src/ics_parser.h \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.cpp \
+  /Users/m1ng/code/github/m1ngsama/TUT/src/ics_parser.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/chrono \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__assert \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__assertion_handler \
