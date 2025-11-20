@@ -4,9 +4,13 @@ project(NBTCA_TUI LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 优先使用带宽字符支持的 ncursesw（Homebrew 安装在 /opt/homebrew）
+# 优先使用带宽字符支持的 ncursesw
 set(CURSES_NEED_WIDE TRUE)
-set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/ncurses" ${CMAKE_PREFIX_PATH})
+
+# macOS: Homebrew ncurses 路径
+if(APPLE)
+    set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/ncurses" ${CMAKE_PREFIX_PATH})
+endif()
 
 find_package(Curses REQUIRED)
 find_package(CURL REQUIRED)
