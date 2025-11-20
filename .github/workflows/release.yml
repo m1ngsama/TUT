@@ -2,22 +2,37 @@ name: Build and Release
 
 on:
   push:
-    tags:
-      - 'v*.*.*' # Trigger on pushes to tags like v1.0.0
-  workflow_dispatch: # Allows manual trigger
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
-  build_and_release:
-    runs-on: macos-latest # Using macOS due to existing brew dependencies
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+          - os: ubuntu-latest
+            name: linux
+
+    runs-on: ${{ matrix.os }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install dependencies
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
       run: |
         brew update
         brew install cmake ncurses curl
+
+    - name: Install dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libncursesw5-dev libcurl4-openssl-dev
 
     - name: Configure CMake
       run: |
@@ -30,22 +45,51 @@ jobs:
         cd build
         cmake --build .
 
-    - name: Get executable path
-      id: get_exe_path
+    - name: Rename binary with platform suffix
       run: |
-        echo "EXECUTABLE_NAME=$(find build -name 'nbtca_tui' -type f | head -n 1)" >> $GITHUB_OUTPUT
+        mv build/nbtca_tui build/nbtca_tui-${{ matrix.name }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nbtca_tui-${{ matrix.name }}
+        path: build/nbtca_tui-${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Generate version
+      id: version
+      run: |
+        VERSION="v$(date +'%Y.%m.%d')-$(git rev-parse --short HEAD)"
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
     - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.version.outputs.VERSION }}
+        name: Release ${{ steps.version.outputs.VERSION }}
+        body: |
+          Automated release for commit ${{ github.sha }}
+
+          ## Download
+          - **macOS**: `nbtca_tui-macos`
+          - **Linux**: `nbtca_tui-linux`
+
+          ## Build from source
+          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for build instructions.
+        files: |
+          artifacts/nbtca_tui-macos/nbtca_tui-macos
+          artifacts/nbtca_tui-linux/nbtca_tui-linux
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        body: |
-          Automated release for ${{ github.ref }}
-          See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/README.md) for build and usage instructions.
-        draft: false
-        prerelease: false
-
