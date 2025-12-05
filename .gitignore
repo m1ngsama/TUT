@@ -1,1 +1,4 @@
 build/
+*.o
+tut
+.DS_Store
