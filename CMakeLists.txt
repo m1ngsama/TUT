@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(NBTCA_TUI LANGUAGES CXX)
+project(TUT LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,15 +15,16 @@ endif()
 find_package(Curses REQUIRED)
 find_package(CURL REQUIRED)
 
-add_executable(nbtca_tui
+add_executable(tut
     src/main.cpp
-    src/ics_fetcher.cpp
-    src/ics_parser.cpp
-    src/tui_view.cpp
-    src/calendar.cpp
+    src/http_client.cpp
+    src/html_parser.cpp
+    src/text_renderer.cpp
+    src/input_handler.cpp
+    src/browser.cpp
 )
 
-target_include_directories(nbtca_tui PRIVATE ${CURSES_INCLUDE_DIR})
-target_link_libraries(nbtca_tui PRIVATE ${CURSES_LIBRARIES} CURL::libcurl)
+target_include_directories(tut PRIVATE ${CURSES_INCLUDE_DIR})
+target_link_libraries(tut PRIVATE ${CURSES_LIBRARIES} CURL::libcurl)
 
 
