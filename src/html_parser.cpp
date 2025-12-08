@@ -139,6 +139,70 @@ public:
         return links;
     }
 
+    // 从HTML中提取文本，同时保留内联链接位置信息
+    std::string extract_text_with_links(const std::string& html,
+                                        std::vector<Link>& all_links,
+                                        std::vector<InlineLink>& inline_links) {
+        std::string result;
+        std::regex link_regex(R"(<a\s+[^>]*href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)</a>)",
+                            std::regex::icase);
+
+        size_t last_pos = 0;
+        auto begin = std::sregex_iterator(html.begin(), html.end(), link_regex);
+        auto end = std::sregex_iterator();
+
+        // 处理所有链接
+        for (std::sregex_iterator i = begin; i != end; ++i) {
+            std::smatch match = *i;
+
+            // 添加链接前的文本
+            std::string before_link = html.substr(last_pos, match.position() - last_pos);
+            std::string before_text = decode_html_entities(remove_tags(before_link));
+            result += before_text;
+
+            // 提取链接信息
+            std::string link_url = match[1].str();
+            std::string link_text = decode_html_entities(remove_tags(match[2].str()));
+
+            // 跳过空链接或锚点链接
+            if (link_url.empty() || link_url[0] == '#' || link_text.empty()) {
+                result += link_text;
+                last_pos = match.position() + match.length();
+                continue;
+            }
+
+            // 找到这个链接在全局链接列表中的索引
+            int link_index = -1;
+            for (size_t j = 0; j < all_links.size(); ++j) {
+                if (all_links[j].url == link_url && all_links[j].text == link_text) {
+                    link_index = j;
+                    break;
+                }
+            }
+
+            if (link_index != -1) {
+                // 记录内联链接位置
+                InlineLink inline_link;
+                inline_link.text = link_text;
+                inline_link.url = link_url;
+                inline_link.start_pos = result.length();
+                inline_link.end_pos = result.length() + link_text.length();
+                inline_link.link_index = link_index;
+                inline_links.push_back(inline_link);
+            }
+
+            // 添加链接文本
+            result += link_text;
+            last_pos = match.position() + match.length();
+        }
+
+        // 添加最后一段文本
+        std::string remaining = html.substr(last_pos);
+        result += decode_html_entities(remove_tags(remaining));
+
+        return trim(result);
+    }
+
     // 清理空白字符
     std::string trim(const std::string& str) {
         auto start = str.begin();
@@ -237,14 +301,13 @@ ParsedDocument HtmlParser::parse(const std::string& html, const std::string& bas
         }
     }
 
-    // 解析段落
+    // 解析段落 (保留内联链接)
     auto paragraphs = pImpl->extract_all_tags(main_content, "p");
     for (const auto& para : paragraphs) {
-        std::string text = pImpl->decode_html_entities(pImpl->trim(pImpl->remove_tags(para)));
-        if (!text.empty() && text.length() > 1) {
-            ContentElement elem;
-            elem.type = ElementType::PARAGRAPH;
-            elem.text = text;
+        ContentElement elem;
+        elem.type = ElementType::PARAGRAPH;
+        elem.text = pImpl->extract_text_with_links(para, doc.links, elem.inline_links);
+        if (!elem.text.empty() && elem.text.length() > 1) {
             doc.elements.push_back(elem);
         }
     }

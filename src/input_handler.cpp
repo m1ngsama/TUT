@@ -23,6 +23,7 @@ public:
         result.has_count = false;
         result.count = 1;
 
+        // Handle digit input for count or 'f' command
         if (std::isdigit(ch) && (ch != '0' || !count_buffer.empty())) {
             count_buffer += static_cast<char>(ch);
             return result;
@@ -31,33 +32,38 @@ public:
         if (!count_buffer.empty()) {
             result.has_count = true;
             result.count = std::stoi(count_buffer);
-            count_buffer.clear();
         }
 
         switch (ch) {
             case 'j':
             case KEY_DOWN:
                 result.action = Action::SCROLL_DOWN;
+                count_buffer.clear();
                 break;
             case 'k':
             case KEY_UP:
                 result.action = Action::SCROLL_UP;
+                count_buffer.clear();
                 break;
             case 'h':
             case KEY_LEFT:
                 result.action = Action::GO_BACK;
+                count_buffer.clear();
                 break;
             case 'l':
             case KEY_RIGHT:
                 result.action = Action::GO_FORWARD;
+                count_buffer.clear();
                 break;
             case 4:
             case ' ':
                 result.action = Action::SCROLL_PAGE_DOWN;
+                count_buffer.clear();
                 break;
             case 21:
             case 'b':
                 result.action = Action::SCROLL_PAGE_UP;
+                count_buffer.clear();
                 break;
             case 'g':
                 buffer += 'g';
@@ -65,6 +71,7 @@ public:
                     result.action = Action::GOTO_TOP;
                     buffer.clear();
                 }
+                count_buffer.clear();
                 break;
             case 'G':
                 if (result.has_count) {
@@ -73,27 +80,52 @@ public:
                 } else {
                     result.action = Action::GOTO_BOTTOM;
                 }
+                count_buffer.clear();
                 break;
             case '/':
                 mode = InputMode::SEARCH;
                 buffer = "/";
+                count_buffer.clear();
                 break;
             case 'n':
                 result.action = Action::SEARCH_NEXT;
+                count_buffer.clear();
                 break;
             case 'N':
                 result.action = Action::SEARCH_PREV;
+                count_buffer.clear();
                 break;
             case '\t':
                 result.action = Action::NEXT_LINK;
+                count_buffer.clear();
                 break;
             case KEY_BTAB:
             case 'T':
                 result.action = Action::PREV_LINK;
+                count_buffer.clear();
                 break;
             case '\n':
             case '\r':
-                result.action = Action::FOLLOW_LINK;
+                // If count buffer has a number, jump to that link
+                if (result.has_count) {
+                    result.action = Action::GOTO_LINK;
+                    result.number = result.count;
+                } else {
+                    result.action = Action::FOLLOW_LINK;
+                }
+                count_buffer.clear();
+                break;
+            case 'f':
+                // 'f' command: follow link by number
+                if (result.has_count) {
+                    result.action = Action::FOLLOW_LINK_NUM;
+                    result.number = result.count;
+                    count_buffer.clear();
+                } else {
+                    // Enter link follow mode, wait for number
+                    mode = InputMode::LINK;
+                    buffer = "f";
+                }
                 break;
             case ':':
                 mode = InputMode::COMMAND;
@@ -190,6 +222,41 @@ public:
 
         return result;
     }
+
+    InputResult process_link_mode(int ch) {
+        InputResult result;
+        result.action = Action::NONE;
+
+        if (std::isdigit(ch)) {
+            buffer += static_cast<char>(ch);
+        } else if (ch == '\n' || ch == '\r') {
+            // Follow the link number entered
+            if (buffer.length() > 1) {
+                try {
+                    int link_num = std::stoi(buffer.substr(1));
+                    result.action = Action::FOLLOW_LINK_NUM;
+                    result.number = link_num;
+                } catch (...) {
+                    set_status("Invalid link number");
+                }
+            }
+            mode = InputMode::NORMAL;
+            buffer.clear();
+        } else if (ch == 27) {
+            // ESC cancels
+            mode = InputMode::NORMAL;
+            buffer.clear();
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (buffer.length() > 1) {
+                buffer.pop_back();
+            } else {
+                mode = InputMode::NORMAL;
+                buffer.clear();
+            }
+        }
+
+        return result;
+    }
 };
 
 InputHandler::InputHandler() : pImpl(std::make_unique<Impl>()) {}
@@ -204,6 +271,8 @@ InputResult InputHandler::handle_key(int ch) {
             return pImpl->process_command_mode(ch);
         case InputMode::SEARCH:
             return pImpl->process_search_mode(ch);
+        case InputMode::LINK:
+            return pImpl->process_link_mode(ch);
         default:
             break;
     }

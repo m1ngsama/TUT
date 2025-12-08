@@ -12,6 +12,7 @@ struct RenderedLine {
     bool is_bold;
     bool is_link;
     int link_index;
+    std::vector<std::pair<size_t, size_t>> link_ranges;  // (start, end) positions of links in this line
 };
 
 struct RenderConfig {
@@ -19,7 +20,7 @@ struct RenderConfig {
     int margin_left = 0;
     bool center_content = true;
     int paragraph_spacing = 1;
-    bool show_link_indicators = true;
+    bool show_link_indicators = false;  // Set to false to show inline links by default
 };
 
 class TextRenderer {

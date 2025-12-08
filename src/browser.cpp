@@ -138,34 +138,93 @@ public:
             int line_idx = scroll_pos + i;
             const auto& line = rendered_lines[line_idx];
 
-            if (line.is_link && line.link_index == current_link) {
-                attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
-            } else {
-                attron(COLOR_PAIR(line.color_pair));
-                if (line.is_bold) {
-                    attron(A_BOLD);
+            // Check if this line contains the active link
+            bool has_active_link = (line.is_link && line.link_index == current_link);
+
+            // Check if this line is in search results
+            bool in_search_results = !search_term.empty() &&
+                std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end();
+
+            // If line has link ranges, render character by character with proper highlighting
+            if (!line.link_ranges.empty()) {
+                int col = 0;
+                for (size_t char_idx = 0; char_idx < line.text.length(); ++char_idx) {
+                    // Check if this character is within any link range
+                    bool is_in_link = false;
+
+                    for (const auto& [start, end] : line.link_ranges) {
+                        if (char_idx >= start && char_idx < end) {
+                            is_in_link = true;
+                            break;
+                        }
+                    }
+
+                    // Apply appropriate color
+                    if (is_in_link && has_active_link) {
+                        attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
+                    } else if (is_in_link) {
+                        attron(COLOR_PAIR(COLOR_LINK));
+                        attron(A_UNDERLINE);
+                    } else {
+                        attron(COLOR_PAIR(line.color_pair));
+                        if (line.is_bold) {
+                            attron(A_BOLD);
+                        }
+                    }
+
+                    if (in_search_results) {
+                        attron(A_REVERSE);
+                    }
+
+                    mvaddch(i, col, line.text[char_idx]);
+
+                    if (in_search_results) {
+                        attroff(A_REVERSE);
+                    }
+
+                    if (is_in_link && has_active_link) {
+                        attroff(COLOR_PAIR(COLOR_LINK_ACTIVE));
+                    } else if (is_in_link) {
+                        attroff(A_UNDERLINE);
+                        attroff(COLOR_PAIR(COLOR_LINK));
+                    } else {
+                        if (line.is_bold) {
+                            attroff(A_BOLD);
+                        }
+                        attroff(COLOR_PAIR(line.color_pair));
+                    }
+
+                    col++;
                 }
-            }
-
-            if (!search_term.empty() &&
-                std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end()) {
-                attron(A_REVERSE);
-            }
-
-            mvprintw(i, 0, "%s", line.text.c_str());
-
-            if (!search_term.empty() &&
-                std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end()) {
-                attroff(A_REVERSE);
-            }
-
-            if (line.is_link && line.link_index == current_link) {
-                attroff(COLOR_PAIR(COLOR_LINK_ACTIVE));
             } else {
-                if (line.is_bold) {
-                    attroff(A_BOLD);
+                // No inline links, render normally
+                if (has_active_link) {
+                    attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
+                } else {
+                    attron(COLOR_PAIR(line.color_pair));
+                    if (line.is_bold) {
+                        attron(A_BOLD);
+                    }
                 }
-                attroff(COLOR_PAIR(line.color_pair));
+
+                if (in_search_results) {
+                    attron(A_REVERSE);
+                }
+
+                mvprintw(i, 0, "%s", line.text.c_str());
+
+                if (in_search_results) {
+                    attroff(A_REVERSE);
+                }
+
+                if (has_active_link) {
+                    attroff(COLOR_PAIR(COLOR_LINK_ACTIVE));
+                } else {
+                    if (line.is_bold) {
+                        attroff(A_BOLD);
+                    }
+                    attroff(COLOR_PAIR(line.color_pair));
+                }
             }
         }
 
@@ -226,6 +285,26 @@ public:
             case Action::FOLLOW_LINK:
                 if (current_link >= 0 && current_link < static_cast<int>(current_doc.links.size())) {
                     load_page(current_doc.links[current_link].url);
+                }
+                break;
+
+            case Action::GOTO_LINK:
+                // Jump to specific link by number
+                if (result.number >= 0 && result.number < static_cast<int>(current_doc.links.size())) {
+                    current_link = result.number;
+                    scroll_to_link(current_link);
+                    status_message = "Link " + std::to_string(result.number);
+                } else {
+                    status_message = "Invalid link number: " + std::to_string(result.number);
+                }
+                break;
+
+            case Action::FOLLOW_LINK_NUM:
+                // Follow specific link by number directly
+                if (result.number >= 0 && result.number < static_cast<int>(current_doc.links.size())) {
+                    load_page(current_doc.links[result.number].url);
+                } else {
+                    status_message = "Invalid link number: " + std::to_string(result.number);
                 }
                 break;
 
@@ -332,9 +411,12 @@ public:
                   << "<p>G: Go to bottom</p>"
                   << "<p>[number]G: Go to line number</p>"
                   << "<h2>Links</h2>"
+                  << "<p>Links are displayed inline with numbers like [0], [1], etc.</p>"
                   << "<p>Tab: Next link</p>"
                   << "<p>Shift-Tab or T: Previous link</p>"
-                  << "<p>Enter: Follow link</p>"
+                  << "<p>Enter: Follow current link</p>"
+                  << "<p>[number]Enter: Jump to link number N</p>"
+                  << "<p>f[number]: Follow link number N directly</p>"
                   << "<p>h: Go back</p>"
                   << "<p>l: Go forward</p>"
                   << "<h2>Search</h2>"

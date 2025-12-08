@@ -7,6 +7,12 @@ class TextRenderer::Impl {
 public:
     RenderConfig config;
 
+    struct LinkPosition {
+        int link_index;
+        size_t start;
+        size_t end;
+    };
+
     std::vector<std::string> wrap_text(const std::string& text, int width) {
         std::vector<std::string> lines;
         if (text.empty()) {
@@ -48,6 +54,151 @@ public:
         }
 
         return lines;
+    }
+
+    // Wrap text with links, tracking link positions and adding link numbers
+    std::vector<std::pair<std::string, std::vector<LinkPosition>>>
+    wrap_text_with_links(const std::string& original_text, int width,
+                        const std::vector<InlineLink>& inline_links) {
+        std::vector<std::pair<std::string, std::vector<LinkPosition>>> result;
+
+        // If no links, use simple wrapping
+        if (inline_links.empty()) {
+            auto wrapped = wrap_text(original_text, width);
+            for (const auto& line : wrapped) {
+                result.push_back({line, {}});
+            }
+            return result;
+        }
+
+        // Build modified text with link numbers inserted
+        std::string text;
+        std::vector<InlineLink> modified_links;
+        size_t text_pos = 0;
+
+        for (const auto& link : inline_links) {
+            // Add text before link
+            if (link.start_pos > text_pos) {
+                text += original_text.substr(text_pos, link.start_pos - text_pos);
+            }
+
+            // Add link text with number indicator
+            size_t link_start_in_modified = text.length();
+            std::string link_text = original_text.substr(link.start_pos, link.end_pos - link.start_pos);
+            std::string link_indicator = "[" + std::to_string(link.link_index) + "]";
+            text += link_text + link_indicator;
+
+            // Store modified link position (including the indicator)
+            InlineLink mod_link = link;
+            mod_link.start_pos = link_start_in_modified;
+            mod_link.end_pos = text.length();
+            modified_links.push_back(mod_link);
+
+            text_pos = link.end_pos;
+        }
+
+        // Add remaining text after last link
+        if (text_pos < original_text.length()) {
+            text += original_text.substr(text_pos);
+        }
+
+        // Split text into words
+        std::vector<std::string> words;
+        std::vector<size_t> word_positions;
+
+        size_t pos = 0;
+        while (pos < text.length()) {
+            // Skip whitespace
+            while (pos < text.length() && std::isspace(text[pos])) {
+                pos++;
+            }
+            if (pos >= text.length()) break;
+
+            // Extract word
+            size_t word_start = pos;
+            while (pos < text.length() && !std::isspace(text[pos])) {
+                pos++;
+            }
+
+            words.push_back(text.substr(word_start, pos - word_start));
+            word_positions.push_back(word_start);
+        }
+
+        // Build lines
+        std::string current_line;
+        std::vector<LinkPosition> current_links;
+
+        for (size_t i = 0; i < words.size(); ++i) {
+            const auto& word = words[i];
+            size_t word_pos = word_positions[i];
+
+            bool can_fit = current_line.empty()
+                ? word.length() <= static_cast<size_t>(width)
+                : current_line.length() + 1 + word.length() <= static_cast<size_t>(width);
+
+            if (!can_fit && !current_line.empty()) {
+                // Save current line
+                result.push_back({current_line, current_links});
+                current_line.clear();
+                current_links.clear();
+            }
+
+            // Add word to current line
+            if (!current_line.empty()) {
+                current_line += " ";
+            }
+            size_t word_start_in_line = current_line.length();
+            current_line += word;
+
+            // Check if this word overlaps with any links
+            for (const auto& link : modified_links) {
+                size_t word_end = word_pos + word.length();
+
+                // Check for overlap
+                if (word_pos < link.end_pos && word_end > link.start_pos) {
+                    // Calculate link position in current line
+                    size_t link_start_in_line = word_start_in_line;
+                    if (link.start_pos > word_pos) {
+                        link_start_in_line += (link.start_pos - word_pos);
+                    }
+
+                    size_t link_end_in_line = word_start_in_line + word.length();
+                    if (link.end_pos < word_end) {
+                        link_end_in_line -= (word_end - link.end_pos);
+                    }
+
+                    // Check if link already added
+                    bool already_added = false;
+                    for (auto& existing : current_links) {
+                        if (existing.link_index == link.link_index) {
+                            // Extend existing link range
+                            existing.end = link_end_in_line;
+                            already_added = true;
+                            break;
+                        }
+                    }
+
+                    if (!already_added) {
+                        LinkPosition lp;
+                        lp.link_index = link.link_index;
+                        lp.start = link_start_in_line;
+                        lp.end = link_end_in_line;
+                        current_links.push_back(lp);
+                    }
+                }
+            }
+        }
+
+        // Add last line
+        if (!current_line.empty()) {
+            result.push_back({current_line, current_links});
+        }
+
+        if (result.empty()) {
+            result.push_back({"", {}});
+        }
+
+        return result;
     }
 
     std::string add_indent(const std::string& text, int indent) {
@@ -167,18 +318,38 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
                 break;
         }
 
-        auto wrapped_lines = pImpl->wrap_text(elem.text, content_width - prefix.length());
-        for (size_t i = 0; i < wrapped_lines.size(); ++i) {
+        auto wrapped_with_links = pImpl->wrap_text_with_links(elem.text,
+                                                              content_width - prefix.length(),
+                                                              elem.inline_links);
+
+        for (size_t i = 0; i < wrapped_with_links.size(); ++i) {
+            const auto& [line_text, link_positions] = wrapped_with_links[i];
             RenderedLine line;
+
             if (i == 0) {
-                line.text = std::string(margin, ' ') + prefix + wrapped_lines[i];
+                line.text = std::string(margin, ' ') + prefix + line_text;
             } else {
-                line.text = std::string(margin + prefix.length(), ' ') + wrapped_lines[i];
+                line.text = std::string(margin + prefix.length(), ' ') + line_text;
             }
+
             line.color_pair = color;
             line.is_bold = bold;
-            line.is_link = false;
-            line.link_index = -1;
+
+            // Store link information
+            if (!link_positions.empty()) {
+                line.is_link = true;
+                line.link_index = link_positions[0].link_index;  // Primary link for Tab navigation
+
+                // Adjust link positions for margin and prefix
+                size_t offset = (i == 0) ? (margin + prefix.length()) : (margin + prefix.length());
+                for (const auto& lp : link_positions) {
+                    line.link_ranges.push_back({lp.start + offset, lp.end + offset});
+                }
+            } else {
+                line.is_link = false;
+                line.link_index = -1;
+            }
+
             lines.push_back(line);
         }
 
@@ -198,7 +369,8 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
         }
     }
 
-    if (!doc.links.empty() && pImpl->config.show_link_indicators) {
+    // Don't show separate links section if inline links are displayed
+    if (!doc.links.empty() && !pImpl->config.show_link_indicators) {
         RenderedLine separator;
         std::string sepline(content_width, '-');
         separator.text = std::string(margin, ' ') + sepline;

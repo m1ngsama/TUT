@@ -26,6 +26,8 @@ enum class Action {
     NEXT_LINK,
     PREV_LINK,
     FOLLOW_LINK,
+    GOTO_LINK,        // Jump to specific link by number
+    FOLLOW_LINK_NUM,  // Follow specific link by number (f command)
     GO_BACK,
     GO_FORWARD,
     OPEN_URL,

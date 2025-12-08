@@ -24,11 +24,20 @@ struct Link {
     int position;
 };
 
+struct InlineLink {
+    std::string text;
+    std::string url;
+    size_t start_pos;  // Position in the text where link starts
+    size_t end_pos;    // Position in the text where link ends
+    int link_index;    // Index in the document's links array
+};
+
 struct ContentElement {
     ElementType type;
     std::string text;
     std::string url;
     int level;
+    std::vector<InlineLink> inline_links;  // Links within this element's text
 };
 
 struct ParsedDocument {
