@@ -3,6 +3,7 @@
 #include "html_parser.h"
 #include <string>
 #include <vector>
+#include <memory>
 #include <curses.h>
 
 // 渲染后的行信息

@@ -2,6 +2,7 @@
 
 #include <string>
 #include <functional>
+#include <memory>
 
 enum class InputMode {
     NORMAL,    // 正常浏览模式
