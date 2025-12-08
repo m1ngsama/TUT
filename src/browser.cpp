@@ -17,14 +17,12 @@ public:
     std::vector<std::string> history;
     int history_pos = -1;
 
-    // 视图状态
     int scroll_pos = 0;
     int current_link = -1;
     std::string status_message;
     std::string search_term;
-    std::vector<int> search_results; // 匹配行号
+    std::vector<int> search_results;
 
-    // 屏幕尺寸
     int screen_height = 0;
     int screen_width = 0;
 
@@ -36,7 +34,7 @@ public:
         noecho();
         keypad(stdscr, TRUE);
         curs_set(0);
-        timeout(0); // non-blocking
+        timeout(0);
         getmaxyx(stdscr, screen_height, screen_width);
     }
 
@@ -311,7 +309,6 @@ public:
     }
 
     void scroll_to_link(int link_idx) {
-        // 查找链接在渲染行中的位置
         for (size_t i = 0; i < rendered_lines.size(); ++i) {
             if (rendered_lines[i].is_link && rendered_lines[i].link_index == link_idx) {
                 int visible_lines = screen_height - 2;
@@ -406,7 +403,7 @@ void Browser::run(const std::string& initial_url) {
 
         int ch = getch();
         if (ch == ERR) {
-            napms(50); // 50ms sleep
+            napms(50);
             continue;
         }
 

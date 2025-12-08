@@ -21,14 +21,14 @@ enum class ElementType {
 struct Link {
     std::string text;
     std::string url;
-    int position; // 在文档中的位置（用于TAB导航）
+    int position;
 };
 
 struct ContentElement {
     ElementType type;
     std::string text;
-    std::string url; // 对于链接元素
-    int level;       // 对于标题元素（1-6）
+    std::string url;
+    int level;
 };
 
 struct ParsedDocument {
@@ -43,13 +43,8 @@ public:
     HtmlParser();
     ~HtmlParser();
 
-    // 解析HTML并提取可读内容
     ParsedDocument parse(const std::string& html, const std::string& base_url = "");
-
-    // 设置是否保留代码块
     void set_keep_code_blocks(bool keep);
-
-    // 设置是否保留列表
     void set_keep_lists(bool keep);
 
 private:

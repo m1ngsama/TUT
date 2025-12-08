@@ -19,16 +19,9 @@ public:
     HttpClient();
     ~HttpClient();
 
-    // 获取网页内容
     HttpResponse fetch(const std::string& url);
-
-    // 设置超时（秒）
     void set_timeout(long timeout_seconds);
-
-    // 设置用户代理
     void set_user_agent(const std::string& user_agent);
-
-    // 设置是否跟随重定向
     void set_follow_redirects(bool follow);
 
 private:
