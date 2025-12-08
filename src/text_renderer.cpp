@@ -7,7 +7,6 @@ class TextRenderer::Impl {
 public:
     RenderConfig config;
 
-    // 自动换行处理
     std::vector<std::string> wrap_text(const std::string& text, int width) {
         std::vector<std::string> lines;
         if (text.empty()) {
@@ -19,20 +18,17 @@ public:
         std::string current_line;
 
         while (words_stream >> word) {
-            // 处理单个词超长的情况
             if (word.length() > static_cast<size_t>(width)) {
                 if (!current_line.empty()) {
                     lines.push_back(current_line);
                     current_line.clear();
                 }
-                // 强制分割长词
                 for (size_t i = 0; i < word.length(); i += width) {
                     lines.push_back(word.substr(i, width));
                 }
                 continue;
             }
 
-            // 正常换行逻辑
             if (current_line.empty()) {
                 current_line = word;
             } else if (current_line.length() + 1 + word.length() <= static_cast<size_t>(width)) {
@@ -54,7 +50,6 @@ public:
         return lines;
     }
 
-    // 添加缩进
     std::string add_indent(const std::string& text, int indent) {
         return std::string(indent, ' ') + text;
     }
@@ -69,20 +64,17 @@ TextRenderer::~TextRenderer() = default;
 std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int screen_width) {
     std::vector<RenderedLine> lines;
 
-    // 计算实际内容宽度
     int content_width = std::min(pImpl->config.max_width, screen_width - 4);
     if (content_width < 40) {
         content_width = screen_width - 4;
     }
 
-    // 计算左边距（如果居中）
     int margin = 0;
     if (pImpl->config.center_content && content_width < screen_width) {
         margin = (screen_width - content_width) / 2;
     }
     pImpl->config.margin_left = margin;
 
-    // 渲染标题
     if (!doc.title.empty()) {
         RenderedLine title_line;
         title_line.text = std::string(margin, ' ') + doc.title;
@@ -92,7 +84,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
         title_line.link_index = -1;
         lines.push_back(title_line);
 
-        // 标题下划线
         RenderedLine underline;
         underline.text = std::string(margin, ' ') + std::string(std::min((int)doc.title.length(), content_width), '=');
         underline.color_pair = COLOR_HEADING1;
@@ -101,7 +92,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
         underline.link_index = -1;
         lines.push_back(underline);
 
-        // 空行
         RenderedLine empty;
         empty.text = "";
         empty.color_pair = COLOR_NORMAL;
@@ -111,7 +101,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
         lines.push_back(empty);
     }
 
-    // 渲染URL
     if (!doc.url.empty()) {
         RenderedLine url_line;
         url_line.text = std::string(margin, ' ') + "URL: " + doc.url;
@@ -130,7 +119,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
         lines.push_back(empty);
     }
 
-    // 渲染内容元素
     for (const auto& elem : doc.elements) {
         int color = COLOR_NORMAL;
         bool bold = false;
@@ -179,7 +167,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
                 break;
         }
 
-        // 换行处理
         auto wrapped_lines = pImpl->wrap_text(elem.text, content_width - prefix.length());
         for (size_t i = 0; i < wrapped_lines.size(); ++i) {
             RenderedLine line;
@@ -195,7 +182,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
             lines.push_back(line);
         }
 
-        // 段落间距
         if (elem.type == ElementType::PARAGRAPH ||
             elem.type == ElementType::HEADING1 ||
             elem.type == ElementType::HEADING2 ||
@@ -212,7 +198,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
         }
     }
 
-    // 渲染链接列表
     if (!doc.links.empty() && pImpl->config.show_link_indicators) {
         RenderedLine separator;
         std::string sepline(content_width, '-');
@@ -254,7 +239,6 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
                 lines.push_back(link_line);
             }
 
-            // URL on next line
             auto url_wrapped = pImpl->wrap_text(link.url, content_width - 6);
             for (const auto& url_line_text : url_wrapped) {
                 RenderedLine url_line;

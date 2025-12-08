@@ -23,22 +23,18 @@ public:
         result.has_count = false;
         result.count = 1;
 
-        // 处理数字前缀
         if (std::isdigit(ch) && (ch != '0' || !count_buffer.empty())) {
             count_buffer += static_cast<char>(ch);
             return result;
         }
 
-        // 解析count
         if (!count_buffer.empty()) {
             result.has_count = true;
             result.count = std::stoi(count_buffer);
             count_buffer.clear();
         }
 
-        // 处理vim风格的命令
         switch (ch) {
-            // 移动
             case 'j':
             case KEY_DOWN:
                 result.action = Action::SCROLL_DOWN;
@@ -55,18 +51,14 @@ public:
             case KEY_RIGHT:
                 result.action = Action::GO_FORWARD;
                 break;
-
-            // 翻页
-            case 4: // Ctrl-D
+            case 4:
             case ' ':
                 result.action = Action::SCROLL_PAGE_DOWN;
                 break;
-            case 21: // Ctrl-U
+            case 21:
             case 'b':
                 result.action = Action::SCROLL_PAGE_UP;
                 break;
-
-            // 跳转
             case 'g':
                 buffer += 'g';
                 if (buffer == "gg") {
@@ -82,8 +74,6 @@ public:
                     result.action = Action::GOTO_BOTTOM;
                 }
                 break;
-
-            // 搜索
             case '/':
                 mode = InputMode::SEARCH;
                 buffer = "/";
@@ -94,27 +84,21 @@ public:
             case 'N':
                 result.action = Action::SEARCH_PREV;
                 break;
-
-            // 链接导航
-            case '\t': // Tab
+            case '\t':
                 result.action = Action::NEXT_LINK;
                 break;
-            case KEY_BTAB: // Shift-Tab (可能不是所有终端都支持)
+            case KEY_BTAB:
             case 'T':
                 result.action = Action::PREV_LINK;
                 break;
-            case '\n': // Enter
+            case '\n':
             case '\r':
                 result.action = Action::FOLLOW_LINK;
                 break;
-
-            // 命令模式
             case ':':
                 mode = InputMode::COMMAND;
                 buffer = ":";
                 break;
-
-            // 其他操作
             case 'r':
                 result.action = Action::REFRESH;
                 break;
@@ -124,7 +108,6 @@ public:
             case '?':
                 result.action = Action::HELP;
                 break;
-
             default:
                 buffer.clear();
                 break;
@@ -138,8 +121,7 @@ public:
         result.action = Action::NONE;
 
         if (ch == '\n' || ch == '\r') {
-            // 执行命令
-            std::string command = buffer.substr(1); // 去掉':'
+            std::string command = buffer.substr(1);
 
             if (command == "q" || command == "quit") {
                 result.action = Action::QUIT;
@@ -148,14 +130,12 @@ public:
             } else if (command == "r" || command == "refresh") {
                 result.action = Action::REFRESH;
             } else if (command.rfind("o ", 0) == 0 || command.rfind("open ", 0) == 0) {
-                // :o URL 或 :open URL
                 size_t space_pos = command.find(' ');
                 if (space_pos != std::string::npos) {
                     result.action = Action::OPEN_URL;
                     result.text = command.substr(space_pos + 1);
                 }
             } else if (!command.empty() && std::isdigit(command[0])) {
-                // 跳转到行号
                 try {
                     result.action = Action::GOTO_LINE;
                     result.number = std::stoi(command);
@@ -166,7 +146,7 @@ public:
 
             mode = InputMode::NORMAL;
             buffer.clear();
-        } else if (ch == 27) { // ESC
+        } else if (ch == 27) {
             mode = InputMode::NORMAL;
             buffer.clear();
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
@@ -188,14 +168,13 @@ public:
         result.action = Action::NONE;
 
         if (ch == '\n' || ch == '\r') {
-            // 执行搜索
             if (buffer.length() > 1) {
                 result.action = Action::SEARCH_FORWARD;
-                result.text = buffer.substr(1); // 去掉'/'
+                result.text = buffer.substr(1);
             }
             mode = InputMode::NORMAL;
             buffer.clear();
-        } else if (ch == 27) { // ESC
+        } else if (ch == 27) {
             mode = InputMode::NORMAL;
             buffer.clear();
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {

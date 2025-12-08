@@ -52,9 +52,9 @@ public:
         auto response = http_client.fetch(url);
 
         if (!response.is_success()) {
-            status_message = "Error: " + (response.error_message.empty() ?
+            status_message = response.error_message.empty() ?
                 "HTTP " + std::to_string(response.status_code) :
-                response.error_message);
+                response.error_message;
             return false;
         }
 
@@ -65,14 +65,13 @@ public:
         current_link = -1;
         search_results.clear();
 
-        // 更新历史
         if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
             history.erase(history.begin() + history_pos + 1, history.end());
         }
         history.push_back(url);
         history_pos = history.size() - 1;
 
-        status_message = "Loaded: " + (current_doc.title.empty() ? url : current_doc.title);
+        status_message = current_doc.title.empty() ? url : current_doc.title;
         return true;
     }
 
@@ -80,7 +79,6 @@ public:
         attron(COLOR_PAIR(COLOR_STATUS_BAR));
         mvprintw(screen_height - 1, 0, "%s", std::string(screen_width, ' ').c_str());
 
-        // 显示模式和缓冲
         std::string mode_str;
         InputMode mode = input_handler.get_mode();
         switch (mode) {
@@ -88,29 +86,24 @@ public:
                 mode_str = "NORMAL";
                 break;
             case InputMode::COMMAND:
-                mode_str = input_handler.get_buffer();
-                break;
             case InputMode::SEARCH:
                 mode_str = input_handler.get_buffer();
                 break;
             default:
-                mode_str = "???";
+                mode_str = "";
                 break;
         }
 
-        // 左侧：模式或命令
         mvprintw(screen_height - 1, 0, " %s", mode_str.c_str());
 
-        // 中间：状态消息
         if (!status_message.empty() && mode == InputMode::NORMAL) {
             int msg_x = (screen_width - status_message.length()) / 2;
-            if (msg_x < mode_str.length() + 2) {
+            if (msg_x < static_cast<int>(mode_str.length()) + 2) {
                 msg_x = mode_str.length() + 2;
             }
             mvprintw(screen_height - 1, msg_x, "%s", status_message.c_str());
         }
 
-        // 右侧：位置信息
         int total_lines = rendered_lines.size();
         int visible_lines = screen_height - 2;
         int percentage = 0;
@@ -147,7 +140,6 @@ public:
             int line_idx = scroll_pos + i;
             const auto& line = rendered_lines[line_idx];
 
-            // 高亮当前链接
             if (line.is_link && line.link_index == current_link) {
                 attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
             } else {
@@ -157,15 +149,12 @@ public:
                 }
             }
 
-            // 搜索高亮
-            std::string display_text = line.text;
             if (!search_term.empty() &&
                 std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end()) {
-                // 简单高亮：整行反色（实际应该只高亮匹配部分）
                 attron(A_REVERSE);
             }
 
-            mvprintw(i, 0, "%s", display_text.c_str());
+            mvprintw(i, 0, "%s", line.text.c_str());
 
             if (!search_term.empty() &&
                 std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end()) {
@@ -225,7 +214,6 @@ public:
             case Action::NEXT_LINK:
                 if (!current_doc.links.empty()) {
                     current_link = (current_link + 1) % current_doc.links.size();
-                    // 滚动到链接位置
                     scroll_to_link(current_link);
                 }
                 break;

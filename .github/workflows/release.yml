@@ -47,13 +47,13 @@ jobs:
 
     - name: Rename binary with platform suffix
       run: |
-        mv build/nbtca_tui build/nbtca_tui-${{ matrix.name }}
+        mv build/tut build/tut-${{ matrix.name }}
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: nbtca_tui-${{ matrix.name }}
-        path: build/nbtca_tui-${{ matrix.name }}
+        name: tut-${{ matrix.name }}
+        path: build/tut-${{ matrix.name }}
 
   release:
     needs: build
@@ -85,13 +85,13 @@ jobs:
           Automated release for commit ${{ github.sha }}
 
           ## Download
-          - **macOS**: `nbtca_tui-macos`
-          - **Linux**: `nbtca_tui-linux`
+          - **macOS**: `tut-macos`
+          - **Linux**: `tut-linux`
 
           ## Build from source
           See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for build instructions.
         files: |
-          artifacts/nbtca_tui-macos/nbtca_tui-macos
-          artifacts/nbtca_tui-linux/nbtca_tui-linux
+          artifacts/tut-macos/tut-macos
+          artifacts/tut-linux/tut-linux
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

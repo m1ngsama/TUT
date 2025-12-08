@@ -12,19 +12,18 @@ void print_usage(const char* prog_name) {
               << "  " << prog_name << " https://example.com\n"
               << "  " << prog_name << " https://news.ycombinator.com\n\n"
               << "Vim-style keybindings:\n"
-              << "  j/k     - Scroll down/up\n"
-              << "  gg/G    - Go to top/bottom\n"
-              << "  /       - Search\n"
-              << "  Tab     - Next link\n"
-              << "  Enter   - Follow link\n"
-              << "  h/l     - Back/Forward\n"
-              << "  :o URL  - Open URL\n"
-              << "  :q      - Quit\n"
-              << "  ?       - Show help\n";
+              << "  j/k       - Scroll down/up\n"
+              << "  gg/G      - Go to top/bottom\n"
+              << "  /         - Search\n"
+              << "  Tab       - Next link\n"
+              << "  Enter     - Follow link\n"
+              << "  h/l       - Back/Forward\n"
+              << "  :o URL    - Open URL\n"
+              << "  :q        - Quit\n"
+              << "  ?         - Show help\n";
 }
 
 int main(int argc, char* argv[]) {
-    // 解析命令行参数
     std::string initial_url;
 
     if (argc > 1) {

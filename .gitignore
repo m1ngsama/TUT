@@ -2,3 +2,8 @@ build/
 *.o
 tut
 .DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
