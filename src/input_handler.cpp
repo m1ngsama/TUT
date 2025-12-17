@@ -23,21 +23,9 @@ public:
         result.has_count = false;
         result.count = 1;
 
-        // Handle multi-char commands like 'gg', 'gt', 'gT', 'm', '
+        // Handle multi-char commands like 'gg', 'm', '
         if (!buffer.empty()) {
-            if (buffer == "g") {
-                if (ch == 't') {
-                    result.action = Action::NEXT_TAB;
-                    buffer.clear();
-                    count_buffer.clear();
-                    return result;
-                } else if (ch == 'T') {
-                    result.action = Action::PREV_TAB;
-                    buffer.clear();
-                    count_buffer.clear();
-                    return result;
-                }
-            } else if (buffer == "m") {
+            if (buffer == "m") {
                 // Set mark with letter
                 if (std::isalpha(ch)) {
                     result.action = Action::SET_MARK;
@@ -161,18 +149,6 @@ public:
                 result.action = Action::SHOW_LINK_HINTS;
                 mode = InputMode::LINK_HINTS;
                 buffer.clear();
-                count_buffer.clear();
-                break;
-            case 'v':
-                // Enter visual mode
-                result.action = Action::ENTER_VISUAL_MODE;
-                mode = InputMode::VISUAL;
-                count_buffer.clear();
-                break;
-            case 'V':
-                // Enter visual line mode
-                result.action = Action::ENTER_VISUAL_LINE_MODE;
-                mode = InputMode::VISUAL_LINE;
                 count_buffer.clear();
                 break;
             case 'm':
@@ -348,42 +324,6 @@ public:
         return result;
     }
 
-    InputResult process_visual_mode(int ch) {
-        InputResult result;
-        result.action = Action::NONE;
-
-        if (ch == 27 || ch == 'v') {
-            // ESC or 'v' exits visual mode
-            mode = InputMode::NORMAL;
-            return result;
-        } else if (ch == 'y') {
-            // Yank (copy) selected text
-            result.action = Action::YANK;
-            mode = InputMode::NORMAL;
-            return result;
-        }
-
-        // Pass through navigation commands
-        switch (ch) {
-            case 'j':
-            case KEY_DOWN:
-                result.action = Action::SCROLL_DOWN;
-                break;
-            case 'k':
-            case KEY_UP:
-                result.action = Action::SCROLL_UP;
-                break;
-            case 'h':
-            case KEY_LEFT:
-                // In visual mode, h/l could extend selection
-                break;
-            case 'l':
-            case KEY_RIGHT:
-                break;
-        }
-
-        return result;
-    }
 };
 
 InputHandler::InputHandler() : pImpl(std::make_unique<Impl>()) {}
@@ -402,9 +342,6 @@ InputResult InputHandler::handle_key(int ch) {
             return pImpl->process_link_mode(ch);
         case InputMode::LINK_HINTS:
             return pImpl->process_link_hints_mode(ch);
-        case InputMode::VISUAL:
-        case InputMode::VISUAL_LINE:
-            return pImpl->process_visual_mode(ch);
         default:
             break;
     }

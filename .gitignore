@@ -1,6 +1,21 @@
+# Build artifacts
 build/
 *.o
+*.a
+*.so
+*.dylib
+
+# Executables
 tut
+nbtca_tui
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# Editor/IDE
 .DS_Store
 *.swp
 *.swo
