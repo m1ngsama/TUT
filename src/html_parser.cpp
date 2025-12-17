@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <functional>
 
 class HtmlParser::Impl {
 public:
@@ -234,6 +235,133 @@ public:
 
         return result;
     }
+
+    // Extract images
+    std::vector<Image> extract_images(const std::string& html) {
+        std::vector<Image> images;
+        std::regex img_regex(R"(<img[^>]*src\s*=\s*["']([^"']*)["'][^>]*>)", std::regex::icase);
+
+        auto begin = std::sregex_iterator(html.begin(), html.end(), img_regex);
+        auto end = std::sregex_iterator();
+
+        for (std::sregex_iterator i = begin; i != end; ++i) {
+            std::smatch match = *i;
+            Image img;
+            img.src = match[1].str();
+            img.width = -1;
+            img.height = -1;
+
+            // Extract alt text
+            std::string img_tag = match[0].str();
+            std::regex alt_regex(R"(alt\s*=\s*["']([^"']*)["'])", std::regex::icase);
+            std::smatch alt_match;
+            if (std::regex_search(img_tag, alt_match, alt_regex)) {
+                img.alt = decode_html_entities(alt_match[1].str());
+            }
+
+            // Extract width
+            std::regex width_regex(R"(width\s*=\s*["']?(\d+)["']?)", std::regex::icase);
+            std::smatch width_match;
+            if (std::regex_search(img_tag, width_match, width_regex)) {
+                try {
+                    img.width = std::stoi(width_match[1].str());
+                } catch (...) {}
+            }
+
+            // Extract height
+            std::regex height_regex(R"(height\s*=\s*["']?(\d+)["']?)", std::regex::icase);
+            std::smatch height_match;
+            if (std::regex_search(img_tag, height_match, height_regex)) {
+                try {
+                    img.height = std::stoi(height_match[1].str());
+                } catch (...) {}
+            }
+
+            images.push_back(img);
+        }
+
+        return images;
+    }
+
+    // Extract tables
+    std::vector<Table> extract_tables(const std::string& html, std::vector<Link>& all_links) {
+        std::vector<Table> tables;
+        auto table_contents = extract_all_tags(html, "table");
+
+        for (const auto& table_html : table_contents) {
+            Table table;
+            table.has_header = false;
+
+            // Extract rows
+            auto thead_html = extract_tag_content(table_html, "thead");
+            auto tbody_html = extract_tag_content(table_html, "tbody");
+
+            // If no thead/tbody, just get all rows
+            std::vector<std::string> row_htmls;
+            if (!thead_html.empty() || !tbody_html.empty()) {
+                if (!thead_html.empty()) {
+                    auto header_rows = extract_all_tags(thead_html, "tr");
+                    row_htmls.insert(row_htmls.end(), header_rows.begin(), header_rows.end());
+                    table.has_header = !header_rows.empty();
+                }
+                if (!tbody_html.empty()) {
+                    auto body_rows = extract_all_tags(tbody_html, "tr");
+                    row_htmls.insert(row_htmls.end(), body_rows.begin(), body_rows.end());
+                }
+            } else {
+                row_htmls = extract_all_tags(table_html, "tr");
+                // Check if first row has <th> tags
+                if (!row_htmls.empty()) {
+                    table.has_header = (row_htmls[0].find("<th") != std::string::npos);
+                }
+            }
+
+            bool is_first_row = true;
+            for (const auto& row_html : row_htmls) {
+                TableRow row;
+
+                // Extract cells (both th and td)
+                auto th_cells = extract_all_tags(row_html, "th");
+                auto td_cells = extract_all_tags(row_html, "td");
+
+                // Process th cells (headers)
+                for (const auto& cell_html : th_cells) {
+                    TableCell cell;
+                    std::vector<InlineLink> inline_links;
+                    cell.text = extract_text_with_links(cell_html, all_links, inline_links);
+                    cell.inline_links = inline_links;
+                    cell.is_header = true;
+                    cell.colspan = 1;
+                    cell.rowspan = 1;
+                    row.cells.push_back(cell);
+                }
+
+                // Process td cells (data)
+                for (const auto& cell_html : td_cells) {
+                    TableCell cell;
+                    std::vector<InlineLink> inline_links;
+                    cell.text = extract_text_with_links(cell_html, all_links, inline_links);
+                    cell.inline_links = inline_links;
+                    cell.is_header = is_first_row && table.has_header && th_cells.empty();
+                    cell.colspan = 1;
+                    cell.rowspan = 1;
+                    row.cells.push_back(cell);
+                }
+
+                if (!row.cells.empty()) {
+                    table.rows.push_back(row);
+                }
+
+                is_first_row = false;
+            }
+
+            if (!table.rows.empty()) {
+                tables.push_back(table);
+            }
+        }
+
+        return tables;
+    }
 };
 
 HtmlParser::HtmlParser() : pImpl(std::make_unique<Impl>()) {}
@@ -271,33 +399,117 @@ ParsedDocument HtmlParser::parse(const std::string& html, const std::string& bas
     // 提取链接
     doc.links = pImpl->extract_links(main_content, base_url);
 
+    // Extract and add images
+    auto images = pImpl->extract_images(main_content);
+    for (const auto& img : images) {
+        ContentElement elem;
+        elem.type = ElementType::IMAGE;
+        elem.image_data = img;
+        elem.level = 0;
+        elem.list_number = 0;
+        elem.nesting_level = 0;
+        doc.elements.push_back(elem);
+    }
+
+    // Extract and add tables
+    auto tables = pImpl->extract_tables(main_content, doc.links);
+    for (const auto& tbl : tables) {
+        ContentElement elem;
+        elem.type = ElementType::TABLE;
+        elem.table_data = tbl;
+        elem.level = 0;
+        elem.list_number = 0;
+        elem.nesting_level = 0;
+        doc.elements.push_back(elem);
+    }
+
     // 解析标题
     for (int level = 1; level <= 6; ++level) {
         std::string tag = "h" + std::to_string(level);
         auto headings = pImpl->extract_all_tags(main_content, tag);
         for (const auto& heading : headings) {
             ContentElement elem;
-            elem.type = (level == 1) ? ElementType::HEADING1 :
-                       (level == 2) ? ElementType::HEADING2 : ElementType::HEADING3;
+            ElementType type;
+            if (level == 1) type = ElementType::HEADING1;
+            else if (level == 2) type = ElementType::HEADING2;
+            else if (level == 3) type = ElementType::HEADING3;
+            else if (level == 4) type = ElementType::HEADING4;
+            else if (level == 5) type = ElementType::HEADING5;
+            else type = ElementType::HEADING6;
+
+            elem.type = type;
             elem.text = pImpl->decode_html_entities(pImpl->trim(pImpl->remove_tags(heading)));
             elem.level = level;
+            elem.list_number = 0;
+            elem.nesting_level = 0;
             if (!elem.text.empty()) {
                 doc.elements.push_back(elem);
             }
         }
     }
 
-    // 解析列表项
+    // 解析列表项 - with nesting support
     if (pImpl->keep_lists) {
-        auto list_items = pImpl->extract_all_tags(main_content, "li");
-        for (const auto& item : list_items) {
-            std::string text = pImpl->decode_html_entities(pImpl->trim(pImpl->remove_tags(item)));
-            if (!text.empty() && text.length() > 1) {
-                ContentElement elem;
-                elem.type = ElementType::LIST_ITEM;
-                elem.text = text;
-                doc.elements.push_back(elem);
+        // Extract both <ul> and <ol> lists
+        auto ul_lists = pImpl->extract_all_tags(main_content, "ul");
+        auto ol_lists = pImpl->extract_all_tags(main_content, "ol");
+
+        // Helper to parse a list recursively
+        std::function<void(const std::string&, bool, int)> parse_list;
+        parse_list = [&](const std::string& list_html, bool is_ordered, int nesting) {
+            auto list_items = pImpl->extract_all_tags(list_html, "li");
+            int item_number = 1;
+
+            for (const auto& item_html : list_items) {
+                // Check if this item contains nested lists
+                bool has_nested_ul = item_html.find("<ul") != std::string::npos;
+                bool has_nested_ol = item_html.find("<ol") != std::string::npos;
+
+                // Extract text without nested lists
+                std::string item_text = item_html;
+                if (has_nested_ul || has_nested_ol) {
+                    // Remove nested lists from text
+                    item_text = std::regex_replace(item_text,
+                        std::regex("<ul[^>]*>[\\s\\S]*?</ul>", std::regex::icase), "");
+                    item_text = std::regex_replace(item_text,
+                        std::regex("<ol[^>]*>[\\s\\S]*?</ol>", std::regex::icase), "");
+                }
+
+                std::string text = pImpl->decode_html_entities(pImpl->trim(pImpl->remove_tags(item_text)));
+                if (!text.empty() && text.length() > 1) {
+                    ContentElement elem;
+                    elem.type = is_ordered ? ElementType::ORDERED_LIST_ITEM : ElementType::LIST_ITEM;
+                    elem.text = text;
+                    elem.level = 0;
+                    elem.list_number = item_number++;
+                    elem.nesting_level = nesting;
+                    doc.elements.push_back(elem);
+                }
+
+                // Parse nested lists
+                if (has_nested_ul) {
+                    auto nested_uls = pImpl->extract_all_tags(item_html, "ul");
+                    for (const auto& nested_ul : nested_uls) {
+                        parse_list(nested_ul, false, nesting + 1);
+                    }
+                }
+                if (has_nested_ol) {
+                    auto nested_ols = pImpl->extract_all_tags(item_html, "ol");
+                    for (const auto& nested_ol : nested_ols) {
+                        parse_list(nested_ol, true, nesting + 1);
+                    }
+                }
             }
+        };
+
+        // Parse unordered lists
+        for (const auto& ul : ul_lists) {
+            parse_list(ul, false, 0);
+        }
+
+        // Parse ordered lists
+        for (const auto& ol : ol_lists) {
+            parse_list(ol, true, 0);
         }
     }
 
@@ -307,6 +519,9 @@ ParsedDocument HtmlParser::parse(const std::string& html, const std::string& bas
         ContentElement elem;
         elem.type = ElementType::PARAGRAPH;
         elem.text = pImpl->extract_text_with_links(para, doc.links, elem.inline_links);
+        elem.level = 0;
+        elem.list_number = 0;
+        elem.nesting_level = 0;
         if (!elem.text.empty() && elem.text.length() > 1) {
             doc.elements.push_back(elem);
         }
@@ -321,6 +536,9 @@ ParsedDocument HtmlParser::parse(const std::string& html, const std::string& bas
                 ContentElement elem;
                 elem.type = ElementType::PARAGRAPH;
                 elem.text = text;
+                elem.level = 0;
+                elem.list_number = 0;
+                elem.nesting_level = 0;
                 doc.elements.push_back(elem);
             }
         }
@@ -339,6 +557,9 @@ ParsedDocument HtmlParser::parse(const std::string& html, const std::string& bas
                     ContentElement elem;
                     elem.type = ElementType::PARAGRAPH;
                     elem.text = line;
+                    elem.level = 0;
+                    elem.list_number = 0;
+                    elem.nesting_level = 0;
                     doc.elements.push_back(elem);
                 }
             }

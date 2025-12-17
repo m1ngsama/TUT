@@ -9,13 +9,28 @@ enum class ElementType {
     HEADING1,
     HEADING2,
     HEADING3,
+    HEADING4,
+    HEADING5,
+    HEADING6,
     PARAGRAPH,
     LINK,
     LIST_ITEM,
+    ORDERED_LIST_ITEM,
     BLOCKQUOTE,
     CODE_BLOCK,
     HORIZONTAL_RULE,
-    LINE_BREAK
+    LINE_BREAK,
+    TABLE,
+    IMAGE,
+    FORM,
+    SECTION_START,
+    SECTION_END,
+    NAV_START,
+    NAV_END,
+    HEADER_START,
+    HEADER_END,
+    ASIDE_START,
+    ASIDE_END
 };
 
 struct Link {
@@ -32,12 +47,57 @@ struct InlineLink {
     int link_index;    // Index in the document's links array
 };
 
+struct TableCell {
+    std::string text;
+    std::vector<InlineLink> inline_links;
+    bool is_header;
+    int colspan;
+    int rowspan;
+};
+
+struct TableRow {
+    std::vector<TableCell> cells;
+};
+
+struct Table {
+    std::vector<TableRow> rows;
+    bool has_header;
+};
+
+struct Image {
+    std::string src;
+    std::string alt;
+    int width;   // -1 if not specified
+    int height;  // -1 if not specified
+};
+
+struct FormField {
+    enum Type { TEXT, PASSWORD, CHECKBOX, RADIO, SUBMIT, BUTTON } type;
+    std::string name;
+    std::string value;
+    std::string placeholder;
+    bool checked;
+};
+
+struct Form {
+    std::string action;
+    std::string method;
+    std::vector<FormField> fields;
+};
+
 struct ContentElement {
     ElementType type;
     std::string text;
     std::string url;
     int level;
+    int list_number;  // For ordered lists
+    int nesting_level;  // For nested lists
     std::vector<InlineLink> inline_links;  // Links within this element's text
+
+    // Extended content types
+    Table table_data;
+    Image image_data;
+    Form form_data;
 };
 
 struct ParsedDocument {
