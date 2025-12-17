@@ -9,9 +9,7 @@ enum class InputMode {
     COMMAND,
     SEARCH,
     LINK,
-    LINK_HINTS,    // Vimium-style 'f' mode
-    VISUAL,        // Visual mode
-    VISUAL_LINE    // Visual line mode
+    LINK_HINTS     // Vimium-style 'f' mode
 };
 
 enum class Action {
@@ -39,16 +37,8 @@ enum class Action {
     REFRESH,
     QUIT,
     HELP,
-    ENTER_VISUAL_MODE,      // Start visual mode
-    ENTER_VISUAL_LINE_MODE, // Start visual line mode
     SET_MARK,               // Set a mark (m + letter)
-    GOTO_MARK,              // Jump to mark (' + letter)
-    YANK,                   // Copy selected text
-    NEXT_TAB,               // gt - next tab
-    PREV_TAB,               // gT - previous tab
-    NEW_TAB,                // :tabnew
-    CLOSE_TAB,              // :tabc
-    TOGGLE_MOUSE            // Toggle mouse support
+    GOTO_MARK               // Jump to mark (' + letter)
 };
 
 struct InputResult {

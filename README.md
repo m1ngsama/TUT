@@ -88,6 +88,24 @@ KEYBINDINGS
 **N**
     Jump to previous search match.
 
+### Marks
+
+**m***[a-z]*
+    Set mark at current position (e.g., **ma**, **mb**).
+
+**'***[a-z]*
+    Jump to mark (e.g., **'a**, **'b**).
+
+### Mouse
+
+**Left Click**
+    Click on links to follow them directly.
+
+**Scroll Wheel Up/Down**
+    Scroll page up or down.
+
+Works with most modern terminal emulators that support mouse events.
+
 ### Commands
 
 Press **:** to enter command mode. Available commands:

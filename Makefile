@@ -1,44 +1,28 @@
-# Makefile for TUT Browser
+# Simple Makefile wrapper for CMake build system
+# Follows Unix convention: simple interface to underlying build
 
-CXX = clang++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2
-LDFLAGS = -lncurses -lcurl
-
-# 源文件
-SOURCES = src/main.cpp \
-          src/http_client.cpp \
-          src/html_parser.cpp \
-          src/text_renderer.cpp \
-          src/input_handler.cpp \
-          src/browser.cpp
-
-# 目标文件
-OBJECTS = $(SOURCES:.cpp=.o)
-
-# 可执行文件
+BUILD_DIR = build
 TARGET = tut
 
-# 默认目标
-all: $(TARGET)
+.PHONY: all clean install test help
 
-# 链接
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) $(LDFLAGS) -o $(TARGET)
+all:
+	@mkdir -p $(BUILD_DIR)
+	@cd $(BUILD_DIR) && cmake .. && cmake --build .
+	@cp $(BUILD_DIR)/$(TARGET) .
 
-# 编译
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# 清理
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	@rm -rf $(BUILD_DIR) $(TARGET)
 
-# 运行
-run: $(TARGET)
-	./$(TARGET)
+install: all
+	@install -m 755 $(TARGET) /usr/local/bin/
 
-# 安装
-install: $(TARGET)
-	install -m 755 $(TARGET) /usr/local/bin/
+test: all
+	@./$(TARGET) https://example.com
 
-.PHONY: all clean run install
+help:
+	@echo "TUT Browser - Simple make targets"
+	@echo "  make       - Build the browser"
+	@echo "  make clean - Remove build artifacts"
+	@echo "  make install - Install to /usr/local/bin"
+	@echo "  make test  - Quick test run"

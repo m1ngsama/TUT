@@ -10,7 +10,7 @@ public:
     bool keep_code_blocks = true;
     bool keep_lists = true;
 
-    // 简单的HTML标签清理
+    // Remove HTML tags
     std::string remove_tags(const std::string& html) {
         std::string result;
         bool in_tag = false;
@@ -26,12 +26,9 @@ public:
         return result;
     }
 
-    // 解码HTML实体
+    // Decode HTML entities (named and numeric)
     std::string decode_html_entities(const std::string& text) {
-        std::string result = text;
-
-        // 常见HTML实体
-        const std::vector<std::pair<std::string, std::string>> entities = {
+        static const std::vector<std::pair<std::string, std::string>> named_entities = {
             {"&nbsp;", " "},
             {"&amp;", "&"},
             {"&lt;", "<"},
@@ -48,7 +45,10 @@ public:
             {"&rsquo;", "\u2019"}
         };
 
-        for (const auto& [entity, replacement] : entities) {
+        std::string result = text;
+
+        // Replace named entities
+        for (const auto& [entity, replacement] : named_entities) {
             size_t pos = 0;
             while ((pos = result.find(entity, pos)) != std::string::npos) {
                 result.replace(pos, entity.length(), replacement);
@@ -56,10 +56,51 @@ public:
             }
         }
 
+        // Replace numeric entities (&#123; and &#xAB;)
+        std::regex numeric_entity(R"(&#(\d+);|&#x([0-9a-fA-F]+);)");
+        std::smatch match;
+        std::string::const_iterator search_start(result.cbegin());
+        std::string temp;
+        size_t last_pos = 0;
+
+        while (std::regex_search(search_start, result.cend(), match, numeric_entity)) {
+            size_t match_pos = match.position(0) + (search_start - result.cbegin());
+            temp += result.substr(last_pos, match_pos - last_pos);
+
+            int code_point = 0;
+            if (match[1].length() > 0) {
+                // Decimal entity
+                code_point = std::stoi(match[1].str());
+            } else if (match[2].length() > 0) {
+                // Hex entity
+                code_point = std::stoi(match[2].str(), nullptr, 16);
+            }
+
+            // Convert to UTF-8 (simplified - only handles ASCII and basic Unicode)
+            if (code_point < 128) {
+                temp += static_cast<char>(code_point);
+            } else if (code_point < 0x800) {
+                temp += static_cast<char>(0xC0 | (code_point >> 6));
+                temp += static_cast<char>(0x80 | (code_point & 0x3F));
+            } else if (code_point < 0x10000) {
+                temp += static_cast<char>(0xE0 | (code_point >> 12));
+                temp += static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+                temp += static_cast<char>(0x80 | (code_point & 0x3F));
+            }
+
+            last_pos = match_pos + match.length(0);
+            search_start = result.cbegin() + last_pos;
+        }
+
+        if (!temp.empty()) {
+            temp += result.substr(last_pos);
+            result = temp;
+        }
+
         return result;
     }
 
-    // 提取标签内容
+    // Extract content between HTML tags
     std::string extract_tag_content(const std::string& html, const std::string& tag) {
         std::regex tag_regex("<" + tag + "[^>]*>([\\s\\S]*?)</" + tag + ">",
                            std::regex::icase);
@@ -70,7 +111,7 @@ public:
         return "";
     }
 
-    // 提取所有匹配的标签
+    // Extract all matching tags
     std::vector<std::string> extract_all_tags(const std::string& html, const std::string& tag) {
         std::vector<std::string> results;
         std::regex tag_regex("<" + tag + "[^>]*>([\\s\\S]*?)</" + tag + ">",
@@ -87,7 +128,7 @@ public:
         return results;
     }
 
-    // 提取链接
+    // Extract links from HTML
     std::vector<Link> extract_links(const std::string& html, const std::string& base_url) {
         std::vector<Link> links;
         std::regex link_regex(R"(<a\s+[^>]*href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)</a>)",
@@ -204,7 +245,7 @@ public:
         return trim(result);
     }
 
-    // 清理空白字符
+    // Trim whitespace
     std::string trim(const std::string& str) {
         auto start = str.begin();
         while (start != str.end() && std::isspace(*start)) {
