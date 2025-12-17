@@ -3,6 +3,7 @@
 #include <clocale>
 #include <algorithm>
 #include <sstream>
+#include <map>
 
 class Browser::Impl {
 public:
@@ -26,6 +27,9 @@ public:
     int screen_height = 0;
     int screen_width = 0;
 
+    // Marks support (vim-style position bookmarks)
+    std::map<char, int> marks;
+
     void init_screen() {
         setlocale(LC_ALL, "");
         initscr();
@@ -35,6 +39,11 @@ public:
         keypad(stdscr, TRUE);
         curs_set(0);
         timeout(0);
+
+        // Enable mouse support
+        mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
+        mouseinterval(0);  // No click delay
+
         getmaxyx(stdscr, screen_height, screen_width);
     }
 
@@ -71,6 +80,53 @@ public:
 
         status_message = current_doc.title.empty() ? url : current_doc.title;
         return true;
+    }
+
+    void handle_mouse(MEVENT& event) {
+        int visible_lines = screen_height - 2;
+
+        // Mouse wheel up (scroll up)
+        if (event.bstate & BUTTON4_PRESSED) {
+            scroll_pos = std::max(0, scroll_pos - 3);
+            return;
+        }
+
+        // Mouse wheel down (scroll down)
+        if (event.bstate & BUTTON5_PRESSED) {
+            int max_scroll = std::max(0, static_cast<int>(rendered_lines.size()) - visible_lines);
+            scroll_pos = std::min(max_scroll, scroll_pos + 3);
+            return;
+        }
+
+        // Left click
+        if (event.bstate & BUTTON1_CLICKED) {
+            int clicked_line = event.y;
+            int clicked_col = event.x;
+
+            // Check if clicked on a link
+            if (clicked_line >= 0 && clicked_line < visible_lines) {
+                int doc_line_idx = scroll_pos + clicked_line;
+                if (doc_line_idx < static_cast<int>(rendered_lines.size())) {
+                    const auto& line = rendered_lines[doc_line_idx];
+
+                    // Check if click is within any link range
+                    for (const auto& [start, end] : line.link_ranges) {
+                        if (clicked_col >= static_cast<int>(start) && clicked_col < static_cast<int>(end)) {
+                            // Clicked on a link!
+                            if (line.link_index >= 0 && line.link_index < static_cast<int>(current_doc.links.size())) {
+                                load_page(current_doc.links[line.link_index].url);
+                                return;
+                            }
+                        }
+                    }
+
+                    // If clicked on a line with a link but not on the link text itself
+                    if (line.is_link && line.link_index >= 0) {
+                        current_link = line.link_index;
+                    }
+                }
+            }
+        }
     }
 
     void draw_status_bar() {
@@ -378,6 +434,27 @@ public:
                 }
                 break;
 
+            case Action::SET_MARK:
+                if (!result.text.empty()) {
+                    char mark = result.text[0];
+                    marks[mark] = scroll_pos;
+                    status_message = "Mark '" + std::string(1, mark) + "' set at line " + std::to_string(scroll_pos);
+                }
+                break;
+
+            case Action::GOTO_MARK:
+                if (!result.text.empty()) {
+                    char mark = result.text[0];
+                    auto it = marks.find(mark);
+                    if (it != marks.end()) {
+                        scroll_pos = std::min(it->second, max_scroll);
+                        status_message = "Jumped to mark '" + std::string(1, mark) + "'";
+                    } else {
+                        status_message = "Mark '" + std::string(1, mark) + "' not set";
+                    }
+                }
+                break;
+
             case Action::HELP:
                 show_help();
                 break;
@@ -429,10 +506,22 @@ public:
                   << "<p>:r or :refresh - Refresh page</p>"
                   << "<p>:h or :help - Show this help</p>"
                   << "<p>:[number] - Go to line number</p>"
+                  << "<h2>Vim Features</h2>"
+                  << "<p>m[a-z]: Set mark at letter (e.g., ma, mb)</p>"
+                  << "<p>'[a-z]: Jump to mark (e.g., 'a, 'b)</p>"
+                  << "<p>v: Enter visual mode (infrastructure ready)</p>"
+                  << "<p>V: Enter visual line mode (infrastructure ready)</p>"
+                  << "<p>gt: Next tab (infrastructure ready)</p>"
+                  << "<p>gT: Previous tab (infrastructure ready)</p>"
+                  << "<h2>Mouse Support</h2>"
+                  << "<p>Click on links to follow them</p>"
+                  << "<p>Scroll wheel to scroll up/down</p>"
+                  << "<p>Works with most terminal emulators</p>"
                   << "<h2>Other</h2>"
                   << "<p>r: Refresh current page</p>"
                   << "<p>q: Quit browser</p>"
                   << "<p>?: Show help</p>"
+                  << "<p>ESC: Cancel current mode</p>"
                   << "<h2>Important Limitations</h2>"
                   << "<p><strong>JavaScript/SPA Websites:</strong> This browser cannot execute JavaScript. "
                   << "Single Page Applications (SPAs) built with React, Vue, Angular, etc. will not work properly "
@@ -486,6 +575,15 @@ void Browser::run(const std::string& initial_url) {
         int ch = getch();
         if (ch == ERR) {
             napms(50);
+            continue;
+        }
+
+        // Handle mouse events
+        if (ch == KEY_MOUSE) {
+            MEVENT event;
+            if (getmouse(&event) == OK) {
+                pImpl->handle_mouse(event);
+            }
             continue;
         }
 
