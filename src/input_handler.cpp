@@ -23,7 +23,48 @@ public:
         result.has_count = false;
         result.count = 1;
 
-        // Handle digit input for count or 'f' command
+        // Handle multi-char commands like 'gg', 'gt', 'gT', 'm', '
+        if (!buffer.empty()) {
+            if (buffer == "g") {
+                if (ch == 't') {
+                    result.action = Action::NEXT_TAB;
+                    buffer.clear();
+                    count_buffer.clear();
+                    return result;
+                } else if (ch == 'T') {
+                    result.action = Action::PREV_TAB;
+                    buffer.clear();
+                    count_buffer.clear();
+                    return result;
+                }
+            } else if (buffer == "m") {
+                // Set mark with letter
+                if (std::isalpha(ch)) {
+                    result.action = Action::SET_MARK;
+                    result.text = std::string(1, static_cast<char>(ch));
+                    buffer.clear();
+                    count_buffer.clear();
+                    return result;
+                }
+                buffer.clear();
+                count_buffer.clear();
+                return result;
+            } else if (buffer == "'") {
+                // Jump to mark
+                if (std::isalpha(ch)) {
+                    result.action = Action::GOTO_MARK;
+                    result.text = std::string(1, static_cast<char>(ch));
+                    buffer.clear();
+                    count_buffer.clear();
+                    return result;
+                }
+                buffer.clear();
+                count_buffer.clear();
+                return result;
+            }
+        }
+
+        // Handle digit input for count
         if (std::isdigit(ch) && (ch != '0' || !count_buffer.empty())) {
             count_buffer += static_cast<char>(ch);
             return result;
@@ -116,16 +157,33 @@ public:
                 count_buffer.clear();
                 break;
             case 'f':
-                // 'f' command: follow link by number
-                if (result.has_count) {
-                    result.action = Action::FOLLOW_LINK_NUM;
-                    result.number = result.count;
-                    count_buffer.clear();
-                } else {
-                    // Enter link follow mode, wait for number
-                    mode = InputMode::LINK;
-                    buffer = "f";
-                }
+                // 'f' command: vimium-style link hints
+                result.action = Action::SHOW_LINK_HINTS;
+                mode = InputMode::LINK_HINTS;
+                buffer.clear();
+                count_buffer.clear();
+                break;
+            case 'v':
+                // Enter visual mode
+                result.action = Action::ENTER_VISUAL_MODE;
+                mode = InputMode::VISUAL;
+                count_buffer.clear();
+                break;
+            case 'V':
+                // Enter visual line mode
+                result.action = Action::ENTER_VISUAL_LINE_MODE;
+                mode = InputMode::VISUAL_LINE;
+                count_buffer.clear();
+                break;
+            case 'm':
+                // Set mark (wait for next char)
+                buffer = "m";
+                count_buffer.clear();
+                break;
+            case '\'':
+                // Jump to mark (wait for next char)
+                buffer = "'";
+                count_buffer.clear();
                 break;
             case ':':
                 mode = InputMode::COMMAND;
@@ -257,6 +315,75 @@ public:
 
         return result;
     }
+
+    InputResult process_link_hints_mode(int ch) {
+        InputResult result;
+        result.action = Action::NONE;
+
+        if (ch == 27) {
+            // ESC cancels link hints mode
+            mode = InputMode::NORMAL;
+            buffer.clear();
+            return result;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            // Backspace removes last character
+            if (!buffer.empty()) {
+                buffer.pop_back();
+            } else {
+                mode = InputMode::NORMAL;
+            }
+            return result;
+        } else if (std::isalpha(ch)) {
+            // Add character to buffer
+            buffer += std::tolower(static_cast<char>(ch));
+
+            // Try to match link hint
+            result.action = Action::FOLLOW_LINK_HINT;
+            result.text = buffer;
+
+            // Mode will be reset by browser if link is followed
+            return result;
+        }
+
+        return result;
+    }
+
+    InputResult process_visual_mode(int ch) {
+        InputResult result;
+        result.action = Action::NONE;
+
+        if (ch == 27 || ch == 'v') {
+            // ESC or 'v' exits visual mode
+            mode = InputMode::NORMAL;
+            return result;
+        } else if (ch == 'y') {
+            // Yank (copy) selected text
+            result.action = Action::YANK;
+            mode = InputMode::NORMAL;
+            return result;
+        }
+
+        // Pass through navigation commands
+        switch (ch) {
+            case 'j':
+            case KEY_DOWN:
+                result.action = Action::SCROLL_DOWN;
+                break;
+            case 'k':
+            case KEY_UP:
+                result.action = Action::SCROLL_UP;
+                break;
+            case 'h':
+            case KEY_LEFT:
+                // In visual mode, h/l could extend selection
+                break;
+            case 'l':
+            case KEY_RIGHT:
+                break;
+        }
+
+        return result;
+    }
 };
 
 InputHandler::InputHandler() : pImpl(std::make_unique<Impl>()) {}
@@ -273,6 +400,11 @@ InputResult InputHandler::handle_key(int ch) {
             return pImpl->process_search_mode(ch);
         case InputMode::LINK:
             return pImpl->process_link_mode(ch);
+        case InputMode::LINK_HINTS:
+            return pImpl->process_link_hints_mode(ch);
+        case InputMode::VISUAL:
+        case InputMode::VISUAL_LINE:
+            return pImpl->process_visual_mode(ch);
         default:
             break;
     }
