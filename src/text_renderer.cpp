@@ -2,6 +2,24 @@
 #include <sstream>
 #include <algorithm>
 #include <clocale>
+#include <numeric>
+
+// Box-drawing characters for tables
+namespace BoxChars {
+    constexpr const char* TOP_LEFT = "┌";
+    constexpr const char* TOP_RIGHT = "┐";
+    constexpr const char* BOTTOM_LEFT = "└";
+    constexpr const char* BOTTOM_RIGHT = "┘";
+    constexpr const char* HORIZONTAL = "─";
+    constexpr const char* VERTICAL = "│";
+    constexpr const char* T_DOWN = "┬";
+    constexpr const char* T_UP = "┴";
+    constexpr const char* T_RIGHT = "├";
+    constexpr const char* T_LEFT = "┤";
+    constexpr const char* CROSS = "┼";
+    constexpr const char* HEAVY_HORIZONTAL = "━";
+    constexpr const char* HEAVY_VERTICAL = "┃";
+}
 
 class TextRenderer::Impl {
 public:
@@ -204,6 +222,212 @@ public:
     std::string add_indent(const std::string& text, int indent) {
         return std::string(indent, ' ') + text;
     }
+
+    // Render a table with box-drawing characters
+    std::vector<RenderedLine> render_table(const Table& table, int content_width, int margin) {
+        std::vector<RenderedLine> lines;
+        if (table.rows.empty()) return lines;
+
+        // Calculate column widths
+        size_t num_cols = 0;
+        for (const auto& row : table.rows) {
+            num_cols = std::max(num_cols, row.cells.size());
+        }
+
+        if (num_cols == 0) return lines;
+
+        std::vector<int> col_widths(num_cols, 0);
+        int available_width = content_width - (num_cols + 1) * 3;  // Account for borders and padding
+
+        // First pass: calculate minimum widths
+        for (const auto& row : table.rows) {
+            for (size_t i = 0; i < row.cells.size() && i < num_cols; ++i) {
+                int cell_len = static_cast<int>(row.cells[i].text.length());
+                int max_width = available_width / static_cast<int>(num_cols);
+                int cell_width = std::min(cell_len, max_width);
+                col_widths[i] = std::max(col_widths[i], cell_width);
+            }
+        }
+
+        // Normalize column widths
+        int total_width = std::accumulate(col_widths.begin(), col_widths.end(), 0);
+        if (total_width > available_width) {
+            // Scale down proportionally
+            for (auto& width : col_widths) {
+                width = (width * available_width) / total_width;
+                width = std::max(width, 5);  // Minimum column width
+            }
+        }
+
+        // Helper to create separator line
+        auto create_separator = [&](bool is_top, bool is_bottom, bool is_middle, bool is_header) {
+            RenderedLine line;
+            std::string sep = std::string(margin, ' ');
+
+            if (is_top) {
+                sep += BoxChars::TOP_LEFT;
+            } else if (is_bottom) {
+                sep += BoxChars::BOTTOM_LEFT;
+            } else {
+                sep += BoxChars::T_RIGHT;
+            }
+
+            for (size_t i = 0; i < num_cols; ++i) {
+                const char* horiz = is_header ? BoxChars::HEAVY_HORIZONTAL : BoxChars::HORIZONTAL;
+                sep += std::string(col_widths[i] + 2, horiz[0]);
+
+                if (i < num_cols - 1) {
+                    if (is_top) {
+                        sep += BoxChars::T_DOWN;
+                    } else if (is_bottom) {
+                        sep += BoxChars::T_UP;
+                    } else {
+                        sep += BoxChars::CROSS;
+                    }
+                }
+            }
+
+            if (is_top) {
+                sep += BoxChars::TOP_RIGHT;
+            } else if (is_bottom) {
+                sep += BoxChars::BOTTOM_RIGHT;
+            } else {
+                sep += BoxChars::T_LEFT;
+            }
+
+            line.text = sep;
+            line.color_pair = COLOR_DIM;
+            line.is_bold = false;
+            line.is_link = false;
+            line.link_index = -1;
+            return line;
+        };
+
+        // Top border
+        lines.push_back(create_separator(true, false, false, false));
+
+        // Render rows
+        bool first_row = true;
+        for (const auto& row : table.rows) {
+            bool is_header_row = first_row && table.has_header;
+
+            // Wrap cell contents
+            std::vector<std::vector<std::string>> wrapped_cells(num_cols);
+            int max_cell_lines = 1;
+
+            for (size_t i = 0; i < row.cells.size() && i < num_cols; ++i) {
+                const auto& cell = row.cells[i];
+                auto cell_lines = wrap_text(cell.text, col_widths[i]);
+                wrapped_cells[i] = cell_lines;
+                max_cell_lines = std::max(max_cell_lines, static_cast<int>(cell_lines.size()));
+            }
+
+            // Render cell lines
+            for (int line_idx = 0; line_idx < max_cell_lines; ++line_idx) {
+                RenderedLine line;
+                std::string line_text = std::string(margin, ' ') + BoxChars::VERTICAL;
+
+                for (size_t col_idx = 0; col_idx < num_cols; ++col_idx) {
+                    std::string cell_text;
+                    if (col_idx < wrapped_cells.size() && line_idx < static_cast<int>(wrapped_cells[col_idx].size())) {
+                        cell_text = wrapped_cells[col_idx][line_idx];
+                    }
+
+                    // Pad to column width
+                    int padding = col_widths[col_idx] - cell_text.length();
+                    line_text += " " + cell_text + std::string(padding + 1, ' ') + BoxChars::VERTICAL;
+                }
+
+                line.text = line_text;
+                line.color_pair = is_header_row ? COLOR_HEADING2 : COLOR_NORMAL;
+                line.is_bold = is_header_row;
+                line.is_link = false;
+                line.link_index = -1;
+                lines.push_back(line);
+            }
+
+            // Separator after header or between rows
+            if (is_header_row) {
+                lines.push_back(create_separator(false, false, true, true));
+            }
+
+            first_row = false;
+        }
+
+        // Bottom border
+        lines.push_back(create_separator(false, true, false, false));
+
+        return lines;
+    }
+
+    // Render an image placeholder
+    std::vector<RenderedLine> render_image(const Image& img, int content_width, int margin) {
+        std::vector<RenderedLine> lines;
+
+        // Create a box for the image
+        std::string img_text = "[IMG";
+        if (!img.alt.empty()) {
+            img_text += ": " + img.alt;
+        }
+        img_text += "]";
+
+        // Truncate if too long
+        if (static_cast<int>(img_text.length()) > content_width) {
+            img_text = img_text.substr(0, content_width - 3) + "...]";
+        }
+
+        // Top border
+        RenderedLine top;
+        top.text = std::string(margin, ' ') + BoxChars::TOP_LEFT +
+                   std::string(img_text.length() + 2, BoxChars::HORIZONTAL[0]) +
+                   BoxChars::TOP_RIGHT;
+        top.color_pair = COLOR_DIM;
+        top.is_bold = false;
+        top.is_link = false;
+        top.link_index = -1;
+        lines.push_back(top);
+
+        // Content
+        RenderedLine content;
+        content.text = std::string(margin, ' ') + BoxChars::VERTICAL + " " + img_text + " " + BoxChars::VERTICAL;
+        content.color_pair = COLOR_LINK;
+        content.is_bold = true;
+        content.is_link = false;
+        content.link_index = -1;
+        lines.push_back(content);
+
+        // Dimensions if available
+        if (img.width > 0 || img.height > 0) {
+            std::string dims = " ";
+            if (img.width > 0) dims += std::to_string(img.width) + "w";
+            if (img.width > 0 && img.height > 0) dims += " × ";
+            if (img.height > 0) dims += std::to_string(img.height) + "h";
+            dims += " ";
+
+            RenderedLine dim_line;
+            int padding = img_text.length() + 2 - dims.length();
+            dim_line.text = std::string(margin, ' ') + BoxChars::VERTICAL + dims +
+                           std::string(padding, ' ') + BoxChars::VERTICAL;
+            dim_line.color_pair = COLOR_DIM;
+            dim_line.is_bold = false;
+            dim_line.is_link = false;
+            dim_line.link_index = -1;
+            lines.push_back(dim_line);
+        }
+
+        // Bottom border
+        RenderedLine bottom;
+        bottom.text = std::string(margin, ' ') + BoxChars::BOTTOM_LEFT +
+                     std::string(img_text.length() + 2, BoxChars::HORIZONTAL[0]) +
+                     BoxChars::BOTTOM_RIGHT;
+        bottom.color_pair = COLOR_DIM;
+        bottom.is_bold = false;
+        bottom.is_link = false;
+        bottom.link_index = -1;
+        lines.push_back(bottom);
+
+        return lines;
+    }
 };
 
 TextRenderer::TextRenderer() : pImpl(std::make_unique<Impl>()) {
@@ -300,8 +524,52 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
                 prefix = "> ";
                 break;
             case ElementType::LIST_ITEM:
-                prefix = "  • ";
+                {
+                    // Different bullets for different nesting levels
+                    const char* bullets[] = {"•", "◦", "▪", "▫"};
+                    int indent = elem.nesting_level * 2;
+                    int bullet_idx = elem.nesting_level % 4;
+                    prefix = std::string(indent, ' ') + "  " + bullets[bullet_idx] + " ";
+                }
                 break;
+            case ElementType::ORDERED_LIST_ITEM:
+                {
+                    // Numbered lists with proper indentation
+                    int indent = elem.nesting_level * 2;
+                    prefix = std::string(indent, ' ') + "  " +
+                            std::to_string(elem.list_number) + ". ";
+                }
+                break;
+            case ElementType::TABLE:
+                {
+                    auto table_lines = pImpl->render_table(elem.table_data, content_width, margin);
+                    lines.insert(lines.end(), table_lines.begin(), table_lines.end());
+
+                    // Add empty line after table
+                    RenderedLine empty;
+                    empty.text = "";
+                    empty.color_pair = COLOR_NORMAL;
+                    empty.is_bold = false;
+                    empty.is_link = false;
+                    empty.link_index = -1;
+                    lines.push_back(empty);
+                    continue;
+                }
+            case ElementType::IMAGE:
+                {
+                    auto img_lines = pImpl->render_image(elem.image_data, content_width, margin);
+                    lines.insert(lines.end(), img_lines.begin(), img_lines.end());
+
+                    // Add empty line after image
+                    RenderedLine empty;
+                    empty.text = "";
+                    empty.color_pair = COLOR_NORMAL;
+                    empty.is_bold = false;
+                    empty.is_link = false;
+                    empty.link_index = -1;
+                    lines.push_back(empty);
+                    continue;
+                }
             case ElementType::HORIZONTAL_RULE:
                 {
                     RenderedLine hr;
@@ -314,6 +582,13 @@ std::vector<RenderedLine> TextRenderer::render(const ParsedDocument& doc, int sc
                     lines.push_back(hr);
                     continue;
                 }
+            case ElementType::HEADING4:
+            case ElementType::HEADING5:
+            case ElementType::HEADING6:
+                color = COLOR_HEADING3;  // Use same color as H3 for H4-H6
+                bold = true;
+                prefix = std::string(elem.level, '#') + " ";
+                break;
             default:
                 break;
         }
