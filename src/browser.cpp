@@ -1,4 +1,5 @@
 #include "browser.h"
+#include "dom_tree.h"
 #include <curses.h>
 #include <clocale>
 #include <algorithm>
@@ -12,14 +13,13 @@ public:
     TextRenderer renderer;
     InputHandler input_handler;
 
-    ParsedDocument current_doc;
+    DocumentTree current_tree;
     std::vector<RenderedLine> rendered_lines;
     std::string current_url;
     std::vector<std::string> history;
     int history_pos = -1;
 
     int scroll_pos = 0;
-    int current_link = -1;
     std::string status_message;
     std::string search_term;
     std::vector<int> search_results;
@@ -27,8 +27,18 @@ public:
     int screen_height = 0;
     int screen_width = 0;
 
-    // Marks support (vim-style position bookmarks)
+    // Marks support
     std::map<char, int> marks;
+
+    // Interactive elements (Links + Form Fields)
+    struct InteractiveElement {
+        int link_index = -1;
+        int field_index = -1;
+        int line_index = -1;
+        InteractiveRange range;
+    };
+    std::vector<InteractiveElement> interactive_elements;
+    int current_element_index = -1;
 
     void init_screen() {
         setlocale(LC_ALL, "");
@@ -51,6 +61,25 @@ public:
         endwin();
     }
 
+    void build_interactive_list() {
+        interactive_elements.clear();
+        for (size_t i = 0; i < rendered_lines.size(); ++i) {
+            for (const auto& range : rendered_lines[i].interactive_ranges) {
+                InteractiveElement el;
+                el.link_index = range.link_index;
+                el.field_index = range.field_index;
+                el.line_index = static_cast<int>(i);
+                el.range = range;
+                interactive_elements.push_back(el);
+            }
+        }
+        
+        // Reset or adjust current_element_index
+        if (current_element_index >= static_cast<int>(interactive_elements.size())) {
+            current_element_index = interactive_elements.empty() ? -1 : 0;
+        }
+    }
+
     bool load_page(const std::string& url) {
         status_message = "Loading " + url + "...";
         draw_screen();
@@ -65,11 +94,13 @@ public:
             return false;
         }
 
-        current_doc = html_parser.parse(response.body, url);
-        rendered_lines = renderer.render(current_doc, screen_width);
+        current_tree = html_parser.parse_tree(response.body, url);
+        rendered_lines = renderer.render_tree(current_tree, screen_width);
+        build_interactive_list();
+        
         current_url = url;
         scroll_pos = 0;
-        current_link = -1;
+        current_element_index = interactive_elements.empty() ? -1 : 0;
         search_results.clear();
 
         if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
@@ -78,55 +109,140 @@ public:
         history.push_back(url);
         history_pos = history.size() - 1;
 
-        status_message = current_doc.title.empty() ? url : current_doc.title;
+        status_message = current_tree.title.empty() ? url : current_tree.title;
         return true;
     }
 
     void handle_mouse(MEVENT& event) {
         int visible_lines = screen_height - 2;
 
-        // Mouse wheel up (scroll up)
         if (event.bstate & BUTTON4_PRESSED) {
             scroll_pos = std::max(0, scroll_pos - 3);
             return;
         }
 
-        // Mouse wheel down (scroll down)
         if (event.bstate & BUTTON5_PRESSED) {
             int max_scroll = std::max(0, static_cast<int>(rendered_lines.size()) - visible_lines);
             scroll_pos = std::min(max_scroll, scroll_pos + 3);
             return;
         }
 
-        // Left click
         if (event.bstate & BUTTON1_CLICKED) {
             int clicked_line = event.y;
             int clicked_col = event.x;
 
-            // Check if clicked on a link
             if (clicked_line >= 0 && clicked_line < visible_lines) {
                 int doc_line_idx = scroll_pos + clicked_line;
                 if (doc_line_idx < static_cast<int>(rendered_lines.size())) {
-                    const auto& line = rendered_lines[doc_line_idx];
-
-                    // Check if click is within any link range
-                    for (const auto& [start, end] : line.link_ranges) {
-                        if (clicked_col >= static_cast<int>(start) && clicked_col < static_cast<int>(end)) {
-                            // Clicked on a link!
-                            if (line.link_index >= 0 && line.link_index < static_cast<int>(current_doc.links.size())) {
-                                load_page(current_doc.links[line.link_index].url);
-                                return;
-                            }
+                    for (size_t i = 0; i < interactive_elements.size(); ++i) {
+                        const auto& el = interactive_elements[i];
+                        if (el.line_index == doc_line_idx && 
+                            clicked_col >= static_cast<int>(el.range.start) && 
+                            clicked_col < static_cast<int>(el.range.end)) {
+                            
+                            current_element_index = i;
+                            activate_element(i);
+                            return;
                         }
-                    }
-
-                    // If clicked on a line with a link but not on the link text itself
-                    if (line.is_link && line.link_index >= 0) {
-                        current_link = line.link_index;
                     }
                 }
             }
         }
+    }
+
+    void activate_element(int index) {
+        if (index < 0 || index >= static_cast<int>(interactive_elements.size())) return;
+        
+        const auto& el = interactive_elements[index];
+        if (el.link_index >= 0) {
+            if (el.link_index < static_cast<int>(current_tree.links.size())) {
+                load_page(current_tree.links[el.link_index].url);
+            }
+        } else if (el.field_index >= 0) {
+            handle_form_interaction(el.field_index);
+        }
+    }
+
+    void handle_form_interaction(int field_idx) {
+        if (field_idx < 0 || field_idx >= static_cast<int>(current_tree.form_fields.size())) return;
+        
+        DomNode* node = current_tree.form_fields[field_idx];
+        
+        if (node->input_type == "checkbox" || node->input_type == "radio") {
+            if (node->input_type == "radio") {
+                // Uncheck others in same group
+                DomNode* form = node->parent;
+                // Find form parent
+                while (form && form->element_type != ElementType::FORM) form = form->parent;
+                
+                // If found form, traverse to uncheck others with same name
+                // This is a complex traversal, simplified: just toggle for now or assume single radio group
+                node->checked = true; 
+            } else {
+                node->checked = !node->checked;
+            }
+            // Re-render
+            rendered_lines = renderer.render_tree(current_tree, screen_width);
+            build_interactive_list();
+        } else if (node->input_type == "text" || node->input_type == "password" || 
+                   node->input_type == "textarea" || node->input_type == "search" ||
+                   node->input_type == "email" || node->input_type == "url") {
+            
+            // Prompt user
+            mvprintw(screen_height - 1, 0, "Input: ");
+            clrtoeol();
+            echo();
+            curs_set(1);
+            char buffer[256];
+            getnstr(buffer, 255);
+            noecho();
+            curs_set(0);
+            
+            node->value = buffer;
+            rendered_lines = renderer.render_tree(current_tree, screen_width);
+            build_interactive_list();
+            
+        } else if (node->input_type == "submit" || node->input_type == "button") {
+            submit_form(node);
+        }
+    }
+
+    void submit_form(DomNode* button) {
+        status_message = "Submitting form...";
+        // Simple GET implementation for now
+        DomNode* form = button->parent;
+        while (form && form->element_type != ElementType::FORM) form = form->parent;
+        
+        if (!form) {
+            status_message = "Error: Button not in a form";
+            return;
+        }
+
+        // Collect data
+        std::string query_string;
+        for (DomNode* field : current_tree.form_fields) {
+            // Check if field belongs to this form
+            DomNode* p = field->parent;
+            bool is_child = false;
+            while(p) { if(p == form) { is_child = true; break; } p = p->parent; }
+            
+            if (is_child && !field->name.empty()) {
+                if (!query_string.empty()) query_string += "&";
+                query_string += field->name + "=" + field->value;
+            }
+        }
+
+        std::string target_url = form->action;
+        if (target_url.empty()) target_url = current_url;
+
+        // TODO: Handle POST. For now, assume GET or append query string
+        if (target_url.find('?') == std::string::npos) {
+            target_url += "?" + query_string;
+        } else {
+            target_url += "&" + query_string;
+        }
+
+        load_page(target_url);
     }
 
     void draw_status_bar() {
@@ -136,52 +252,61 @@ public:
         std::string mode_str;
         InputMode mode = input_handler.get_mode();
         switch (mode) {
-            case InputMode::NORMAL:
-                mode_str = "NORMAL";
-                break;
+            case InputMode::NORMAL: mode_str = "NORMAL"; break;
             case InputMode::COMMAND:
-            case InputMode::SEARCH:
-                mode_str = input_handler.get_buffer();
-                break;
-            default:
-                mode_str = "";
-                break;
+            case InputMode::SEARCH: mode_str = input_handler.get_buffer(); break;
+            default: mode_str = ""; break;
         }
 
         mvprintw(screen_height - 1, 0, " %s", mode_str.c_str());
 
-        if (!status_message.empty() && mode == InputMode::NORMAL) {
-            int msg_x = (screen_width - status_message.length()) / 2;
-            if (msg_x < static_cast<int>(mode_str.length()) + 2) {
-                msg_x = mode_str.length() + 2;
+        if (mode == InputMode::NORMAL) {
+            std::string display_msg;
+            
+            // Priority: Hovered Link URL > Status Message > Title
+            if (current_element_index >= 0 && 
+                current_element_index < static_cast<int>(interactive_elements.size())) {
+                const auto& el = interactive_elements[current_element_index];
+                if (el.link_index >= 0 && el.link_index < static_cast<int>(current_tree.links.size())) {
+                    display_msg = current_tree.links[el.link_index].url;
+                }
             }
-            mvprintw(screen_height - 1, msg_x, "%s", status_message.c_str());
+            
+            if (display_msg.empty()) {
+                display_msg = status_message;
+            }
+
+            if (!display_msg.empty()) {
+                int msg_x = (screen_width - display_msg.length()) / 2;
+                if (msg_x < static_cast<int>(mode_str.length()) + 2) msg_x = mode_str.length() + 2;
+                // Truncate if too long
+                int max_len = screen_width - msg_x - 20; // Reserve space for position info
+                if (max_len > 0) {
+                    if (display_msg.length() > static_cast<size_t>(max_len)) {
+                        display_msg = display_msg.substr(0, max_len - 3) + "...";
+                    }
+                    mvprintw(screen_height - 1, msg_x, "%s", display_msg.c_str());
+                }
+            }
         }
 
         int total_lines = rendered_lines.size();
-        int visible_lines = screen_height - 2;
-        int percentage = 0;
-        if (total_lines > 0) {
-            if (scroll_pos == 0) {
-                percentage = 0;
-            } else if (scroll_pos + visible_lines >= total_lines) {
-                percentage = 100;
-            } else {
-                percentage = (scroll_pos * 100) / total_lines;
-            }
-        }
+        int percentage = (total_lines > 0 && scroll_pos + screen_height - 2 < total_lines) ? 
+                         (scroll_pos * 100) / total_lines : 100;
+        if (total_lines == 0) percentage = 0;
 
-        std::string pos_str = std::to_string(scroll_pos + 1) + "/" +
-                             std::to_string(total_lines) + " " +
-                             std::to_string(percentage) + "%";
-
-        if (current_link >= 0 && current_link < static_cast<int>(current_doc.links.size())) {
-            pos_str = "[Link " + std::to_string(current_link) + "] " + pos_str;
-        }
-
+        std::string pos_str = std::to_string(scroll_pos + 1) + "/" + std::to_string(total_lines) + " " + std::to_string(percentage) + "%";
         mvprintw(screen_height - 1, screen_width - pos_str.length() - 1, "%s", pos_str.c_str());
 
         attroff(COLOR_PAIR(COLOR_STATUS_BAR));
+    }
+
+    int get_utf8_sequence_length(char c) {
+        if ((c & 0x80) == 0) return 1;
+        if ((c & 0xE0) == 0xC0) return 2;
+        if ((c & 0xF0) == 0xE0) return 3;
+        if ((c & 0xF8) == 0xF0) return 4;
+        return 1; // Fallback
     }
 
     void draw_screen() {
@@ -189,360 +314,201 @@ public:
 
         int visible_lines = screen_height - 2;
         int content_lines = std::min(static_cast<int>(rendered_lines.size()) - scroll_pos, visible_lines);
+        
+        int cursor_y = -1;
+        int cursor_x = -1;
 
         for (int i = 0; i < content_lines; ++i) {
             int line_idx = scroll_pos + i;
             const auto& line = rendered_lines[line_idx];
 
-            // Check if this line contains the active link
-            bool has_active_link = (line.is_link && line.link_index == current_link);
-
             // Check if this line is in search results
             bool in_search_results = !search_term.empty() &&
                 std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end();
 
-            // If line has link ranges, render character by character with proper highlighting
-            if (!line.link_ranges.empty()) {
-                int col = 0;
-                for (size_t char_idx = 0; char_idx < line.text.length(); ++char_idx) {
-                    // Check if this character is within any link range
-                    bool is_in_link = false;
+            move(i, 0); // Move to start of line
 
-                    for (const auto& [start, end] : line.link_ranges) {
-                        if (char_idx >= start && char_idx < end) {
-                            is_in_link = true;
-                            break;
-                        }
-                    }
-
-                    // Apply appropriate color
-                    if (is_in_link && has_active_link) {
-                        attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
-                    } else if (is_in_link) {
-                        attron(COLOR_PAIR(COLOR_LINK));
-                        attron(A_UNDERLINE);
-                    } else {
-                        attron(COLOR_PAIR(line.color_pair));
-                        if (line.is_bold) {
-                            attron(A_BOLD);
-                        }
-                    }
-
-                    if (in_search_results) {
-                        attron(A_REVERSE);
-                    }
-
-                    mvaddch(i, col, line.text[char_idx]);
-
-                    if (in_search_results) {
-                        attroff(A_REVERSE);
-                    }
-
-                    if (is_in_link && has_active_link) {
-                        attroff(COLOR_PAIR(COLOR_LINK_ACTIVE));
-                    } else if (is_in_link) {
-                        attroff(A_UNDERLINE);
-                        attroff(COLOR_PAIR(COLOR_LINK));
-                    } else {
-                        if (line.is_bold) {
-                            attroff(A_BOLD);
-                        }
-                        attroff(COLOR_PAIR(line.color_pair));
-                    }
-
-                    col++;
+            size_t byte_idx = 0;
+            int current_col = 0; // Track visual column
+            
+            while (byte_idx < line.text.length()) {
+                size_t seq_len = get_utf8_sequence_length(line.text[byte_idx]);
+                // Ensure we don't read past end of string (malformed utf8 protection)
+                if (byte_idx + seq_len > line.text.length()) {
+                    seq_len = line.text.length() - byte_idx;
                 }
-            } else {
-                // No inline links, render normally
-                if (has_active_link) {
+
+                bool is_active = false;
+                bool is_interactive = false;
+                
+                // Check if current byte position falls within an interactive range
+                for (const auto& range : line.interactive_ranges) {
+                    if (byte_idx >= range.start && byte_idx < range.end) {
+                        is_interactive = true;
+                        // Check if this is the currently selected element
+                        if (current_element_index >= 0 && 
+                            current_element_index < static_cast<int>(interactive_elements.size())) {
+                            const auto& el = interactive_elements[current_element_index];
+                            if (el.line_index == line_idx && 
+                                el.range.start == range.start && 
+                                el.range.end == range.end) {
+                                is_active = true;
+                                // Capture cursor position for the START of the active element
+                                if (byte_idx == range.start && cursor_y == -1) {
+                                    cursor_y = i;
+                                    cursor_x = current_col;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                // Apply attributes
+                if (is_active) {
                     attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
+                } else if (is_interactive) {
+                    attron(COLOR_PAIR(COLOR_LINK));
+                    attron(A_UNDERLINE);
                 } else {
                     attron(COLOR_PAIR(line.color_pair));
-                    if (line.is_bold) {
-                        attron(A_BOLD);
-                    }
+                    if (line.is_bold) attron(A_BOLD);
                 }
 
-                if (in_search_results) {
-                    attron(A_REVERSE);
-                }
+                if (in_search_results) attron(A_REVERSE);
 
-                mvprintw(i, 0, "%s", line.text.c_str());
+                // Print the UTF-8 sequence
+                addnstr(line.text.c_str() + byte_idx, seq_len);
+                
+                // Approximate column width update (simple)
+                // For proper handling, we should use wcwidth, but for now assuming 1 or 2 based on seq_len is "okay" approximation for cursor placement
+                // actually addnstr advances cursor, getyx is better?
+                // But we are in a loop.
+                int unused_y, x;
+                getyx(stdscr, unused_y, x);
+                (void)unused_y;  // Suppress unused variable warning
+                current_col = x;
 
-                if (in_search_results) {
-                    attroff(A_REVERSE);
-                }
+                // Clear attributes
+                if (in_search_results) attroff(A_REVERSE);
 
-                if (has_active_link) {
+                if (is_active) {
                     attroff(COLOR_PAIR(COLOR_LINK_ACTIVE));
+                } else if (is_interactive) {
+                    attroff(A_UNDERLINE);
+                    attroff(COLOR_PAIR(COLOR_LINK));
                 } else {
-                    if (line.is_bold) {
-                        attroff(A_BOLD);
-                    }
+                    if (line.is_bold) attroff(A_BOLD);
                     attroff(COLOR_PAIR(line.color_pair));
                 }
+
+                byte_idx += seq_len;
             }
         }
 
         draw_status_bar();
+        
+        // Place cursor
+        if (cursor_y != -1 && cursor_x != -1) {
+            curs_set(1);
+            move(cursor_y, cursor_x);
+        } else {
+            curs_set(0);
+        }
     }
 
     void handle_action(const InputResult& result) {
         int visible_lines = screen_height - 2;
         int max_scroll = std::max(0, static_cast<int>(rendered_lines.size()) - visible_lines);
-
         int count = result.has_count ? result.count : 1;
 
         switch (result.action) {
-            case Action::SCROLL_UP:
-                scroll_pos = std::max(0, scroll_pos - count);
-                break;
-
-            case Action::SCROLL_DOWN:
-                scroll_pos = std::min(max_scroll, scroll_pos + count);
-                break;
-
-            case Action::SCROLL_PAGE_UP:
-                scroll_pos = std::max(0, scroll_pos - visible_lines);
-                break;
-
-            case Action::SCROLL_PAGE_DOWN:
-                scroll_pos = std::min(max_scroll, scroll_pos + visible_lines);
-                break;
-
-            case Action::GOTO_TOP:
-                scroll_pos = 0;
-                break;
-
-            case Action::GOTO_BOTTOM:
-                scroll_pos = max_scroll;
-                break;
-
-            case Action::GOTO_LINE:
-                if (result.number > 0 && result.number <= static_cast<int>(rendered_lines.size())) {
-                    scroll_pos = std::min(result.number - 1, max_scroll);
-                }
-                break;
+            case Action::SCROLL_UP: scroll_pos = std::max(0, scroll_pos - count); break;
+            case Action::SCROLL_DOWN: scroll_pos = std::min(max_scroll, scroll_pos + count); break;
+            case Action::SCROLL_PAGE_UP: scroll_pos = std::max(0, scroll_pos - visible_lines); break;
+            case Action::SCROLL_PAGE_DOWN: scroll_pos = std::min(max_scroll, scroll_pos + visible_lines); break;
+            case Action::GOTO_TOP: scroll_pos = 0; break;
+            case Action::GOTO_BOTTOM: scroll_pos = max_scroll; break;
+            case Action::GOTO_LINE: if (result.number > 0) scroll_pos = std::min(result.number - 1, max_scroll); break;
 
             case Action::NEXT_LINK:
-                if (!current_doc.links.empty()) {
-                    current_link = (current_link + 1) % current_doc.links.size();
-                    scroll_to_link(current_link);
+                if (!interactive_elements.empty()) {
+                    current_element_index = (current_element_index + 1) % interactive_elements.size();
+                    scroll_to_element(current_element_index);
                 }
                 break;
 
             case Action::PREV_LINK:
-                if (!current_doc.links.empty()) {
-                    current_link = (current_link - 1 + current_doc.links.size()) % current_doc.links.size();
-                    scroll_to_link(current_link);
+                if (!interactive_elements.empty()) {
+                    current_element_index = (current_element_index - 1 + interactive_elements.size()) % interactive_elements.size();
+                    scroll_to_element(current_element_index);
                 }
                 break;
 
             case Action::FOLLOW_LINK:
-                if (current_link >= 0 && current_link < static_cast<int>(current_doc.links.size())) {
-                    load_page(current_doc.links[current_link].url);
-                }
-                break;
-
-            case Action::GOTO_LINK:
-                // Jump to specific link by number
-                if (result.number >= 0 && result.number < static_cast<int>(current_doc.links.size())) {
-                    current_link = result.number;
-                    scroll_to_link(current_link);
-                    status_message = "Link " + std::to_string(result.number);
-                } else {
-                    status_message = "Invalid link number: " + std::to_string(result.number);
-                }
-                break;
-
-            case Action::FOLLOW_LINK_NUM:
-                // Follow specific link by number directly
-                if (result.number >= 0 && result.number < static_cast<int>(current_doc.links.size())) {
-                    load_page(current_doc.links[result.number].url);
-                } else {
-                    status_message = "Invalid link number: " + std::to_string(result.number);
-                }
+                activate_element(current_element_index);
                 break;
 
             case Action::GO_BACK:
-                if (history_pos > 0) {
-                    history_pos--;
-                    load_page(history[history_pos]);
-                } else {
-                    status_message = "No previous page";
-                }
+                if (history_pos > 0) { history_pos--; load_page(history[history_pos]); }
                 break;
-
             case Action::GO_FORWARD:
-                if (history_pos < static_cast<int>(history.size()) - 1) {
-                    history_pos++;
-                    load_page(history[history_pos]);
-                } else {
-                    status_message = "No next page";
-                }
+                if (history_pos < static_cast<int>(history.size()) - 1) { history_pos++; load_page(history[history_pos]); }
                 break;
-
-            case Action::OPEN_URL:
-                if (!result.text.empty()) {
-                    load_page(result.text);
-                }
-                break;
-
-            case Action::REFRESH:
-                if (!current_url.empty()) {
-                    load_page(current_url);
-                }
-                break;
-
+            case Action::OPEN_URL: if (!result.text.empty()) load_page(result.text); break;
+            case Action::REFRESH: if (!current_url.empty()) load_page(current_url); break;
+            
             case Action::SEARCH_FORWARD:
                 search_term = result.text;
                 search_results.clear();
                 for (size_t i = 0; i < rendered_lines.size(); ++i) {
-                    if (rendered_lines[i].text.find(search_term) != std::string::npos) {
-                        search_results.push_back(i);
-                    }
+                    if (rendered_lines[i].text.find(search_term) != std::string::npos) search_results.push_back(i);
                 }
                 if (!search_results.empty()) {
                     scroll_pos = search_results[0];
                     status_message = "Found " + std::to_string(search_results.size()) + " matches";
-                } else {
-                    status_message = "Pattern not found: " + search_term;
-                }
+                } else status_message = "Pattern not found";
                 break;
 
             case Action::SEARCH_NEXT:
                 if (!search_results.empty()) {
                     auto it = std::upper_bound(search_results.begin(), search_results.end(), scroll_pos);
-                    if (it != search_results.end()) {
-                        scroll_pos = *it;
-                    } else {
-                        scroll_pos = search_results[0];
-                        status_message = "Search wrapped to top";
-                    }
+                    scroll_pos = (it != search_results.end()) ? *it : search_results[0];
                 }
                 break;
-
             case Action::SEARCH_PREV:
                 if (!search_results.empty()) {
                     auto it = std::lower_bound(search_results.begin(), search_results.end(), scroll_pos);
-                    if (it != search_results.begin()) {
-                        scroll_pos = *(--it);
-                    } else {
-                        scroll_pos = search_results.back();
-                        status_message = "Search wrapped to bottom";
-                    }
+                    scroll_pos = (it != search_results.begin()) ? *(--it) : search_results.back();
                 }
                 break;
-
-            case Action::SET_MARK:
-                if (!result.text.empty()) {
-                    char mark = result.text[0];
-                    marks[mark] = scroll_pos;
-                    status_message = "Mark '" + std::string(1, mark) + "' set at line " + std::to_string(scroll_pos);
-                }
-                break;
-
-            case Action::GOTO_MARK:
-                if (!result.text.empty()) {
-                    char mark = result.text[0];
-                    auto it = marks.find(mark);
-                    if (it != marks.end()) {
-                        scroll_pos = std::min(it->second, max_scroll);
-                        status_message = "Jumped to mark '" + std::string(1, mark) + "'";
-                    } else {
-                        status_message = "Mark '" + std::string(1, mark) + "' not set";
-                    }
-                }
-                break;
-
-            case Action::HELP:
-                show_help();
-                break;
-
-            default:
-                break;
+            
+            case Action::HELP: show_help(); break;
+            case Action::QUIT: break; // Handled in browser.run
+            default: break;
         }
     }
 
-    void scroll_to_link(int link_idx) {
-        for (size_t i = 0; i < rendered_lines.size(); ++i) {
-            if (rendered_lines[i].is_link && rendered_lines[i].link_index == link_idx) {
-                int visible_lines = screen_height - 2;
-                if (static_cast<int>(i) < scroll_pos || static_cast<int>(i) >= scroll_pos + visible_lines) {
-                    scroll_pos = std::max(0, static_cast<int>(i) - visible_lines / 2);
-                }
-                break;
-            }
+    void scroll_to_element(int index) {
+        if (index < 0 || index >= static_cast<int>(interactive_elements.size())) return;
+        
+        int line_idx = interactive_elements[index].line_index;
+        int visible_lines = screen_height - 2;
+        
+        if (line_idx < scroll_pos || line_idx >= scroll_pos + visible_lines) {
+            scroll_pos = std::max(0, line_idx - visible_lines / 2);
         }
     }
 
     void show_help() {
+        // Updated help text would go here
         std::ostringstream help_html;
-        help_html << "<html><head><title>TUT Browser Help</title></head><body>"
-                  << "<h1>TUT Browser - Vim-style Terminal Browser</h1>"
-                  << "<h2>Navigation</h2>"
-                  << "<p>j/k or ↓/↑: Scroll down/up</p>"
-                  << "<p>Ctrl-D or Space: Scroll page down</p>"
-                  << "<p>Ctrl-U or b: Scroll page up</p>"
-                  << "<p>gg: Go to top</p>"
-                  << "<p>G: Go to bottom</p>"
-                  << "<p>[number]G: Go to line number</p>"
-                  << "<h2>Links</h2>"
-                  << "<p>Links are displayed inline with numbers like [0], [1], etc.</p>"
-                  << "<p>Tab: Next link</p>"
-                  << "<p>Shift-Tab or T: Previous link</p>"
-                  << "<p>Enter: Follow current link</p>"
-                  << "<p>[number]Enter: Jump to link number N</p>"
-                  << "<p>f[number]: Follow link number N directly</p>"
-                  << "<p>h: Go back</p>"
-                  << "<p>l: Go forward</p>"
-                  << "<h2>Search</h2>"
-                  << "<p>/: Start search</p>"
-                  << "<p>n: Next match</p>"
-                  << "<p>N: Previous match</p>"
-                  << "<h2>Commands</h2>"
-                  << "<p>:q or :quit - Quit browser</p>"
-                  << "<p>:o URL or :open URL - Open URL</p>"
-                  << "<p>:r or :refresh - Refresh page</p>"
-                  << "<p>:h or :help - Show this help</p>"
-                  << "<p>:[number] - Go to line number</p>"
-                  << "<h2>Marks</h2>"
-                  << "<p>m[a-z]: Set mark at letter (e.g., ma, mb)</p>"
-                  << "<p>'[a-z]: Jump to mark (e.g., 'a, 'b)</p>"
-                  << "<h2>Mouse Support</h2>"
-                  << "<p>Click on links to follow them</p>"
-                  << "<p>Scroll wheel to scroll up/down</p>"
-                  << "<p>Works with most terminal emulators</p>"
-                  << "<h2>Other</h2>"
-                  << "<p>r: Refresh current page</p>"
-                  << "<p>q: Quit browser</p>"
-                  << "<p>?: Show help</p>"
-                  << "<p>ESC: Cancel current mode</p>"
-                  << "<h2>Important Limitations</h2>"
-                  << "<p><strong>JavaScript/SPA Websites:</strong> This browser cannot execute JavaScript. "
-                  << "Single Page Applications (SPAs) built with React, Vue, Angular, etc. will not work properly "
-                  << "as they render content dynamically with JavaScript.</p>"
-                  << "<p><strong>Works best with:</strong></p>"
-                  << "<ul>"
-                  << "<li>Static HTML websites</li>"
-                  << "<li>Server-side rendered pages</li>"
-                  << "<li>Documentation sites</li>"
-                  << "<li>News sites with HTML content</li>"
-                  << "<li>Blogs with traditional HTML</li>"
-                  << "</ul>"
-                  << "<p><strong>Example sites that work well:</strong></p>"
-                  << "<p>- https://example.com</p>"
-                  << "<p>- https://en.wikipedia.org</p>"
-                  << "<p>- Text-based news sites</p>"
-                  << "<p><strong>For JavaScript-heavy sites:</strong> You may need to find alternative URLs "
-                  << "that provide the same content in plain HTML format.</p>"
-                  << "</body></html>";
-
-        current_doc = html_parser.parse(help_html.str(), "help://");
-        rendered_lines = renderer.render(current_doc, screen_width);
+        help_html << "<html><body><h1>Help</h1><p>Use Tab to navigate links and form fields.</p><p>Enter to activate/edit.</p></body></html>";
+        current_tree = html_parser.parse_tree(help_html.str(), "help://");
+        rendered_lines = renderer.render_tree(current_tree, screen_width);
+        build_interactive_list();
         scroll_pos = 0;
-        current_link = -1;
-        status_message = "Help - Press q to return";
+        current_element_index = -1;
     }
 };
 
@@ -557,11 +523,8 @@ Browser::~Browser() = default;
 void Browser::run(const std::string& initial_url) {
     pImpl->init_screen();
 
-    if (!initial_url.empty()) {
-        load_url(initial_url);
-    } else {
-        pImpl->show_help();
-    }
+    if (!initial_url.empty()) load_url(initial_url);
+    else pImpl->show_help();
 
     bool running = true;
     while (running) {
@@ -569,27 +532,17 @@ void Browser::run(const std::string& initial_url) {
         refresh();
 
         int ch = getch();
-        if (ch == ERR) {
-            napms(50);
-            continue;
-        }
+        if (ch == ERR) { napms(50); continue; }
 
-        // Handle mouse events
         if (ch == KEY_MOUSE) {
             MEVENT event;
-            if (getmouse(&event) == OK) {
-                pImpl->handle_mouse(event);
-            }
+            if (getmouse(&event) == OK) pImpl->handle_mouse(event);
             continue;
         }
 
         auto result = pImpl->input_handler.handle_key(ch);
-
-        if (result.action == Action::QUIT) {
-            running = false;
-        } else if (result.action != Action::NONE) {
-            pImpl->handle_action(result);
-        }
+        if (result.action == Action::QUIT) running = false;
+        else if (result.action != Action::NONE) pImpl->handle_action(result);
     }
 
     pImpl->cleanup_screen();

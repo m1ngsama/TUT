@@ -23,6 +23,7 @@ public:
     void set_timeout(long timeout_seconds);
     void set_user_agent(const std::string& user_agent);
     void set_follow_redirects(bool follow);
+    void enable_cookies(const std::string& cookie_file = "");
 
 private:
     class Impl;

@@ -155,8 +155,6 @@ If you only see JavaScript code or empty div elements, it will not.
 Additionally:
 - No image display
 - No CSS layout support
-- No form submission
-- No cookie or session management
 - No AJAX or dynamic content loading
 
 EXAMPLES

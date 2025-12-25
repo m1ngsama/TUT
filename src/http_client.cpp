@@ -15,6 +15,7 @@ public:
     long timeout;
     std::string user_agent;
     bool follow_redirects;
+    std::string cookie_file;
 
     Impl() : timeout(30),
              user_agent("TUT-Browser/1.0 (Terminal User Interface Browser)"),
@@ -23,6 +24,10 @@ public:
         if (!curl) {
             throw std::runtime_error("Failed to initialize CURL");
         }
+        // Enable cookie engine by default (in-memory)
+        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+        // Enable automatic decompression of supported encodings (gzip, deflate, etc.)
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     }
 
     ~Impl() {
@@ -45,9 +50,15 @@ HttpResponse HttpClient::fetch(const std::string& url) {
         return response;
     }
 
-    // 重置选项
+    // 重置选项 (Note: curl_easy_reset clears cookies setting if not careful, 
+    // but here we might want to preserve them or reset and re-apply options)
+    // Actually curl_easy_reset clears ALL options including cookie engine state?
+    // No, it resets options to default. It does NOT clear the cookie engine state (cookies held in memory).
+    // BUT it resets CURLOPT_COOKIEFILE/JAR settings.
+    
     curl_easy_reset(pImpl->curl);
 
+    // Re-apply settings
     // 设置URL
     curl_easy_setopt(pImpl->curl, CURLOPT_URL, url.c_str());
 
@@ -72,6 +83,14 @@ HttpResponse HttpClient::fetch(const std::string& url) {
     // 支持 HTTPS
     curl_easy_setopt(pImpl->curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(pImpl->curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    // Cookie settings
+    if (!pImpl->cookie_file.empty()) {
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEFILE, pImpl->cookie_file.c_str());
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEJAR, pImpl->cookie_file.c_str());
+    } else {
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEFILE, "");
+    }
 
     // 执行请求
     CURLcode res = curl_easy_perform(pImpl->curl);
@@ -108,4 +127,8 @@ void HttpClient::set_user_agent(const std::string& user_agent) {
 
 void HttpClient::set_follow_redirects(bool follow) {
     pImpl->follow_redirects = follow;
+}
+
+void HttpClient::enable_cookies(const std::string& cookie_file) {
+    pImpl->cookie_file = cookie_file;
 }

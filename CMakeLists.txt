@@ -15,18 +15,35 @@ endif()
 find_package(Curses REQUIRED)
 find_package(CURL REQUIRED)
 
+# Find gumbo-parser for HTML parsing
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GUMBO REQUIRED gumbo)
+
 # Executable
 add_executable(tut
     src/main.cpp
     src/http_client.cpp
+    src/dom_tree.cpp
     src/html_parser.cpp
     src/text_renderer.cpp
     src/input_handler.cpp
     src/browser.cpp
 )
 
-target_include_directories(tut PRIVATE ${CURSES_INCLUDE_DIR})
-target_link_libraries(tut PRIVATE ${CURSES_LIBRARIES} CURL::libcurl)
+target_include_directories(tut PRIVATE
+    ${CURSES_INCLUDE_DIR}
+    ${GUMBO_INCLUDE_DIRS}
+)
+
+target_link_directories(tut PRIVATE
+    ${GUMBO_LIBRARY_DIRS}
+)
+
+target_link_libraries(tut PRIVATE
+    ${CURSES_LIBRARIES}
+    CURL::libcurl
+    ${GUMBO_LIBRARIES}
+)
 
 # Compiler warnings
 target_compile_options(tut PRIVATE

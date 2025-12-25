@@ -4,6 +4,9 @@
 #include <vector>
 #include <memory>
 
+// Forward declaration
+struct DocumentTree;
+
 enum class ElementType {
     TEXT,
     HEADING1,
@@ -23,6 +26,11 @@ enum class ElementType {
     TABLE,
     IMAGE,
     FORM,
+    INPUT,
+    TEXTAREA,
+    SELECT,
+    OPTION,
+    BUTTON,
     SECTION_START,
     SECTION_END,
     NAV_START,
@@ -45,6 +53,7 @@ struct InlineLink {
     size_t start_pos;  // Position in the text where link starts
     size_t end_pos;    // Position in the text where link ends
     int link_index;    // Index in the document's links array
+    int field_index = -1; // Index in the document's form_fields array
 };
 
 struct TableCell {
@@ -112,7 +121,12 @@ public:
     HtmlParser();
     ~HtmlParser();
 
+    // 新接口：使用DOM树解析
+    DocumentTree parse_tree(const std::string& html, const std::string& base_url = "");
+
+    // 旧接口：保持向后兼容（已废弃，内部使用parse_tree）
     ParsedDocument parse(const std::string& html, const std::string& base_url = "");
+
     void set_keep_code_blocks(bool keep);
     void set_keep_lists(bool keep);
 
