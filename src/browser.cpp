@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <sstream>
 #include <map>
+#include <cctype>
+#include <cstdio>
 
 class Browser::Impl {
 public:
@@ -207,42 +209,98 @@ public:
         }
     }
 
+    // URL encode helper function
+    std::string url_encode(const std::string& value) {
+        std::string result;
+        for (unsigned char c : value) {
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                result += c;
+            } else if (c == ' ') {
+                result += '+';
+            } else {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%%%02X", c);
+                result += hex;
+            }
+        }
+        return result;
+    }
+
     void submit_form(DomNode* button) {
         status_message = "Submitting form...";
-        // Simple GET implementation for now
+
+        // Find parent form
         DomNode* form = button->parent;
         while (form && form->element_type != ElementType::FORM) form = form->parent;
-        
+
         if (!form) {
             status_message = "Error: Button not in a form";
             return;
         }
 
-        // Collect data
-        std::string query_string;
+        // Collect form data with URL encoding
+        std::string form_data;
         for (DomNode* field : current_tree.form_fields) {
             // Check if field belongs to this form
             DomNode* p = field->parent;
             bool is_child = false;
             while(p) { if(p == form) { is_child = true; break; } p = p->parent; }
-            
+
             if (is_child && !field->name.empty()) {
-                if (!query_string.empty()) query_string += "&";
-                query_string += field->name + "=" + field->value;
+                if (!form_data.empty()) form_data += "&";
+                form_data += url_encode(field->name) + "=" + url_encode(field->value);
             }
         }
 
         std::string target_url = form->action;
         if (target_url.empty()) target_url = current_url;
 
-        // TODO: Handle POST. For now, assume GET or append query string
-        if (target_url.find('?') == std::string::npos) {
-            target_url += "?" + query_string;
-        } else {
-            target_url += "&" + query_string;
-        }
+        // Check form method (default to GET if not specified)
+        std::string method = form->method;
+        std::transform(method.begin(), method.end(), method.begin(), ::toupper);
 
-        load_page(target_url);
+        if (method == "POST") {
+            // POST request
+            status_message = "Sending POST request...";
+            HttpResponse response = http_client.post(target_url, form_data);
+
+            if (!response.error_message.empty()) {
+                status_message = "Error: " + response.error_message;
+                return;
+            }
+
+            if (!response.is_success()) {
+                status_message = "Error: HTTP " + std::to_string(response.status_code);
+                return;
+            }
+
+            // Parse and render response
+            DocumentTree tree = html_parser.parse_tree(response.body, target_url);
+            current_tree = std::move(tree);
+            current_url = target_url;
+            rendered_lines = renderer.render_tree(current_tree, screen_width);
+            build_interactive_list();
+            scroll_pos = 0;
+            current_element_index = -1;
+
+            // Update history
+            if (history_pos < static_cast<int>(history.size()) - 1) {
+                history.erase(history.begin() + history_pos + 1, history.end());
+            }
+            history.push_back(current_url);
+            history_pos = history.size() - 1;
+
+            status_message = "Form submitted (POST)";
+        } else {
+            // GET request (default)
+            if (target_url.find('?') == std::string::npos) {
+                target_url += "?" + form_data;
+            } else {
+                target_url += "&" + form_data;
+            }
+            load_page(target_url);
+            status_message = "Form submitted (GET)";
+        }
     }
 
     void draw_status_bar() {

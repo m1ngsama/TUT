@@ -20,6 +20,8 @@ public:
     ~HttpClient();
 
     HttpResponse fetch(const std::string& url);
+    HttpResponse post(const std::string& url, const std::string& data,
+                     const std::string& content_type = "application/x-www-form-urlencoded");
     void set_timeout(long timeout_seconds);
     void set_user_agent(const std::string& user_agent);
     void set_follow_redirects(bool follow);

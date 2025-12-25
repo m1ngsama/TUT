@@ -117,6 +117,95 @@ HttpResponse HttpClient::fetch(const std::string& url) {
     return response;
 }
 
+HttpResponse HttpClient::post(const std::string& url, const std::string& data,
+                              const std::string& content_type) {
+    HttpResponse response;
+    response.status_code = 0;
+
+    if (!pImpl->curl) {
+        response.error_message = "CURL not initialized";
+        return response;
+    }
+
+    curl_easy_reset(pImpl->curl);
+
+    // Re-apply settings
+    curl_easy_setopt(pImpl->curl, CURLOPT_URL, url.c_str());
+
+    // Set write callback
+    std::string response_body;
+    curl_easy_setopt(pImpl->curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(pImpl->curl, CURLOPT_WRITEDATA, &response_body);
+
+    // Set timeout
+    curl_easy_setopt(pImpl->curl, CURLOPT_TIMEOUT, pImpl->timeout);
+    curl_easy_setopt(pImpl->curl, CURLOPT_CONNECTTIMEOUT, 10L);
+
+    // Set user agent
+    curl_easy_setopt(pImpl->curl, CURLOPT_USERAGENT, pImpl->user_agent.c_str());
+
+    // Set redirect following
+    if (pImpl->follow_redirects) {
+        curl_easy_setopt(pImpl->curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(pImpl->curl, CURLOPT_MAXREDIRS, 10L);
+    }
+
+    // HTTPS support
+    curl_easy_setopt(pImpl->curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(pImpl->curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    // Cookie settings
+    if (!pImpl->cookie_file.empty()) {
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEFILE, pImpl->cookie_file.c_str());
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEJAR, pImpl->cookie_file.c_str());
+    } else {
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEFILE, "");
+    }
+
+    // Enable automatic decompression
+    curl_easy_setopt(pImpl->curl, CURLOPT_ACCEPT_ENCODING, "");
+
+    // Set POST method
+    curl_easy_setopt(pImpl->curl, CURLOPT_POST, 1L);
+
+    // Set POST data
+    curl_easy_setopt(pImpl->curl, CURLOPT_POSTFIELDS, data.c_str());
+    curl_easy_setopt(pImpl->curl, CURLOPT_POSTFIELDSIZE, data.length());
+
+    // Set Content-Type header
+    struct curl_slist* headers = nullptr;
+    std::string content_type_header = "Content-Type: " + content_type;
+    headers = curl_slist_append(headers, content_type_header.c_str());
+    curl_easy_setopt(pImpl->curl, CURLOPT_HTTPHEADER, headers);
+
+    // Perform request
+    CURLcode res = curl_easy_perform(pImpl->curl);
+
+    // Clean up headers
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK) {
+        response.error_message = curl_easy_strerror(res);
+        return response;
+    }
+
+    // Get response code
+    long http_code = 0;
+    curl_easy_getinfo(pImpl->curl, CURLINFO_RESPONSE_CODE, &http_code);
+    response.status_code = static_cast<int>(http_code);
+
+    // Get Content-Type
+    char* resp_content_type = nullptr;
+    curl_easy_getinfo(pImpl->curl, CURLINFO_CONTENT_TYPE, &resp_content_type);
+    if (resp_content_type) {
+        response.content_type = resp_content_type;
+    }
+
+    response.body = std::move(response_body);
+
+    return response;
+}
+
 void HttpClient::set_timeout(long timeout_seconds) {
     pImpl->timeout = timeout_seconds;
 }
