@@ -34,7 +34,12 @@ struct DomNode {
     std::string href;
     int link_index = -1;  // -1表示非链接
     int field_index = -1; // -1表示非表单字段
-    std::string alt_text; // For images
+
+    // 图片属性
+    std::string img_src;   // 图片URL
+    std::string alt_text;  // 图片alt文本
+    int img_width = -1;    // 图片宽度 (-1表示未指定)
+    int img_height = -1;   // 图片高度 (-1表示未指定)
 
     // 表格属性
     bool is_table_header = false;

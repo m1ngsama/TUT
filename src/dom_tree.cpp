@@ -265,8 +265,23 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
 
         // Handle IMG
         if (element.tag == GUMBO_TAG_IMG) {
+            GumboAttribute* src_attr = gumbo_get_attribute(&element.attributes, "src");
+            if (src_attr && src_attr->value) {
+                node->img_src = resolve_url(src_attr->value, base_url);
+            }
+
             GumboAttribute* alt_attr = gumbo_get_attribute(&element.attributes, "alt");
             if (alt_attr) node->alt_text = alt_attr->value;
+
+            GumboAttribute* width_attr = gumbo_get_attribute(&element.attributes, "width");
+            if (width_attr && width_attr->value) {
+                try { node->img_width = std::stoi(width_attr->value); } catch (...) {}
+            }
+
+            GumboAttribute* height_attr = gumbo_get_attribute(&element.attributes, "height");
+            if (height_attr && height_attr->value) {
+                try { node->img_height = std::stoi(height_attr->value); } catch (...) {}
+            }
         }
 
 

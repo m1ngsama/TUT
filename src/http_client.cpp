@@ -2,10 +2,18 @@
 #include <curl/curl.h>
 #include <stdexcept>
 
-// 回调函数用于接收数据
+// 回调函数用于接收文本数据
 static size_t write_callback(void* contents, size_t size, size_t nmemb, std::string* userp) {
     size_t total_size = size * nmemb;
     userp->append(static_cast<char*>(contents), total_size);
+    return total_size;
+}
+
+// 回调函数用于接收二进制数据
+static size_t binary_write_callback(void* contents, size_t size, size_t nmemb, std::vector<uint8_t>* userp) {
+    size_t total_size = size * nmemb;
+    uint8_t* data = static_cast<uint8_t*>(contents);
+    userp->insert(userp->end(), data, data + total_size);
     return total_size;
 }
 
@@ -113,6 +121,75 @@ HttpResponse HttpClient::fetch(const std::string& url) {
     }
 
     response.body = std::move(response_body);
+
+    return response;
+}
+
+BinaryResponse HttpClient::fetch_binary(const std::string& url) {
+    BinaryResponse response;
+    response.status_code = 0;
+
+    if (!pImpl->curl) {
+        response.error_message = "CURL not initialized";
+        return response;
+    }
+
+    curl_easy_reset(pImpl->curl);
+
+    // 设置URL
+    curl_easy_setopt(pImpl->curl, CURLOPT_URL, url.c_str());
+
+    // 设置写回调
+    std::vector<uint8_t> response_data;
+    curl_easy_setopt(pImpl->curl, CURLOPT_WRITEFUNCTION, binary_write_callback);
+    curl_easy_setopt(pImpl->curl, CURLOPT_WRITEDATA, &response_data);
+
+    // 设置超时
+    curl_easy_setopt(pImpl->curl, CURLOPT_TIMEOUT, pImpl->timeout);
+    curl_easy_setopt(pImpl->curl, CURLOPT_CONNECTTIMEOUT, 10L);
+
+    // 设置用户代理
+    curl_easy_setopt(pImpl->curl, CURLOPT_USERAGENT, pImpl->user_agent.c_str());
+
+    // 设置是否跟随重定向
+    if (pImpl->follow_redirects) {
+        curl_easy_setopt(pImpl->curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(pImpl->curl, CURLOPT_MAXREDIRS, 10L);
+    }
+
+    // 支持 HTTPS
+    curl_easy_setopt(pImpl->curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(pImpl->curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    // Cookie settings
+    if (!pImpl->cookie_file.empty()) {
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEFILE, pImpl->cookie_file.c_str());
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEJAR, pImpl->cookie_file.c_str());
+    } else {
+        curl_easy_setopt(pImpl->curl, CURLOPT_COOKIEFILE, "");
+    }
+
+    // 执行请求
+    CURLcode res = curl_easy_perform(pImpl->curl);
+
+    if (res != CURLE_OK) {
+        response.error_message = curl_easy_strerror(res);
+        return response;
+    }
+
+    // 获取响应码
+    long http_code = 0;
+    curl_easy_getinfo(pImpl->curl, CURLINFO_RESPONSE_CODE, &http_code);
+    response.status_code = static_cast<int>(http_code);
+
+    // 获取 Content-Type
+    char* content_type = nullptr;
+    curl_easy_getinfo(pImpl->curl, CURLINFO_CONTENT_TYPE, &content_type);
+    if (content_type) {
+        response.content_type = content_type;
+    }
+
+    response.data = std::move(response_data);
 
     return response;
 }
