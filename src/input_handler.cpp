@@ -174,6 +174,12 @@ public:
             case '?':
                 result.action = Action::HELP;
                 break;
+            case 'B':
+                result.action = Action::ADD_BOOKMARK;
+                break;
+            case 'D':
+                result.action = Action::REMOVE_BOOKMARK;
+                break;
             default:
                 buffer.clear();
                 break;
@@ -201,6 +207,8 @@ public:
                     result.action = Action::OPEN_URL;
                     result.text = command.substr(space_pos + 1);
                 }
+            } else if (command == "bookmarks" || command == "bm" || command == "b") {
+                result.action = Action::SHOW_BOOKMARKS;
             } else if (!command.empty() && std::isdigit(command[0])) {
                 try {
                     result.action = Action::GOTO_LINE;

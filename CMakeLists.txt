@@ -88,6 +88,7 @@ add_executable(tut2
     src/browser_v2.cpp
     src/http_client.cpp
     src/input_handler.cpp
+    src/bookmark.cpp
     src/render/terminal.cpp
     src/render/renderer.cpp
     src/render/layout.cpp

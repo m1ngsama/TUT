@@ -1,9 +1,9 @@
 # TUT 2.0 - 下次继续从这里开始
 
 ## 当前位置
-- **阶段**: Phase 4 - 图片支持 (已完成!)
-- **进度**: 图片 ASCII Art 渲染已集成到浏览器
-- **最后提交**: `feat: Add image ASCII art rendering support`
+- **阶段**: Phase 5 - 书签管理 (已完成!)
+- **进度**: 书签添加/删除/持久化存储已完成
+- **最后提交**: `feat: Add bookmark management`
 
 ## 立即可做的事
 
@@ -15,20 +15,24 @@ curl -L https://raw.githubusercontent.com/nothings/stb/master/stb_image.h \
 
 # 重新编译
 cmake --build build_v2
-
-# 编译后会自动支持 PNG/JPEG/GIF/BMP 图片格式
 ```
 
-### 2. 测试图片渲染
-```bash
-# 访问有图片的网页
-./build_v2/tut2 https://httpbin.org/html
+### 2. 使用书签功能
+- **B** - 添加当前页面到书签
+- **D** - 从书签中移除当前页面
+- **:bookmarks** 或 **:bm** - 查看书签列表
 
-# 或访问包含图片的任意网页
-./build_v2/tut2 https://example.com
-```
+书签存储在 `~/.config/tut/bookmarks.json`
 
 ## 已完成的功能清单
+
+### Phase 5 - 书签管理
+- [x] 书签数据结构 (URL, 标题, 添加时间)
+- [x] JSON 持久化存储 (~/.config/tut/bookmarks.json)
+- [x] 添加书签 (B 键)
+- [x] 删除书签 (D 键)
+- [x] 书签列表页面 (:bookmarks 命令)
+- [x] 书签链接可点击跳转
 
 ### Phase 4 - 图片支持
 - [x] `<img>` 标签解析 (src, alt, width, height)
@@ -127,10 +131,10 @@ cmake --build build_v2
 
 ## 下一步功能优先级
 
-1. **书签管理** - 添加/删除书签，书签列表页面，持久化存储
-2. **异步 HTTP 请求** - 非阻塞加载，加载动画，可取消请求
-3. **更多表单交互** - 文本输入编辑，下拉选择
-4. **图片缓存** - 避免重复下载相同图片
+1. **异步 HTTP 请求** - 非阻塞加载，加载动画，可取消请求
+2. **更多表单交互** - 文本输入编辑，下拉选择
+3. **图片缓存** - 避免重复下载相同图片
+4. **历史记录管理** - 持久化历史记录，历史页面
 
 ## 恢复对话时说
 

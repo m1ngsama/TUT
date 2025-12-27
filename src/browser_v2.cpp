@@ -1,5 +1,6 @@
 #include "browser_v2.h"
 #include "dom_tree.h"
+#include "bookmark.h"
 #include "render/colors.h"
 #include "render/decorations.h"
 #include "render/image.h"
@@ -33,6 +34,7 @@ public:
     HttpClient http_client;
     HtmlParser html_parser;
     InputHandler input_handler;
+    tut::BookmarkManager bookmark_manager;
 
     // 新渲染系统
     Terminal terminal;
@@ -407,6 +409,18 @@ public:
                 show_help();
                 break;
 
+            case Action::ADD_BOOKMARK:
+                add_bookmark();
+                break;
+
+            case Action::REMOVE_BOOKMARK:
+                remove_bookmark();
+                break;
+
+            case Action::SHOW_BOOKMARKS:
+                show_bookmarks();
+                break;
+
             case Action::QUIT:
                 break; // 在main loop处理
 
@@ -589,9 +603,17 @@ public:
 <li>N - Previous match</li>
 </ul>
 
+<h2>Bookmarks</h2>
+<ul>
+<li>B - Add bookmark</li>
+<li>D - Remove bookmark</li>
+<li>:bookmarks - Show bookmarks</li>
+</ul>
+
 <h2>Commands</h2>
 <ul>
 <li>:o URL - Open URL</li>
+<li>:bookmarks - Show bookmarks</li>
 <li>:q - Quit</li>
 <li>? - Show this help</li>
 </ul>
@@ -612,6 +634,79 @@ public:
         scroll_pos = 0;
         active_link = current_tree.links.empty() ? -1 : 0;
         status_message = "Help - Press any key to continue";
+    }
+
+    void show_bookmarks() {
+        std::ostringstream html;
+        html << R"(
+<!DOCTYPE html>
+<html>
+<head><title>Bookmarks</title></head>
+<body>
+<h1>Bookmarks</h1>
+)";
+
+        const auto& bookmarks = bookmark_manager.get_all();
+
+        if (bookmarks.empty()) {
+            html << "<p>No bookmarks yet.</p>\n";
+            html << "<p>Press <b>B</b> on any page to add a bookmark.</p>\n";
+        } else {
+            html << "<ul>\n";
+            for (const auto& bm : bookmarks) {
+                html << "<li><a href=\"" << bm.url << "\">"
+                     << (bm.title.empty() ? bm.url : bm.title)
+                     << "</a></li>\n";
+            }
+            html << "</ul>\n";
+            html << "<hr>\n";
+            html << "<p>" << bookmarks.size() << " bookmark(s). Press D on any page to remove its bookmark.</p>\n";
+        }
+
+        html << R"(
+</body>
+</html>
+)";
+
+        current_tree = html_parser.parse_tree(html.str(), "bookmarks://");
+        current_layout = layout_engine->layout(current_tree);
+        scroll_pos = 0;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        status_message = "Bookmarks";
+    }
+
+    void add_bookmark() {
+        if (current_url.empty() || current_url.find("://") == std::string::npos) {
+            status_message = "Cannot bookmark this page";
+            return;
+        }
+
+        // 不要书签特殊页面
+        if (current_url.find("help://") == 0 || current_url.find("bookmarks://") == 0) {
+            status_message = "Cannot bookmark special pages";
+            return;
+        }
+
+        std::string title = current_tree.title.empty() ? current_url : current_tree.title;
+
+        if (bookmark_manager.add(current_url, title)) {
+            status_message = "Bookmarked: " + title;
+        } else {
+            status_message = "Already bookmarked";
+        }
+    }
+
+    void remove_bookmark() {
+        if (current_url.empty()) {
+            status_message = "No page to unbookmark";
+            return;
+        }
+
+        if (bookmark_manager.remove(current_url)) {
+            status_message = "Bookmark removed";
+        } else {
+            status_message = "Not bookmarked";
+        }
     }
 };
 

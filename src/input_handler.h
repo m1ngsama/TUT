@@ -38,7 +38,10 @@ enum class Action {
     QUIT,
     HELP,
     SET_MARK,               // Set a mark (m + letter)
-    GOTO_MARK               // Jump to mark (' + letter)
+    GOTO_MARK,              // Jump to mark (' + letter)
+    ADD_BOOKMARK,           // Add current page to bookmarks (B)
+    REMOVE_BOOKMARK,        // Remove current page from bookmarks (D)
+    SHOW_BOOKMARKS          // Show bookmarks page (:bookmarks)
 };
 
 struct InputResult {
