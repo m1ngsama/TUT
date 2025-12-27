@@ -125,11 +125,14 @@ public:
     }
 
     void clear() {
-        ::clear();
+        // 使用 ANSI 转义码清屏并移动光标到左上角
+        std::printf("\033[2J\033[H");
+        std::fflush(stdout);
     }
 
     void refresh() {
-        ::refresh();
+        // ANSI 模式下不需要 ncurses 的 refresh，只需 flush
+        std::fflush(stdout);
     }
 
     // ==================== True Color ====================
@@ -223,15 +226,20 @@ public:
     // ==================== 光标控制 ====================
 
     void move_cursor(int x, int y) {
-        move(y, x);  // ncurses使用 (y, x) 顺序
+        // 使用 ANSI 转义码移动光标（和 printf 输出兼容）
+        // 注意：ANSI 坐标是 1-indexed，所以需要 +1
+        std::printf("\033[%d;%dH", y + 1, x + 1);
+        std::fflush(stdout);
     }
 
     void hide_cursor() {
-        curs_set(0);
+        std::printf("\033[?25l");  // DECTCEM: 隐藏光标
+        std::fflush(stdout);
     }
 
     void show_cursor() {
-        curs_set(1);
+        std::printf("\033[?25h");  // DECTCEM: 显示光标
+        std::fflush(stdout);
     }
 
     // ==================== 文本输出 ====================
