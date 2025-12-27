@@ -456,6 +456,7 @@ public:
             case InputMode::NORMAL: mode_str = "NORMAL"; break;
             case InputMode::COMMAND:
             case InputMode::SEARCH: mode_str = input_handler.get_buffer(); break;
+            case InputMode::FORM_EDIT: mode_str = "-- INSERT -- " + input_handler.get_buffer(); break;
             default: mode_str = ""; break;
         }
         framebuffer->set_text(1, y, mode_str, colors::STATUSBAR_FG, colors::STATUSBAR_BG);
@@ -540,7 +541,25 @@ public:
                 break;
 
             case Action::FOLLOW_LINK:
-                if (active_link >= 0 && active_link < static_cast<int>(current_tree.links.size())) {
+                // If on a form field, activate it instead of following link
+                if (active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                    auto* field = current_tree.form_fields[active_field];
+                    if (field) {
+                        if (field->input_type == "text" || field->input_type == "password") {
+                            // Enter edit mode
+                            input_handler.set_mode(InputMode::FORM_EDIT);
+                            input_handler.set_buffer(field->value);
+                            status_message = "-- INSERT --";
+                        } else if (field->input_type == "checkbox") {
+                            // Toggle checkbox
+                            field->checked = !field->checked;
+                            status_message = field->checked ? "☑ Checked" : "☐ Unchecked";
+                        } else if (field->input_type == "submit" || field->element_type == ElementType::BUTTON) {
+                            // TODO: Submit form
+                            status_message = "Form submit (not yet implemented)";
+                        }
+                    }
+                } else if (active_link >= 0 && active_link < static_cast<int>(current_tree.links.size())) {
                     start_async_load(current_tree.links[active_link].url);
                 }
                 break;
@@ -607,6 +626,66 @@ public:
 
             case Action::SHOW_HISTORY:
                 show_history();
+                break;
+
+            case Action::NEXT_FIELD:
+                if (!current_tree.form_fields.empty()) {
+                    // Save current text if in edit mode
+                    if (input_handler.get_mode() == InputMode::FORM_EDIT &&
+                        active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                        auto* field = current_tree.form_fields[active_field];
+                        if (field && (field->input_type == "text" || field->input_type == "password")) {
+                            field->value = result.text;
+                        }
+                    }
+
+                    // Move to next field
+                    if (active_field < 0) {
+                        active_field = 0;  // First field
+                    } else {
+                        active_field = (active_field + 1) % current_tree.form_fields.size();
+                    }
+
+                    // Auto-scroll to field
+                    // TODO: Implement scroll to field
+                    status_message = "Field " + std::to_string(active_field + 1) + "/" +
+                                   std::to_string(current_tree.form_fields.size());
+                }
+                break;
+
+            case Action::PREV_FIELD:
+                if (!current_tree.form_fields.empty()) {
+                    // Save current text if in edit mode
+                    if (input_handler.get_mode() == InputMode::FORM_EDIT &&
+                        active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                        auto* field = current_tree.form_fields[active_field];
+                        if (field && (field->input_type == "text" || field->input_type == "password")) {
+                            field->value = result.text;
+                        }
+                    }
+
+                    // Move to previous field
+                    if (active_field < 0) {
+                        active_field = current_tree.form_fields.size() - 1;  // Last field
+                    } else {
+                        active_field = (active_field - 1 + current_tree.form_fields.size()) %
+                                     current_tree.form_fields.size();
+                    }
+
+                    status_message = "Field " + std::to_string(active_field + 1) + "/" +
+                                   std::to_string(current_tree.form_fields.size());
+                }
+                break;
+
+            case Action::EDIT_TEXT:
+                // Update field value in real-time
+                if (active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                    auto* field = current_tree.form_fields[active_field];
+                    if (field && (field->input_type == "text" || field->input_type == "password")) {
+                        field->value = result.text;
+                        status_message = "Editing: " + result.text;
+                    }
+                }
                 break;
 
             case Action::QUIT:

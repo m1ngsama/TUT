@@ -125,6 +125,7 @@ public:
                 count_buffer.clear();
                 break;
             case '\t':
+                // Tab can navigate both links and fields - browser will decide
                 result.action = Action::NEXT_LINK;
                 count_buffer.clear();
                 break;
@@ -135,13 +136,18 @@ public:
                 break;
             case '\n':
             case '\r':
-                // If count buffer has a number, jump to that link
+                // Enter can follow links or activate fields - browser will decide
                 if (result.has_count) {
                     result.action = Action::GOTO_LINK;
                     result.number = result.count;
                 } else {
                     result.action = Action::FOLLOW_LINK;
                 }
+                count_buffer.clear();
+                break;
+            case 'i':
+                // 'i' to focus on first form field (like vim insert mode)
+                result.action = Action::NEXT_FIELD;
                 count_buffer.clear();
                 break;
             case 'f':
@@ -334,6 +340,52 @@ public:
         return result;
     }
 
+    InputResult process_form_edit_mode(int ch) {
+        InputResult result;
+        result.action = Action::NONE;
+
+        if (ch == 27) {
+            // ESC exits form edit mode
+            mode = InputMode::NORMAL;
+            buffer.clear();
+            return result;
+        } else if (ch == '\n' || ch == '\r') {
+            // Enter submits the text
+            result.action = Action::EDIT_TEXT;
+            result.text = buffer;
+            mode = InputMode::NORMAL;
+            buffer.clear();
+            return result;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            // Backspace removes last character
+            if (!buffer.empty()) {
+                buffer.pop_back();
+            }
+            return result;
+        } else if (ch == '\t') {
+            // Tab moves to next field while saving current text
+            result.action = Action::NEXT_FIELD;
+            result.text = buffer;
+            buffer.clear();
+            return result;
+        } else if (ch == KEY_BTAB) {
+            // Shift+Tab moves to previous field while saving current text
+            result.action = Action::PREV_FIELD;
+            result.text = buffer;
+            buffer.clear();
+            return result;
+        } else if (std::isprint(ch)) {
+            // Add printable characters to buffer
+            buffer += static_cast<char>(ch);
+            // Return EDIT_TEXT to update in real-time
+            result.action = Action::EDIT_TEXT;
+            result.text = buffer;
+            return result;
+        }
+
+        return result;
+    }
+
 };
 
 InputHandler::InputHandler() : pImpl(std::make_unique<Impl>()) {}
@@ -352,6 +404,8 @@ InputResult InputHandler::handle_key(int ch) {
             return pImpl->process_link_mode(ch);
         case InputMode::LINK_HINTS:
             return pImpl->process_link_hints_mode(ch);
+        case InputMode::FORM_EDIT:
+            return pImpl->process_form_edit_mode(ch);
         default:
             break;
     }
@@ -373,6 +427,14 @@ void InputHandler::reset() {
     pImpl->mode = InputMode::NORMAL;
     pImpl->buffer.clear();
     pImpl->count_buffer.clear();
+}
+
+void InputHandler::set_mode(InputMode mode) {
+    pImpl->mode = mode;
+}
+
+void InputHandler::set_buffer(const std::string& buffer) {
+    pImpl->buffer = buffer;
 }
 
 void InputHandler::set_status_callback(std::function<void(const std::string&)> callback) {

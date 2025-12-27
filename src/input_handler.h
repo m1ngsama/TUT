@@ -9,7 +9,8 @@ enum class InputMode {
     COMMAND,
     SEARCH,
     LINK,
-    LINK_HINTS     // Vimium-style 'f' mode
+    LINK_HINTS,    // Vimium-style 'f' mode
+    FORM_EDIT      // Form field editing mode
 };
 
 enum class Action {
@@ -42,7 +43,13 @@ enum class Action {
     ADD_BOOKMARK,           // Add current page to bookmarks (B)
     REMOVE_BOOKMARK,        // Remove current page from bookmarks (D)
     SHOW_BOOKMARKS,         // Show bookmarks page (:bookmarks)
-    SHOW_HISTORY            // Show history page (:history)
+    SHOW_HISTORY,           // Show history page (:history)
+    NEXT_FIELD,             // Move to next form field (Tab)
+    PREV_FIELD,             // Move to previous form field (Shift+Tab)
+    ACTIVATE_FIELD,         // Activate current field for editing (Enter)
+    TOGGLE_CHECKBOX,        // Toggle checkbox state
+    EDIT_TEXT,              // Edit text input (updates text buffer)
+    SUBMIT_FORM             // Submit form (Enter on submit button)
 };
 
 struct InputResult {
@@ -62,6 +69,8 @@ public:
     InputMode get_mode() const;
     std::string get_buffer() const;
     void reset();
+    void set_mode(InputMode mode);
+    void set_buffer(const std::string& buffer);
     void set_status_callback(std::function<void(const std::string&)> callback);
 
 private:
