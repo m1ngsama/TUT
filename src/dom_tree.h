@@ -1,6 +1,7 @@
 #pragma once
 
 #include "html_parser.h"
+#include "render/image.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -40,6 +41,7 @@ struct DomNode {
     std::string alt_text;  // 图片alt文本
     int img_width = -1;    // 图片宽度 (-1表示未指定)
     int img_height = -1;   // 图片高度 (-1表示未指定)
+    tut::ImageData image_data;  // 解码后的图片数据
 
     // 表格属性
     bool is_table_header = false;
@@ -68,6 +70,7 @@ struct DocumentTree {
     std::unique_ptr<DomNode> root;
     std::vector<Link> links;  // 全局链接列表
     std::vector<DomNode*> form_fields; // 全局表单字段列表 (非拥有指针)
+    std::vector<DomNode*> images;  // 全局图片列表 (非拥有指针)
     std::string title;
     std::string url;
 };
@@ -87,6 +90,7 @@ private:
         GumboNode* gumbo_node,
         std::vector<Link>& links,
         std::vector<DomNode*>& form_fields,
+        std::vector<DomNode*>& images,
         const std::string& base_url
     );
 

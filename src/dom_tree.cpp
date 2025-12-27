@@ -136,7 +136,7 @@ DocumentTree DomTreeBuilder::build(const std::string& html, const std::string& b
     // 2. 转换为DomNode树
     DocumentTree tree;
     tree.url = base_url;
-    tree.root = convert_node(output->root, tree.links, tree.form_fields, base_url);
+    tree.root = convert_node(output->root, tree.links, tree.form_fields, tree.images, base_url);
 
     // 3. 提取标题
     if (tree.root) {
@@ -153,6 +153,7 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
     GumboNode* gumbo_node,
     std::vector<Link>& links,
     std::vector<DomNode*>& form_fields,
+    std::vector<DomNode*>& images,
     const std::string& base_url
 ) {
     if (!gumbo_node) return nullptr;
@@ -282,6 +283,11 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
             if (height_attr && height_attr->value) {
                 try { node->img_height = std::stoi(height_attr->value); } catch (...) {}
             }
+
+            // 添加到图片列表（用于后续下载）
+            if (!node->img_src.empty()) {
+                images.push_back(node.get());
+            }
         }
 
 
@@ -334,12 +340,13 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
                 static_cast<GumboNode*>(children->data[i]),
                 links,
                 form_fields,
+                images,
                 base_url
             );
             if (child) {
                 child->parent = node.get();
                 node->children.push_back(std::move(child));
-                
+
                 // For TEXTAREA, content is value
                 if (element.tag == GUMBO_TAG_TEXTAREA && child->node_type == NodeType::TEXT) {
                     node->value += child->text_content;
@@ -371,6 +378,7 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
                 static_cast<GumboNode*>(doc.children.data[i]),
                 links,
                 form_fields,
+                images,
                 base_url
             );
             if (child) {

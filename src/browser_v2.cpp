@@ -2,6 +2,7 @@
 #include "dom_tree.h"
 #include "render/colors.h"
 #include "render/decorations.h"
+#include "render/image.h"
 #include "utils/unicode.h"
 #include <algorithm>
 #include <sstream>
@@ -142,6 +143,9 @@ public:
             status_message = current_tree.title.empty() ? url : current_tree.title;
         }
 
+        // 下载图片
+        load_images(current_tree);
+
         // 布局计算
         current_layout = layout_engine->layout(current_tree);
 
@@ -181,6 +185,39 @@ public:
         entry.html = html;
         entry.timestamp = std::chrono::steady_clock::now();
         page_cache[url] = std::move(entry);
+    }
+
+    // 下载并解码页面中的图片
+    void load_images(DocumentTree& tree) {
+        if (tree.images.empty()) {
+            return;
+        }
+
+        int loaded = 0;
+        int total = static_cast<int>(tree.images.size());
+
+        for (DomNode* img_node : tree.images) {
+            if (img_node->img_src.empty()) {
+                continue;
+            }
+
+            // 更新状态
+            loaded++;
+            status_message = "🖼 Loading image " + std::to_string(loaded) + "/" + std::to_string(total) + "...";
+            draw_screen();
+
+            // 下载图片
+            auto response = http_client.fetch_binary(img_node->img_src);
+            if (!response.is_success() || response.data.empty()) {
+                continue;  // 跳过失败的图片
+            }
+
+            // 解码图片
+            tut::ImageData img_data = tut::ImageRenderer::load_from_memory(response.data);
+            if (img_data.is_valid()) {
+                img_node->image_data = std::move(img_data);
+            }
+        }
     }
 
     // 从URL中提取主机名

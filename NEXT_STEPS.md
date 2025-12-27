@@ -1,37 +1,32 @@
 # TUT 2.0 - 下次继续从这里开始
 
 ## 当前位置
-- **阶段**: Phase 4 - 图片支持 (基础完成)
-- **进度**: 占位符显示已完成，ASCII Art 渲染框架就绪
-- **最后提交**: `d80d0a1 feat: Implement TUT 2.0 with new rendering architecture`
-- **待推送**: 本地有 3 个提交未推送到 origin/main
+- **阶段**: Phase 4 - 图片支持 (已完成!)
+- **进度**: 图片 ASCII Art 渲染已集成到浏览器
+- **最后提交**: `feat: Add image ASCII art rendering support`
 
 ## 立即可做的事
 
-### 1. 推送代码到远程
+### 1. 启用图片支持 (首次使用时需要)
 ```bash
-git push origin main
-```
-
-### 2. 启用完整图片支持 (PNG/JPEG)
-```bash
-# 下载 stb_image.h
+# 下载 stb_image.h (如果尚未下载)
 curl -L https://raw.githubusercontent.com/nothings/stb/master/stb_image.h \
      -o src/utils/stb_image.h
 
 # 重新编译
 cmake --build build_v2
 
-# 编译后 ImageRenderer::load_from_memory() 将自动支持 PNG/JPEG/GIF/BMP
+# 编译后会自动支持 PNG/JPEG/GIF/BMP 图片格式
 ```
 
-### 3. 在浏览器中集成图片渲染
-需要在 `browser_v2.cpp` 中:
-1. 收集页面中的所有 `<img>` 标签
-2. 使用 `HttpClient::fetch_binary()` 下载图片
-3. 调用 `ImageRenderer::load_from_memory()` 解码
-4. 调用 `ImageRenderer::render()` 生成 ASCII Art
-5. 将结果插入到布局中
+### 2. 测试图片渲染
+```bash
+# 访问有图片的网页
+./build_v2/tut2 https://httpbin.org/html
+
+# 或访问包含图片的任意网页
+./build_v2/tut2 https://example.com
+```
 
 ## 已完成的功能清单
 
@@ -42,8 +37,9 @@ cmake --build build_v2
 - [x] `HttpClient::fetch_binary()` 方法
 - [x] `ImageRenderer` 类框架
 - [x] PPM 格式内置解码
-- [ ] stb_image.h 集成 (需手动下载)
-- [ ] 浏览器中的图片下载和渲染
+- [x] stb_image.h 集成 (PNG/JPEG/GIF/BMP 支持)
+- [x] 浏览器中的图片下载和渲染
+- [x] ASCII Art 彩色渲染 (True Color)
 
 ### Phase 3 - 性能优化
 - [x] LRU 页面缓存 (20页, 5分钟过期)
@@ -131,14 +127,14 @@ cmake --build build_v2
 
 ## 下一步功能优先级
 
-1. **完成图片 ASCII Art 渲染** - 下载 stb_image.h 并集成到浏览器
-2. **书签管理** - 添加/删除书签，书签列表页面，持久化存储
-3. **异步 HTTP 请求** - 非阻塞加载，加载动画，可取消请求
-4. **更多表单交互** - 文本输入编辑，下拉选择
+1. **书签管理** - 添加/删除书签，书签列表页面，持久化存储
+2. **异步 HTTP 请求** - 非阻塞加载，加载动画，可取消请求
+3. **更多表单交互** - 文本输入编辑，下拉选择
+4. **图片缓存** - 避免重复下载相同图片
 
 ## 恢复对话时说
 
 > "继续TUT 2.0开发"
 
 ---
-更新时间: 2025-12-26 15:00
+更新时间: 2025-12-27

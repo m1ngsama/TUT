@@ -391,10 +391,88 @@ void LayoutEngine::layout_image_element(const DomNode* node, Context& /*ctx*/, s
     block.margin_top = 0;
     block.margin_bottom = 1;
 
+    // 检查是否有解码后的图片数据
+    if (node->image_data.is_valid()) {
+        // 渲染 ASCII Art
+        ImageRenderer renderer;
+        renderer.set_mode(ImageRenderer::Mode::BLOCKS);
+        renderer.set_color_enabled(true);
+
+        // 计算图片最大尺寸（留出左边距）
+        int max_width = content_width_;
+        int max_height = 30;  // 限制高度
+
+        // 如果节点指定了尺寸，使用更小的值
+        if (node->img_width > 0) {
+            max_width = std::min(max_width, node->img_width);
+        }
+        if (node->img_height > 0) {
+            max_height = std::min(max_height, node->img_height / 2);  // 考虑字符高宽比
+        }
+
+        AsciiImage ascii = renderer.render(node->image_data, max_width, max_height);
+
+        if (!ascii.lines.empty()) {
+            for (size_t i = 0; i < ascii.lines.size(); ++i) {
+                LayoutLine line;
+                line.indent = MARGIN_LEFT;
+
+                // 将每一行作为一个 span
+                // 但由于颜色可能不同，需要逐字符处理
+                const std::string& line_text = ascii.lines[i];
+                const std::vector<uint32_t>& line_colors = ascii.colors[i];
+
+                // 为了效率，尝试合并相同颜色的字符
+                size_t pos = 0;
+                while (pos < line_text.size()) {
+                    // 获取当前字符的字节数（UTF-8）
+                    int char_bytes = 1;
+                    unsigned char c = line_text[pos];
+                    if ((c & 0x80) == 0) {
+                        char_bytes = 1;
+                    } else if ((c & 0xE0) == 0xC0) {
+                        char_bytes = 2;
+                    } else if ((c & 0xF0) == 0xE0) {
+                        char_bytes = 3;
+                    } else if ((c & 0xF8) == 0xF0) {
+                        char_bytes = 4;
+                    }
+
+                    // 获取颜色索引（基于显示宽度位置）
+                    size_t color_idx = 0;
+                    for (size_t j = 0; j < pos; ) {
+                        unsigned char ch = line_text[j];
+                        int bytes = 1;
+                        if ((ch & 0x80) == 0) bytes = 1;
+                        else if ((ch & 0xE0) == 0xC0) bytes = 2;
+                        else if ((ch & 0xF0) == 0xE0) bytes = 3;
+                        else if ((ch & 0xF8) == 0xF0) bytes = 4;
+                        color_idx++;
+                        j += bytes;
+                    }
+
+                    uint32_t color = (color_idx < line_colors.size()) ? line_colors[color_idx] : colors::FG_PRIMARY;
+
+                    StyledSpan span;
+                    span.text = line_text.substr(pos, char_bytes);
+                    span.fg = color;
+                    span.attrs = ATTR_NONE;
+                    line.spans.push_back(span);
+
+                    pos += char_bytes;
+                }
+
+                block.lines.push_back(line);
+            }
+            blocks.push_back(block);
+            return;
+        }
+    }
+
+    // 回退到占位符
     LayoutLine line;
     line.indent = MARGIN_LEFT;
 
-    // 生成图片占位符
     std::string placeholder = make_image_placeholder(node->alt_text, node->img_src);
 
     StyledSpan span;
