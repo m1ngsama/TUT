@@ -9,8 +9,9 @@ enum class InputMode {
     COMMAND,
     SEARCH,
     LINK,
-    LINK_HINTS,    // Vimium-style 'f' mode
-    FORM_EDIT      // Form field editing mode
+    LINK_HINTS,     // Vimium-style 'f' mode
+    FORM_EDIT,      // Form field editing mode
+    SELECT_OPTION   // Dropdown selection mode
 };
 
 enum class Action {
@@ -49,7 +50,10 @@ enum class Action {
     ACTIVATE_FIELD,         // Activate current field for editing (Enter)
     TOGGLE_CHECKBOX,        // Toggle checkbox state
     EDIT_TEXT,              // Edit text input (updates text buffer)
-    SUBMIT_FORM             // Submit form (Enter on submit button)
+    SUBMIT_FORM,            // Submit form (Enter on submit button)
+    NEXT_OPTION,            // Move to next dropdown option (j/down)
+    PREV_OPTION,            // Move to previous dropdown option (k/up)
+    SELECT_CURRENT_OPTION   // Select current dropdown option (Enter)
 };
 
 struct InputResult {

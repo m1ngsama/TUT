@@ -58,6 +58,10 @@ struct DomNode {
     bool checked = false;
     int form_id = -1;
 
+    // SELECT元素的选项
+    std::vector<std::pair<std::string, std::string>> options;  // (value, text) pairs
+    int selected_option = 0;  // 当前选中的选项索引
+
     // 辅助方法
     bool is_block_element() const;
     bool is_inline_element() const;

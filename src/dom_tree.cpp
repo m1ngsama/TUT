@@ -369,7 +369,30 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
                 }
             }
         }
-        
+
+        // For SELECT, collect all OPTION children
+        if (element.tag == GUMBO_TAG_SELECT) {
+            for (const auto& child : node->children) {
+                if (child->element_type == ElementType::OPTION) {
+                    std::string option_value = child->value.empty() ? child->get_all_text() : child->value;
+                    std::string option_text = child->get_all_text();
+                    node->options.push_back({option_value, option_text});
+
+                    // Set selected option if marked
+                    if (child->checked) {
+                        node->selected_option = node->options.size() - 1;
+                        node->value = option_value;
+                    }
+                }
+            }
+
+            // Set default value to first option if no option is selected
+            if (!node->options.empty() && node->value.empty()) {
+                node->value = node->options[0].first;
+                node->selected_option = 0;
+            }
+        }
+
         // Reset form ID if we are exiting a form
         if (element.tag == GUMBO_TAG_FORM) {
             g_current_form_id = -1; // Assuming no nested forms

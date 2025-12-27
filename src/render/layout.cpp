@@ -432,9 +432,13 @@ void LayoutEngine::layout_form_element(const DomNode* node, Context& /*ctx*/, st
         span.field_index = node->field_index;
         line.spans.push_back(span);
     } else if (node->element_type == ElementType::SELECT) {
-        // 下拉选择
+        // 下拉选择 - 显示当前选中的选项
         StyledSpan span;
-        span.text = "[▼ Select]";
+        std::string selected_text = "Select";
+        if (node->selected_option >= 0 && node->selected_option < static_cast<int>(node->options.size())) {
+            selected_text = node->options[node->selected_option].second;
+        }
+        span.text = "[▼ " + selected_text + "]";
         span.fg = colors::INPUT_FOCUS;
         span.bg = colors::INPUT_BG;
         span.field_index = node->field_index;

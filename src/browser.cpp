@@ -457,6 +457,7 @@ public:
             case InputMode::COMMAND:
             case InputMode::SEARCH: mode_str = input_handler.get_buffer(); break;
             case InputMode::FORM_EDIT: mode_str = "-- INSERT -- " + input_handler.get_buffer(); break;
+            case InputMode::SELECT_OPTION: mode_str = "-- SELECT --"; break;
             default: mode_str = ""; break;
         }
         framebuffer->set_text(1, y, mode_str, colors::STATUSBAR_FG, colors::STATUSBAR_BG);
@@ -554,6 +555,10 @@ public:
                             // Toggle checkbox
                             field->checked = !field->checked;
                             status_message = field->checked ? "☑ Checked" : "☐ Unchecked";
+                        } else if (field->input_type == "select") {
+                            // Enter dropdown selection mode
+                            input_handler.set_mode(InputMode::SELECT_OPTION);
+                            status_message = "-- SELECT -- (j/k to navigate, Enter to select, Esc to cancel)";
                         } else if (field->input_type == "submit" || field->element_type == ElementType::BUTTON) {
                             // TODO: Submit form
                             status_message = "Form submit (not yet implemented)";
@@ -684,6 +689,37 @@ public:
                     if (field && (field->input_type == "text" || field->input_type == "password")) {
                         field->value = result.text;
                         status_message = "Editing: " + result.text;
+                    }
+                }
+                break;
+
+            case Action::NEXT_OPTION:
+                if (active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                    auto* field = current_tree.form_fields[active_field];
+                    if (field && field->input_type == "select" && !field->options.empty()) {
+                        field->selected_option = (field->selected_option + 1) % field->options.size();
+                        status_message = "Option: " + field->options[field->selected_option].second;
+                    }
+                }
+                break;
+
+            case Action::PREV_OPTION:
+                if (active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                    auto* field = current_tree.form_fields[active_field];
+                    if (field && field->input_type == "select" && !field->options.empty()) {
+                        field->selected_option = (field->selected_option - 1 + field->options.size()) %
+                                                field->options.size();
+                        status_message = "Option: " + field->options[field->selected_option].second;
+                    }
+                }
+                break;
+
+            case Action::SELECT_CURRENT_OPTION:
+                if (active_field >= 0 && active_field < static_cast<int>(current_tree.form_fields.size())) {
+                    auto* field = current_tree.form_fields[active_field];
+                    if (field && field->input_type == "select" && !field->options.empty()) {
+                        field->value = field->options[field->selected_option].first;
+                        status_message = "Selected: " + field->options[field->selected_option].second;
                     }
                 }
                 break;

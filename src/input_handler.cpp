@@ -386,6 +386,32 @@ public:
         return result;
     }
 
+    InputResult process_select_option_mode(int ch) {
+        InputResult result;
+        result.action = Action::NONE;
+
+        if (ch == 27) {
+            // ESC cancels selection
+            mode = InputMode::NORMAL;
+            return result;
+        } else if (ch == '\n' || ch == '\r') {
+            // Enter selects current option
+            result.action = Action::SELECT_CURRENT_OPTION;
+            mode = InputMode::NORMAL;
+            return result;
+        } else if (ch == 'j' || ch == KEY_DOWN) {
+            // Next option
+            result.action = Action::NEXT_OPTION;
+            return result;
+        } else if (ch == 'k' || ch == KEY_UP) {
+            // Previous option
+            result.action = Action::PREV_OPTION;
+            return result;
+        }
+
+        return result;
+    }
+
 };
 
 InputHandler::InputHandler() : pImpl(std::make_unique<Impl>()) {}
@@ -406,6 +432,8 @@ InputResult InputHandler::handle_key(int ch) {
             return pImpl->process_link_hints_mode(ch);
         case InputMode::FORM_EDIT:
             return pImpl->process_form_edit_mode(ch);
+        case InputMode::SELECT_OPTION:
+            return pImpl->process_select_option_mode(ch);
         default:
             break;
     }
