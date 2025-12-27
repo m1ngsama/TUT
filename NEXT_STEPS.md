@@ -1,9 +1,9 @@
 # TUT 2.0 - 下次继续从这里开始
 
 ## 当前位置
-- **阶段**: Phase 5 - 书签管理 (已完成!)
-- **进度**: 书签添加/删除/持久化存储已完成
-- **最后提交**: `feat: Add bookmark management`
+- **阶段**: Phase 6 - 异步HTTP (已完成!)
+- **进度**: 非阻塞加载、加载动画、可取消请求已完成
+- **最后提交**: `feat: Add async HTTP requests with non-blocking loading`
 
 ## 立即可做的事
 
@@ -25,6 +25,16 @@ cmake --build build_v2
 书签存储在 `~/.config/tut/bookmarks.json`
 
 ## 已完成的功能清单
+
+### Phase 6 - 异步HTTP
+- [x] libcurl multi接口实现非阻塞请求
+- [x] AsyncState状态管理 (IDLE/LOADING/COMPLETE/FAILED/CANCELLED)
+- [x] start_async_fetch() 启动异步请求
+- [x] poll_async() 非阻塞轮询
+- [x] cancel_async() 取消请求
+- [x] 加载动画 (旋转spinner: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
+- [x] Esc键取消加载
+- [x] 主循环50ms轮询集成
 
 ### Phase 5 - 书签管理
 - [x] 书签数据结构 (URL, 标题, 添加时间)
@@ -128,12 +138,13 @@ cmake --build build_v2
 | :o URL | 打开URL |
 | :q | 退出 |
 | ? | 帮助 |
+| Esc | 取消加载 |
 
 ## 下一步功能优先级
 
-1. **异步 HTTP 请求** - 非阻塞加载，加载动画，可取消请求
-2. **更多表单交互** - 文本输入编辑，下拉选择
-3. **图片缓存** - 避免重复下载相同图片
+1. **更多表单交互** - 文本输入编辑，下拉选择
+2. **图片缓存** - 避免重复下载相同图片
+3. **异步图片加载** - 图片也使用异步加载
 4. **历史记录管理** - 持久化历史记录，历史页面
 
 ## 恢复对话时说
@@ -143,7 +154,7 @@ cmake --build build_v2
 ## Git 信息
 
 - **当前标签**: `v2.0.0-alpha`
-- **最新提交**: `a4c95a6 feat: Add bookmark management`
+- **最新提交**: `18859ee feat: Add async HTTP requests with non-blocking loading`
 - **远程仓库**: https://github.com/m1ngsama/TUT
 
 ```bash
