@@ -25,8 +25,15 @@ public:
     bool follow_redirects;
     std::string cookie_file;
 
+    // 异步请求相关
+    CURLM* multi_handle = nullptr;
+    CURL* async_easy = nullptr;
+    AsyncState async_state = AsyncState::IDLE;
+    std::string async_response_body;
+    HttpResponse async_result;
+
     Impl() : timeout(30),
-             user_agent("TUT-Browser/1.0 (Terminal User Interface Browser)"),
+             user_agent("TUT-Browser/2.0 (Terminal User Interface Browser)"),
              follow_redirects(true) {
         curl = curl_easy_init();
         if (!curl) {
@@ -36,12 +43,58 @@ public:
         curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
         // Enable automatic decompression of supported encodings (gzip, deflate, etc.)
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+
+        // 初始化multi handle用于异步请求
+        multi_handle = curl_multi_init();
+        if (!multi_handle) {
+            throw std::runtime_error("Failed to initialize CURL multi handle");
+        }
     }
 
     ~Impl() {
+        // 清理异步请求
+        cleanup_async();
+
+        if (multi_handle) {
+            curl_multi_cleanup(multi_handle);
+        }
         if (curl) {
             curl_easy_cleanup(curl);
         }
+    }
+
+    void cleanup_async() {
+        if (async_easy) {
+            curl_multi_remove_handle(multi_handle, async_easy);
+            curl_easy_cleanup(async_easy);
+            async_easy = nullptr;
+        }
+        async_state = AsyncState::IDLE;
+        async_response_body.clear();
+    }
+
+    void setup_easy_handle(CURL* handle, const std::string& url) {
+        curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(handle, CURLOPT_TIMEOUT, timeout);
+        curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(handle, CURLOPT_USERAGENT, user_agent.c_str());
+
+        if (follow_redirects) {
+            curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 10L);
+        }
+
+        curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L);
+
+        if (!cookie_file.empty()) {
+            curl_easy_setopt(handle, CURLOPT_COOKIEFILE, cookie_file.c_str());
+            curl_easy_setopt(handle, CURLOPT_COOKIEJAR, cookie_file.c_str());
+        } else {
+            curl_easy_setopt(handle, CURLOPT_COOKIEFILE, "");
+        }
+
+        curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "");
     }
 };
 
@@ -297,4 +350,106 @@ void HttpClient::set_follow_redirects(bool follow) {
 
 void HttpClient::enable_cookies(const std::string& cookie_file) {
     pImpl->cookie_file = cookie_file;
+}
+
+// ==================== 异步请求实现 ====================
+
+void HttpClient::start_async_fetch(const std::string& url) {
+    // 如果有正在进行的请求，先取消
+    if (pImpl->async_easy) {
+        cancel_async();
+    }
+
+    // 创建新的easy handle
+    pImpl->async_easy = curl_easy_init();
+    if (!pImpl->async_easy) {
+        pImpl->async_state = AsyncState::FAILED;
+        pImpl->async_result.error_message = "Failed to create CURL handle";
+        return;
+    }
+
+    // 配置请求
+    pImpl->setup_easy_handle(pImpl->async_easy, url);
+
+    // 设置写回调
+    pImpl->async_response_body.clear();
+    curl_easy_setopt(pImpl->async_easy, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(pImpl->async_easy, CURLOPT_WRITEDATA, &pImpl->async_response_body);
+
+    // 添加到multi handle
+    curl_multi_add_handle(pImpl->multi_handle, pImpl->async_easy);
+
+    pImpl->async_state = AsyncState::LOADING;
+    pImpl->async_result = HttpResponse{};  // 重置结果
+}
+
+AsyncState HttpClient::poll_async() {
+    if (pImpl->async_state != AsyncState::LOADING) {
+        return pImpl->async_state;
+    }
+
+    // 执行非阻塞的multi perform
+    int still_running = 0;
+    CURLMcode mc = curl_multi_perform(pImpl->multi_handle, &still_running);
+
+    if (mc != CURLM_OK) {
+        pImpl->async_result.error_message = curl_multi_strerror(mc);
+        pImpl->async_state = AsyncState::FAILED;
+        pImpl->cleanup_async();
+        return pImpl->async_state;
+    }
+
+    // 检查是否有完成的请求
+    int msgs_left = 0;
+    CURLMsg* msg;
+    while ((msg = curl_multi_info_read(pImpl->multi_handle, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+            CURL* easy = msg->easy_handle;
+            CURLcode result = msg->data.result;
+
+            if (result == CURLE_OK) {
+                // 获取响应信息
+                long http_code = 0;
+                curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+                pImpl->async_result.status_code = static_cast<int>(http_code);
+
+                char* content_type = nullptr;
+                curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &content_type);
+                if (content_type) {
+                    pImpl->async_result.content_type = content_type;
+                }
+
+                pImpl->async_result.body = std::move(pImpl->async_response_body);
+                pImpl->async_state = AsyncState::COMPLETE;
+            } else {
+                pImpl->async_result.error_message = curl_easy_strerror(result);
+                pImpl->async_state = AsyncState::FAILED;
+            }
+
+            // 清理handle但保留状态供获取结果
+            curl_multi_remove_handle(pImpl->multi_handle, pImpl->async_easy);
+            curl_easy_cleanup(pImpl->async_easy);
+            pImpl->async_easy = nullptr;
+        }
+    }
+
+    return pImpl->async_state;
+}
+
+HttpResponse HttpClient::get_async_result() {
+    HttpResponse result = std::move(pImpl->async_result);
+    pImpl->async_result = HttpResponse{};
+    pImpl->async_state = AsyncState::IDLE;
+    return result;
+}
+
+void HttpClient::cancel_async() {
+    if (pImpl->async_easy) {
+        pImpl->cleanup_async();
+        pImpl->async_state = AsyncState::CANCELLED;
+    }
+}
+
+bool HttpClient::is_async_active() const {
+    return pImpl->async_state == AsyncState::LOADING;
 }

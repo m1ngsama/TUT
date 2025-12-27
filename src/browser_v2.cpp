@@ -15,6 +15,19 @@
 
 using namespace tut;
 
+// 浏览器加载状态
+enum class LoadingState {
+    IDLE,           // 空闲
+    LOADING_PAGE,   // 正在加载页面
+    LOADING_IMAGES  // 正在加载图片
+};
+
+// 加载动画帧
+static const char* SPINNER_FRAMES[] = {
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+};
+static const int SPINNER_FRAME_COUNT = 10;
+
 // 缓存条目
 struct CacheEntry {
     DocumentTree tree;
@@ -69,6 +82,13 @@ public:
     std::map<std::string, CacheEntry> page_cache;
     static constexpr int CACHE_MAX_AGE = 300;  // 5分钟缓存
     static constexpr size_t CACHE_MAX_SIZE = 20;  // 最多缓存20个页面
+
+    // 异步加载状态
+    LoadingState loading_state = LoadingState::IDLE;
+    std::string pending_url;  // 正在加载的URL
+    bool pending_force_refresh = false;
+    int spinner_frame = 0;
+    std::chrono::steady_clock::time_point last_spinner_update;
 
     bool init_screen() {
         if (!terminal.init()) {
@@ -168,6 +188,162 @@ public:
         }
 
         return true;
+    }
+
+    // 启动异步页面加载
+    void start_async_load(const std::string& url, bool force_refresh = false) {
+        // 检查缓存
+        auto cache_it = page_cache.find(url);
+        bool use_cache = !force_refresh && cache_it != page_cache.end() &&
+                        !cache_it->second.is_expired(CACHE_MAX_AGE);
+
+        if (use_cache) {
+            // 使用缓存，不需要网络请求
+            status_message = "⚡ Loading from cache...";
+            current_tree = html_parser.parse_tree(cache_it->second.html, url);
+            current_layout = layout_engine->layout(current_tree);
+            current_url = url;
+            scroll_pos = 0;
+            active_link = current_tree.links.empty() ? -1 : 0;
+            active_field = current_tree.form_fields.empty() ? -1 : 0;
+            search_ctx = SearchContext();
+            search_term.clear();
+            status_message = "⚡ " + (current_tree.title.empty() ? url : current_tree.title);
+
+            // 更新历史
+            if (!force_refresh) {
+                if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
+                    history.erase(history.begin() + history_pos + 1, history.end());
+                }
+                history.push_back(url);
+                history_pos = history.size() - 1;
+            }
+
+            // 加载图片（仍然同步，可以后续优化）
+            load_images(current_tree);
+            current_layout = layout_engine->layout(current_tree);
+            return;
+        }
+
+        // 需要网络请求，启动异步加载
+        pending_url = url;
+        pending_force_refresh = force_refresh;
+        loading_state = LoadingState::LOADING_PAGE;
+        spinner_frame = 0;
+        last_spinner_update = std::chrono::steady_clock::now();
+
+        status_message = std::string(SPINNER_FRAMES[0]) + " Connecting to " + extract_host(url) + "...";
+        http_client.start_async_fetch(url);
+    }
+
+    // 轮询异步加载状态，返回true表示还在加载中
+    bool poll_loading() {
+        if (loading_state == LoadingState::IDLE) {
+            return false;
+        }
+
+        // 更新spinner动画
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_spinner_update).count();
+        if (elapsed >= 80) {  // 每80ms更新一帧
+            spinner_frame = (spinner_frame + 1) % SPINNER_FRAME_COUNT;
+            last_spinner_update = now;
+            update_loading_status();
+        }
+
+        if (loading_state == LoadingState::LOADING_PAGE) {
+            auto state = http_client.poll_async();
+
+            switch (state) {
+                case AsyncState::COMPLETE:
+                    handle_load_complete();
+                    return false;
+
+                case AsyncState::FAILED: {
+                    auto result = http_client.get_async_result();
+                    status_message = "❌ " + (result.error_message.empty() ?
+                        "Connection failed" : result.error_message);
+                    loading_state = LoadingState::IDLE;
+                    return false;
+                }
+
+                case AsyncState::CANCELLED:
+                    status_message = "⚠ Loading cancelled";
+                    loading_state = LoadingState::IDLE;
+                    return false;
+
+                case AsyncState::LOADING:
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        return loading_state != LoadingState::IDLE;
+    }
+
+    // 更新加载状态消息
+    void update_loading_status() {
+        std::string spinner = SPINNER_FRAMES[spinner_frame];
+        if (loading_state == LoadingState::LOADING_PAGE) {
+            status_message = spinner + " Loading " + extract_host(pending_url) + "...";
+        } else if (loading_state == LoadingState::LOADING_IMAGES) {
+            status_message = spinner + " Loading images...";
+        }
+    }
+
+    // 处理页面加载完成
+    void handle_load_complete() {
+        auto response = http_client.get_async_result();
+
+        if (!response.is_success()) {
+            status_message = "❌ HTTP " + std::to_string(response.status_code);
+            loading_state = LoadingState::IDLE;
+            return;
+        }
+
+        // 解析HTML
+        current_tree = html_parser.parse_tree(response.body, pending_url);
+
+        // 添加到缓存
+        add_to_cache(pending_url, response.body);
+
+        // 布局计算
+        current_layout = layout_engine->layout(current_tree);
+
+        current_url = pending_url;
+        scroll_pos = 0;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        active_field = current_tree.form_fields.empty() ? -1 : 0;
+        search_ctx = SearchContext();
+        search_term.clear();
+
+        // 更新历史（仅在非刷新时）
+        if (!pending_force_refresh) {
+            if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
+                history.erase(history.begin() + history_pos + 1, history.end());
+            }
+            history.push_back(pending_url);
+            history_pos = history.size() - 1;
+        }
+
+        status_message = current_tree.title.empty() ? pending_url : current_tree.title;
+
+        // 加载图片（目前仍同步，可后续优化为异步）
+        load_images(current_tree);
+        current_layout = layout_engine->layout(current_tree);
+
+        loading_state = LoadingState::IDLE;
+    }
+
+    // 取消加载
+    void cancel_loading() {
+        if (loading_state != LoadingState::IDLE) {
+            http_client.cancel_async();
+            loading_state = LoadingState::IDLE;
+            status_message = "⚠ Cancelled";
+        }
     }
 
     void add_to_cache(const std::string& url, const std::string& html) {
@@ -357,33 +533,33 @@ public:
 
             case Action::FOLLOW_LINK:
                 if (active_link >= 0 && active_link < static_cast<int>(current_tree.links.size())) {
-                    load_page(current_tree.links[active_link].url);
+                    start_async_load(current_tree.links[active_link].url);
                 }
                 break;
 
             case Action::GO_BACK:
                 if (history_pos > 0) {
                     history_pos--;
-                    load_page(history[history_pos]);
+                    start_async_load(history[history_pos]);
                 }
                 break;
 
             case Action::GO_FORWARD:
                 if (history_pos < static_cast<int>(history.size()) - 1) {
                     history_pos++;
-                    load_page(history[history_pos]);
+                    start_async_load(history[history_pos]);
                 }
                 break;
 
             case Action::OPEN_URL:
                 if (!result.text.empty()) {
-                    load_page(result.text);
+                    start_async_load(result.text);
                 }
                 break;
 
             case Action::REFRESH:
                 if (!current_url.empty()) {
-                    load_page(current_url, true);  // 强制刷新，跳过缓存
+                    start_async_load(current_url, true);  // 强制刷新，跳过缓存
                 }
                 break;
 
@@ -724,15 +900,20 @@ void BrowserV2::run(const std::string& initial_url) {
     }
 
     if (!initial_url.empty()) {
-        load_url(initial_url);
+        pImpl->start_async_load(initial_url);
     } else {
         pImpl->show_help();
     }
 
     bool running = true;
     while (running) {
+        // 轮询异步加载状态
+        pImpl->poll_loading();
+
+        // 渲染屏幕
         pImpl->draw_screen();
 
+        // 获取输入（非阻塞，50ms超时）
         int ch = pImpl->terminal.get_key(50);
         if (ch == -1) continue;
 
@@ -740,6 +921,20 @@ void BrowserV2::run(const std::string& initial_url) {
         if (ch == KEY_RESIZE) {
             pImpl->handle_resize();
             continue;
+        }
+
+        // 如果正在加载，Esc可以取消
+        if (pImpl->loading_state != LoadingState::IDLE && ch == 27) {  // 27 = Esc
+            pImpl->cancel_loading();
+            continue;
+        }
+
+        // 加载时忽略大部分输入，只允许取消和退出
+        if (pImpl->loading_state != LoadingState::IDLE) {
+            if (ch == 'q' || ch == 'Q') {
+                running = false;
+            }
+            continue;  // 忽略其他输入
         }
 
         auto result = pImpl->input_handler.handle_key(ch);
