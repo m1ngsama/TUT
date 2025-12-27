@@ -26,13 +26,13 @@ jobs:
       if: matrix.os == 'macos-latest'
       run: |
         brew update
-        brew install cmake ncurses curl
+        brew install cmake ncurses curl gumbo-parser
 
     - name: Install dependencies (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake libncursesw5-dev libcurl4-openssl-dev
+        sudo apt-get install -y cmake libncursesw5-dev libcurl4-openssl-dev libgumbo-dev
 
     - name: Configure CMake
       run: |
@@ -47,7 +47,7 @@ jobs:
 
     - name: Rename binary with platform suffix
       run: |
-        mv build/tut build/tut-${{ matrix.name }}
+        mv build/tut2 build/tut-${{ matrix.name }}
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
