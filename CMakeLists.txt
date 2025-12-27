@@ -129,3 +129,37 @@ target_link_libraries(tut
     CURL::libcurl
     ${GUMBO_LIBRARIES}
 )
+
+# ==================== HTTP 异步测试程序 ====================
+
+add_executable(test_http_async
+    src/http_client.cpp
+    tests/test_http_async.cpp
+)
+
+target_link_libraries(test_http_async
+    CURL::libcurl
+)
+
+# ==================== HTML 解析测试程序 ====================
+
+add_executable(test_html_parse
+    src/html_parser.cpp
+    src/dom_tree.cpp
+    tests/test_html_parse.cpp
+)
+
+target_link_directories(test_html_parse PRIVATE
+    ${GUMBO_LIBRARY_DIRS}
+)
+
+target_link_libraries(test_html_parse
+    ${GUMBO_LIBRARIES}
+)
+
+# ==================== 书签测试程序 ====================
+
+add_executable(test_bookmark
+    src/bookmark.cpp
+    tests/test_bookmark.cpp
+)
