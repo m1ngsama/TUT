@@ -979,8 +979,29 @@ public:
 
 <h2>Forms</h2>
 <ul>
-<li>Tab - Navigate links and form fields</li>
-<li>Enter - Activate link or submit form</li>
+<li>i - Focus first form field</li>
+<li>Tab/Shift+Tab - Navigate between fields</li>
+<li>Enter - Activate field (text input/checkbox/dropdown)</li>
+</ul>
+
+<h3>Text Input</h3>
+<ul>
+<li>Type to edit text</li>
+<li>Backspace to delete</li>
+<li>Enter or Esc to finish editing</li>
+</ul>
+
+<h3>Dropdown Selection</h3>
+<ul>
+<li>Enter on SELECT to open options</li>
+<li>j/k or arrows to navigate options</li>
+<li>Enter to select, Esc to cancel</li>
+</ul>
+
+<h2>Other</h2>
+<ul>
+<li>r - Refresh page (bypass cache)</li>
+<li>Esc - Cancel loading</li>
 </ul>
 
 <hr>
