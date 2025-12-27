@@ -38,6 +38,7 @@ add_executable(tut
     src/http_client.cpp
     src/input_handler.cpp
     src/bookmark.cpp
+    src/history.cpp
     src/render/terminal.cpp
     src/render/renderer.cpp
     src/render/layout.cpp
@@ -131,4 +132,10 @@ target_link_libraries(test_html_parse
 add_executable(test_bookmark
     src/bookmark.cpp
     tests/test_bookmark.cpp
+)
+
+# 历史记录测试
+add_executable(test_history
+    src/history.cpp
+    tests/test_history.cpp
 )

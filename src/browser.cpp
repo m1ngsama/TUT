@@ -1,6 +1,7 @@
 #include "browser.h"
 #include "dom_tree.h"
 #include "bookmark.h"
+#include "history.h"
 #include "render/colors.h"
 #include "render/decorations.h"
 #include "render/image.h"
@@ -48,6 +49,7 @@ public:
     HtmlParser html_parser;
     InputHandler input_handler;
     tut::BookmarkManager bookmark_manager;
+    tut::HistoryManager history_manager;
 
     // 新渲染系统
     Terminal terminal;
@@ -185,6 +187,8 @@ public:
             }
             history.push_back(url);
             history_pos = history.size() - 1;
+            // 持久化历史记录
+            history_manager.add(url, current_tree.title);
         }
 
         return true;
@@ -217,6 +221,8 @@ public:
                 }
                 history.push_back(url);
                 history_pos = history.size() - 1;
+                // 持久化历史记录
+                history_manager.add(url, current_tree.title);
             }
 
             // 加载图片（仍然同步，可以后续优化）
@@ -326,6 +332,8 @@ public:
             }
             history.push_back(pending_url);
             history_pos = history.size() - 1;
+            // 持久化历史记录
+            history_manager.add(pending_url, current_tree.title);
         }
 
         status_message = current_tree.title.empty() ? pending_url : current_tree.title;
@@ -597,6 +605,10 @@ public:
                 show_bookmarks();
                 break;
 
+            case Action::SHOW_HISTORY:
+                show_history();
+                break;
+
             case Action::QUIT:
                 break; // 在main loop处理
 
@@ -784,12 +796,14 @@ public:
 <li>B - Add bookmark</li>
 <li>D - Remove bookmark</li>
 <li>:bookmarks - Show bookmarks</li>
+<li>:history - Show history</li>
 </ul>
 
 <h2>Commands</h2>
 <ul>
 <li>:o URL - Open URL</li>
 <li>:bookmarks - Show bookmarks</li>
+<li>:history - Show history</li>
 <li>:q - Quit</li>
 <li>? - Show this help</li>
 </ul>
@@ -851,6 +865,54 @@ public:
         status_message = "Bookmarks";
     }
 
+    void show_history() {
+        std::ostringstream html;
+        html << R"(
+<!DOCTYPE html>
+<html>
+<head><title>History</title></head>
+<body>
+<h1>History</h1>
+)";
+
+        const auto& entries = history_manager.get_all();
+
+        if (entries.empty()) {
+            html << "<p>No browsing history yet.</p>\n";
+        } else {
+            html << "<ul>\n";
+            // 显示最近的 100 条
+            size_t count = std::min(entries.size(), static_cast<size_t>(100));
+            for (size_t i = 0; i < count; ++i) {
+                const auto& entry = entries[i];
+                // 格式化时间
+                char time_buf[64];
+                std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M",
+                              std::localtime(&entry.visit_time));
+                html << "<li><a href=\"" << entry.url << "\">"
+                     << (entry.title.empty() ? entry.url : entry.title)
+                     << "</a> <small>(" << time_buf << ")</small></li>\n";
+            }
+            html << "</ul>\n";
+            if (entries.size() > 100) {
+                html << "<p><i>Showing 100 of " << entries.size() << " entries</i></p>\n";
+            }
+            html << "<hr>\n";
+            html << "<p>" << entries.size() << " entries in history.</p>\n";
+        }
+
+        html << R"(
+</body>
+</html>
+)";
+
+        current_tree = html_parser.parse_tree(html.str(), "history://");
+        current_layout = layout_engine->layout(current_tree);
+        scroll_pos = 0;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        status_message = "History";
+    }
+
     void add_bookmark() {
         if (current_url.empty() || current_url.find("://") == std::string::npos) {
             status_message = "Cannot bookmark this page";
@@ -858,7 +920,8 @@ public:
         }
 
         // 不要书签特殊页面
-        if (current_url.find("help://") == 0 || current_url.find("bookmarks://") == 0) {
+        if (current_url.find("help://") == 0 || current_url.find("bookmarks://") == 0 ||
+            current_url.find("history://") == 0) {
             status_message = "Cannot bookmark special pages";
             return;
         }

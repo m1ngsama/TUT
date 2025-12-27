@@ -1,9 +1,9 @@
 # TUT 2.0 - 下次继续从这里开始
 
 ## 当前位置
-- **阶段**: 代码整合完成，准备发布 v2.0.0
-- **进度**: 所有核心功能已完成，代码库已整合简化
-- **最后提交**: `refactor: Consolidate v2 architecture into main codebase`
+- **阶段**: Phase 7 - 历史记录持久化 (已完成!)
+- **进度**: 历史记录自动保存，支持 :history 命令查看
+- **最后提交**: `feat: Add persistent browsing history`
 
 ## 立即可做的事
 
@@ -14,7 +14,21 @@
 
 书签存储在 `~/.config/tut/bookmarks.json`
 
+### 2. 查看历史记录
+- **:history** 或 **:hist** - 查看浏览历史
+
+历史记录存储在 `~/.config/tut/history.json`
+
 ## 已完成的功能清单
+
+### Phase 7 - 历史记录持久化
+- [x] HistoryEntry 数据结构 (URL, 标题, 访问时间)
+- [x] JSON 持久化存储 (~/.config/tut/history.json)
+- [x] 自动记录访问历史
+- [x] 重复访问更新时间
+- [x] 最大 1000 条记录限制
+- [x] :history 命令查看历史页面
+- [x] 历史链接可点击跳转
 
 ### Phase 6 - 异步HTTP
 - [x] libcurl multi接口实现非阻塞请求
@@ -79,6 +93,7 @@ src/
 ├── html_parser.cpp/h     # HTML 解析
 ├── input_handler.cpp/h   # 输入处理
 ├── bookmark.cpp/h        # 书签管理
+├── history.cpp/h         # 历史记录管理
 ├── render/
 │   ├── terminal.cpp/h    # 终端抽象 (ncurses)
 │   ├── renderer.cpp/h    # FrameBuffer + 差分渲染
@@ -96,7 +111,8 @@ tests/
 ├── test_layout.cpp       # Layout + 图片占位符测试
 ├── test_http_async.cpp   # HTTP 异步测试
 ├── test_html_parse.cpp   # HTML 解析测试
-└── test_bookmark.cpp     # 书签测试
+├── test_bookmark.cpp     # 书签测试
+└── test_history.cpp      # 历史记录测试
 ```
 
 ## 构建与运行
@@ -136,6 +152,7 @@ cmake --build build
 | D | 删除书签 |
 | :o URL | 打开URL |
 | :bookmarks | 查看书签 |
+| :history | 查看历史 |
 | :q | 退出 |
 | ? | 帮助 |
 | Esc | 取消加载 |
@@ -145,7 +162,7 @@ cmake --build build
 1. **更多表单交互** - 文本输入编辑，下拉选择
 2. **图片缓存** - 避免重复下载相同图片
 3. **异步图片加载** - 图片也使用异步加载
-4. **历史记录管理** - 持久化历史记录，历史页面
+4. **Cookie 支持** - 保存和发送 Cookie
 
 ## 恢复对话时说
 

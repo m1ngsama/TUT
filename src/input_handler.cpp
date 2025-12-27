@@ -209,6 +209,8 @@ public:
                 }
             } else if (command == "bookmarks" || command == "bm" || command == "b") {
                 result.action = Action::SHOW_BOOKMARKS;
+            } else if (command == "history" || command == "hist" || command == "hi") {
+                result.action = Action::SHOW_HISTORY;
             } else if (!command.empty() && std::isdigit(command[0])) {
                 try {
                     result.action = Action::GOTO_LINE;
