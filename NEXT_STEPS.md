@@ -140,5 +140,21 @@ cmake --build build_v2
 
 > "继续TUT 2.0开发"
 
+## Git 信息
+
+- **当前标签**: `v2.0.0-alpha`
+- **最新提交**: `a4c95a6 feat: Add bookmark management`
+- **远程仓库**: https://github.com/m1ngsama/TUT
+
+```bash
+# 恢复开发
+git clone https://github.com/m1ngsama/TUT.git
+cd TUT
+curl -L https://raw.githubusercontent.com/nothings/stb/master/stb_image.h -o src/utils/stb_image.h
+cmake -B build_v2 -S . -DCMAKE_BUILD_TYPE=Debug
+cmake --build build_v2
+./build_v2/tut2
+```
+
 ---
 更新时间: 2025-12-27
