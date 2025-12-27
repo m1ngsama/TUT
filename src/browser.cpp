@@ -42,6 +42,18 @@ struct CacheEntry {
     }
 };
 
+// 图片缓存条目
+struct ImageCacheEntry {
+    tut::ImageData image_data;
+    std::chrono::steady_clock::time_point timestamp;
+
+    bool is_expired(int max_age_seconds = 600) const {  // 图片缓存10分钟
+        auto now = std::chrono::steady_clock::now();
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - timestamp).count();
+        return age > max_age_seconds;
+    }
+};
+
 class Browser::Impl {
 public:
     // 网络和解析
@@ -84,6 +96,11 @@ public:
     std::map<std::string, CacheEntry> page_cache;
     static constexpr int CACHE_MAX_AGE = 300;  // 5分钟缓存
     static constexpr size_t CACHE_MAX_SIZE = 20;  // 最多缓存20个页面
+
+    // 图片缓存
+    std::map<std::string, ImageCacheEntry> image_cache;
+    static constexpr int IMAGE_CACHE_MAX_AGE = 600;  // 10分钟缓存
+    static constexpr size_t IMAGE_CACHE_MAX_SIZE = 100;  // 最多缓存100张图片
 
     // 异步加载状态
     LoadingState loading_state = LoadingState::IDLE;
@@ -380,6 +397,7 @@ public:
         }
 
         int loaded = 0;
+        int cached = 0;
         int total = static_cast<int>(tree.images.size());
 
         for (DomNode* img_node : tree.images) {
@@ -387,9 +405,22 @@ public:
                 continue;
             }
 
-            // 更新状态
             loaded++;
-            status_message = "🖼 Loading image " + std::to_string(loaded) + "/" + std::to_string(total) + "...";
+
+            // 检查缓存
+            auto cache_it = image_cache.find(img_node->img_src);
+            if (cache_it != image_cache.end() && !cache_it->second.is_expired(IMAGE_CACHE_MAX_AGE)) {
+                // 使用缓存的图片
+                img_node->image_data = cache_it->second.image_data;
+                cached++;
+                status_message = "🖼 Loading image " + std::to_string(loaded) + "/" + std::to_string(total) +
+                                " (cached: " + std::to_string(cached) + ")";
+                draw_screen();
+                continue;
+            }
+
+            // 更新状态
+            status_message = "🖼 Downloading image " + std::to_string(loaded) + "/" + std::to_string(total) + "...";
             draw_screen();
 
             // 下载图片
@@ -401,8 +432,31 @@ public:
             // 解码图片
             tut::ImageData img_data = tut::ImageRenderer::load_from_memory(response.data);
             if (img_data.is_valid()) {
-                img_node->image_data = std::move(img_data);
+                img_node->image_data = img_data;
+
+                // 添加到缓存
+                // 限制缓存大小
+                if (image_cache.size() >= IMAGE_CACHE_MAX_SIZE) {
+                    // 移除最老的缓存条目
+                    auto oldest = image_cache.begin();
+                    for (auto it = image_cache.begin(); it != image_cache.end(); ++it) {
+                        if (it->second.timestamp < oldest->second.timestamp) {
+                            oldest = it;
+                        }
+                    }
+                    image_cache.erase(oldest);
+                }
+
+                ImageCacheEntry entry;
+                entry.image_data = std::move(img_data);
+                entry.timestamp = std::chrono::steady_clock::now();
+                image_cache[img_node->img_src] = std::move(entry);
             }
+        }
+
+        if (cached > 0) {
+            status_message = "✓ Loaded " + std::to_string(total) + " images (" +
+                           std::to_string(cached) + " from cache)";
         }
     }
 
