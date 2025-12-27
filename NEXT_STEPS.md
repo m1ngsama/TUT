@@ -1,23 +1,13 @@
 # TUT 2.0 - 下次继续从这里开始
 
 ## 当前位置
-- **阶段**: Phase 6 - 异步HTTP (已完成!)
-- **进度**: 非阻塞加载、加载动画、可取消请求已完成
-- **最后提交**: `feat: Add async HTTP requests with non-blocking loading`
+- **阶段**: 代码整合完成，准备发布 v2.0.0
+- **进度**: 所有核心功能已完成，代码库已整合简化
+- **最后提交**: `refactor: Consolidate v2 architecture into main codebase`
 
 ## 立即可做的事
 
-### 1. 启用图片支持 (首次使用时需要)
-```bash
-# 下载 stb_image.h (如果尚未下载)
-curl -L https://raw.githubusercontent.com/nothings/stb/master/stb_image.h \
-     -o src/utils/stb_image.h
-
-# 重新编译
-cmake --build build_v2
-```
-
-### 2. 使用书签功能
+### 1. 使用书签功能
 - **B** - 添加当前页面到书签
 - **D** - 从书签中移除当前页面
 - **:bookmarks** 或 **:bm** - 查看书签列表
@@ -82,12 +72,13 @@ cmake --build build_v2
 
 ```
 src/
-├── browser_v2.cpp/h      # 新架构浏览器 (pImpl模式)
-├── main_v2.cpp           # tut2 入口点
-├── http_client.cpp/h     # HTTP 客户端 (支持二进制)
+├── browser.cpp/h         # 主浏览器 (pImpl模式)
+├── main.cpp              # 程序入口点
+├── http_client.cpp/h     # HTTP 客户端 (支持二进制和异步)
 ├── dom_tree.cpp/h        # DOM 树
 ├── html_parser.cpp/h     # HTML 解析
 ├── input_handler.cpp/h   # 输入处理
+├── bookmark.cpp/h        # 书签管理
 ├── render/
 │   ├── terminal.cpp/h    # 终端抽象 (ncurses)
 │   ├── renderer.cpp/h    # FrameBuffer + 差分渲染
@@ -97,29 +88,35 @@ src/
 │   └── decorations.h     # Unicode 装饰字符
 └── utils/
     ├── unicode.cpp/h     # Unicode 处理
-    └── stb_image.h       # [需下载] 图片解码库
+    └── stb_image.h       # 图片解码库
 
 tests/
 ├── test_terminal.cpp     # Terminal 测试
 ├── test_renderer.cpp     # Renderer 测试
-└── test_layout.cpp       # Layout + 图片占位符测试
+├── test_layout.cpp       # Layout + 图片占位符测试
+├── test_http_async.cpp   # HTTP 异步测试
+├── test_html_parse.cpp   # HTML 解析测试
+└── test_bookmark.cpp     # 书签测试
 ```
 
 ## 构建与运行
 
 ```bash
 # 构建
-cmake -B build_v2 -S . -DCMAKE_BUILD_TYPE=Debug
-cmake --build build_v2
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
 
 # 运行
-./build_v2/tut2                      # 显示帮助
-./build_v2/tut2 https://example.com  # 打开网页
+./build/tut                      # 显示帮助
+./build/tut https://example.com  # 打开网页
 
 # 测试
-./build_v2/test_terminal   # 终端测试
-./build_v2/test_renderer   # 渲染测试
-./build_v2/test_layout     # 布局+图片测试 (按回车进入交互模式)
+./build/test_terminal      # 终端测试
+./build/test_renderer      # 渲染测试
+./build/test_layout        # 布局+图片测试
+./build/test_http_async    # HTTP异步测试
+./build/test_html_parse    # HTML解析测试
+./build/test_bookmark      # 书签测试
 ```
 
 ## 快捷键
@@ -135,7 +132,10 @@ cmake --build build_v2
 | / | 搜索 |
 | n/N | 下一个/上一个匹配 |
 | r | 刷新 (跳过缓存) |
+| B | 添加书签 |
+| D | 删除书签 |
 | :o URL | 打开URL |
+| :bookmarks | 查看书签 |
 | :q | 退出 |
 | ? | 帮助 |
 | Esc | 取消加载 |
@@ -154,17 +154,15 @@ cmake --build build_v2
 ## Git 信息
 
 - **当前标签**: `v2.0.0-alpha`
-- **最新提交**: `18859ee feat: Add async HTTP requests with non-blocking loading`
 - **远程仓库**: https://github.com/m1ngsama/TUT
 
 ```bash
 # 恢复开发
 git clone https://github.com/m1ngsama/TUT.git
 cd TUT
-curl -L https://raw.githubusercontent.com/nothings/stb/master/stb_image.h -o src/utils/stb_image.h
-cmake -B build_v2 -S . -DCMAKE_BUILD_TYPE=Debug
-cmake --build build_v2
-./build_v2/tut2
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+./build/tut
 ```
 
 ---
