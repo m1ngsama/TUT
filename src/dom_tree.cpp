@@ -178,6 +178,12 @@ std::unique_ptr<DomNode> DomTreeBuilder::convert_node(
         node->tag_name = gumbo_normalized_tagname(element.tag);
         node->element_type = map_gumbo_tag_to_element_type(element.tag);
 
+        // 跳过 script、style 等不需要渲染的标签（包括其所有子节点）
+        if (element.tag == GUMBO_TAG_SCRIPT || element.tag == GUMBO_TAG_STYLE ||
+            element.tag == GUMBO_TAG_NOSCRIPT || element.tag == GUMBO_TAG_TEMPLATE) {
+            return nullptr;
+        }
+
         // Assign current form ID to children
         node->form_id = g_current_form_id;
 
