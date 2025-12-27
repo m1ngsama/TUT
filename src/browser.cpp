@@ -1,312 +1,447 @@
 #include "browser.h"
 #include "dom_tree.h"
-#include <curses.h>
-#include <clocale>
+#include "bookmark.h"
+#include "render/colors.h"
+#include "render/decorations.h"
+#include "render/image.h"
+#include "utils/unicode.h"
 #include <algorithm>
 #include <sstream>
 #include <map>
 #include <cctype>
 #include <cstdio>
+#include <chrono>
+#include <ncurses.h>
+
+using namespace tut;
+
+// 浏览器加载状态
+enum class LoadingState {
+    IDLE,           // 空闲
+    LOADING_PAGE,   // 正在加载页面
+    LOADING_IMAGES  // 正在加载图片
+};
+
+// 加载动画帧
+static const char* SPINNER_FRAMES[] = {
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+};
+static const int SPINNER_FRAME_COUNT = 10;
+
+// 缓存条目
+struct CacheEntry {
+    DocumentTree tree;
+    std::string html;
+    std::chrono::steady_clock::time_point timestamp;
+
+    bool is_expired(int max_age_seconds = 300) const {
+        auto now = std::chrono::steady_clock::now();
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - timestamp).count();
+        return age > max_age_seconds;
+    }
+};
 
 class Browser::Impl {
 public:
+    // 网络和解析
     HttpClient http_client;
     HtmlParser html_parser;
-    TextRenderer renderer;
     InputHandler input_handler;
+    tut::BookmarkManager bookmark_manager;
 
+    // 新渲染系统
+    Terminal terminal;
+    std::unique_ptr<FrameBuffer> framebuffer;
+    std::unique_ptr<Renderer> renderer;
+    std::unique_ptr<LayoutEngine> layout_engine;
+
+    // 文档状态
     DocumentTree current_tree;
-    std::vector<RenderedLine> rendered_lines;
+    LayoutResult current_layout;
     std::string current_url;
     std::vector<std::string> history;
     int history_pos = -1;
 
+    // 视图状态
     int scroll_pos = 0;
+    int active_link = -1;
+    int active_field = -1;
     std::string status_message;
     std::string search_term;
-    std::vector<int> search_results;
 
-    int screen_height = 0;
     int screen_width = 0;
+    int screen_height = 0;
 
     // Marks support
     std::map<char, int> marks;
 
-    // Interactive elements (Links + Form Fields)
-    struct InteractiveElement {
-        int link_index = -1;
-        int field_index = -1;
-        int line_index = -1;
-        InteractiveRange range;
-    };
-    std::vector<InteractiveElement> interactive_elements;
-    int current_element_index = -1;
+    // 搜索相关
+    SearchContext search_ctx;
 
-    void init_screen() {
-        setlocale(LC_ALL, "");
-        initscr();
-        init_color_scheme();
-        cbreak();
-        noecho();
-        keypad(stdscr, TRUE);
-        curs_set(0);
-        timeout(0);
+    // 页面缓存
+    std::map<std::string, CacheEntry> page_cache;
+    static constexpr int CACHE_MAX_AGE = 300;  // 5分钟缓存
+    static constexpr size_t CACHE_MAX_SIZE = 20;  // 最多缓存20个页面
 
-        // Enable mouse support
-        mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
-        mouseinterval(0);  // No click delay
+    // 异步加载状态
+    LoadingState loading_state = LoadingState::IDLE;
+    std::string pending_url;  // 正在加载的URL
+    bool pending_force_refresh = false;
+    int spinner_frame = 0;
+    std::chrono::steady_clock::time_point last_spinner_update;
 
-        getmaxyx(stdscr, screen_height, screen_width);
-    }
-
-    void cleanup_screen() {
-        endwin();
-    }
-
-    void build_interactive_list() {
-        interactive_elements.clear();
-        for (size_t i = 0; i < rendered_lines.size(); ++i) {
-            for (const auto& range : rendered_lines[i].interactive_ranges) {
-                InteractiveElement el;
-                el.link_index = range.link_index;
-                el.field_index = range.field_index;
-                el.line_index = static_cast<int>(i);
-                el.range = range;
-                interactive_elements.push_back(el);
-            }
-        }
-        
-        // Reset or adjust current_element_index
-        if (current_element_index >= static_cast<int>(interactive_elements.size())) {
-            current_element_index = interactive_elements.empty() ? -1 : 0;
-        }
-    }
-
-    bool load_page(const std::string& url) {
-        status_message = "Loading " + url + "...";
-        draw_screen();
-        refresh();
-
-        auto response = http_client.fetch(url);
-
-        if (!response.is_success()) {
-            status_message = response.error_message.empty() ?
-                "HTTP " + std::to_string(response.status_code) :
-                response.error_message;
+    bool init_screen() {
+        if (!terminal.init()) {
             return false;
         }
 
-        current_tree = html_parser.parse_tree(response.body, url);
-        rendered_lines = renderer.render_tree(current_tree, screen_width);
-        build_interactive_list();
-        
-        current_url = url;
-        scroll_pos = 0;
-        current_element_index = interactive_elements.empty() ? -1 : 0;
-        search_results.clear();
+        terminal.get_size(screen_width, screen_height);
+        terminal.use_alternate_screen(true);
+        terminal.hide_cursor();
 
-        if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
-            history.erase(history.begin() + history_pos + 1, history.end());
-        }
-        history.push_back(url);
-        history_pos = history.size() - 1;
+        // 创建渲染组件
+        framebuffer = std::make_unique<FrameBuffer>(screen_width, screen_height);
+        renderer = std::make_unique<Renderer>(terminal);
+        layout_engine = std::make_unique<LayoutEngine>(screen_width);
 
-        status_message = current_tree.title.empty() ? url : current_tree.title;
         return true;
     }
 
-    void handle_mouse(MEVENT& event) {
-        int visible_lines = screen_height - 2;
-
-        if (event.bstate & BUTTON4_PRESSED) {
-            scroll_pos = std::max(0, scroll_pos - 3);
-            return;
-        }
-
-        if (event.bstate & BUTTON5_PRESSED) {
-            int max_scroll = std::max(0, static_cast<int>(rendered_lines.size()) - visible_lines);
-            scroll_pos = std::min(max_scroll, scroll_pos + 3);
-            return;
-        }
-
-        if (event.bstate & BUTTON1_CLICKED) {
-            int clicked_line = event.y;
-            int clicked_col = event.x;
-
-            if (clicked_line >= 0 && clicked_line < visible_lines) {
-                int doc_line_idx = scroll_pos + clicked_line;
-                if (doc_line_idx < static_cast<int>(rendered_lines.size())) {
-                    for (size_t i = 0; i < interactive_elements.size(); ++i) {
-                        const auto& el = interactive_elements[i];
-                        if (el.line_index == doc_line_idx && 
-                            clicked_col >= static_cast<int>(el.range.start) && 
-                            clicked_col < static_cast<int>(el.range.end)) {
-                            
-                            current_element_index = i;
-                            activate_element(i);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
+    void cleanup_screen() {
+        terminal.show_cursor();
+        terminal.use_alternate_screen(false);
+        terminal.cleanup();
     }
 
-    void activate_element(int index) {
-        if (index < 0 || index >= static_cast<int>(interactive_elements.size())) return;
-        
-        const auto& el = interactive_elements[index];
-        if (el.link_index >= 0) {
-            if (el.link_index < static_cast<int>(current_tree.links.size())) {
-                load_page(current_tree.links[el.link_index].url);
-            }
-        } else if (el.field_index >= 0) {
-            handle_form_interaction(el.field_index);
+    void handle_resize() {
+        terminal.get_size(screen_width, screen_height);
+        framebuffer = std::make_unique<FrameBuffer>(screen_width, screen_height);
+        layout_engine->set_viewport_width(screen_width);
+
+        // 重新布局当前文档
+        if (current_tree.root) {
+            current_layout = layout_engine->layout(current_tree);
         }
+
+        renderer->force_redraw();
     }
 
-    void handle_form_interaction(int field_idx) {
-        if (field_idx < 0 || field_idx >= static_cast<int>(current_tree.form_fields.size())) return;
-        
-        DomNode* node = current_tree.form_fields[field_idx];
-        
-        if (node->input_type == "checkbox" || node->input_type == "radio") {
-            if (node->input_type == "radio") {
-                // Uncheck others in same group
-                DomNode* form = node->parent;
-                // Find form parent
-                while (form && form->element_type != ElementType::FORM) form = form->parent;
-                
-                // If found form, traverse to uncheck others with same name
-                // This is a complex traversal, simplified: just toggle for now or assume single radio group
-                node->checked = true; 
-            } else {
-                node->checked = !node->checked;
-            }
-            // Re-render
-            rendered_lines = renderer.render_tree(current_tree, screen_width);
-            build_interactive_list();
-        } else if (node->input_type == "text" || node->input_type == "password" || 
-                   node->input_type == "textarea" || node->input_type == "search" ||
-                   node->input_type == "email" || node->input_type == "url") {
-            
-            // Prompt user
-            mvprintw(screen_height - 1, 0, "Input: ");
-            clrtoeol();
-            echo();
-            curs_set(1);
-            char buffer[256];
-            getnstr(buffer, 255);
-            noecho();
-            curs_set(0);
-            
-            node->value = buffer;
-            rendered_lines = renderer.render_tree(current_tree, screen_width);
-            build_interactive_list();
-            
-        } else if (node->input_type == "submit" || node->input_type == "button") {
-            submit_form(node);
-        }
-    }
+    bool load_page(const std::string& url, bool force_refresh = false) {
+        // 检查缓存
+        auto cache_it = page_cache.find(url);
+        bool use_cache = !force_refresh && cache_it != page_cache.end() &&
+                        !cache_it->second.is_expired(CACHE_MAX_AGE);
 
-    // URL encode helper function
-    std::string url_encode(const std::string& value) {
-        std::string result;
-        for (unsigned char c : value) {
-            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-                result += c;
-            } else if (c == ' ') {
-                result += '+';
-            } else {
-                char hex[4];
-                snprintf(hex, sizeof(hex), "%%%02X", c);
-                result += hex;
-            }
-        }
-        return result;
-    }
+        if (use_cache) {
+            status_message = "⚡ Loading from cache...";
+            draw_screen();
 
-    void submit_form(DomNode* button) {
-        status_message = "Submitting form...";
+            // 使用缓存的文档树
+            // 注意：需要重新解析因为DocumentTree包含unique_ptr
+            current_tree = html_parser.parse_tree(cache_it->second.html, url);
+            status_message = "⚡ " + (current_tree.title.empty() ? url : current_tree.title);
+        } else {
+            status_message = "⏳ Connecting to " + extract_host(url) + "...";
+            draw_screen();
 
-        // Find parent form
-        DomNode* form = button->parent;
-        while (form && form->element_type != ElementType::FORM) form = form->parent;
-
-        if (!form) {
-            status_message = "Error: Button not in a form";
-            return;
-        }
-
-        // Collect form data with URL encoding
-        std::string form_data;
-        for (DomNode* field : current_tree.form_fields) {
-            // Check if field belongs to this form
-            DomNode* p = field->parent;
-            bool is_child = false;
-            while(p) { if(p == form) { is_child = true; break; } p = p->parent; }
-
-            if (is_child && !field->name.empty()) {
-                if (!form_data.empty()) form_data += "&";
-                form_data += url_encode(field->name) + "=" + url_encode(field->value);
-            }
-        }
-
-        std::string target_url = form->action;
-        if (target_url.empty()) target_url = current_url;
-
-        // Check form method (default to GET if not specified)
-        std::string method = form->method;
-        std::transform(method.begin(), method.end(), method.begin(), ::toupper);
-
-        if (method == "POST") {
-            // POST request
-            status_message = "Sending POST request...";
-            HttpResponse response = http_client.post(target_url, form_data);
-
-            if (!response.error_message.empty()) {
-                status_message = "Error: " + response.error_message;
-                return;
-            }
+            auto response = http_client.fetch(url);
 
             if (!response.is_success()) {
-                status_message = "Error: HTTP " + std::to_string(response.status_code);
-                return;
+                status_message = "❌ " + (response.error_message.empty() ?
+                    "HTTP " + std::to_string(response.status_code) :
+                    response.error_message);
+                return false;
             }
 
-            // Parse and render response
-            DocumentTree tree = html_parser.parse_tree(response.body, target_url);
-            current_tree = std::move(tree);
-            current_url = target_url;
-            rendered_lines = renderer.render_tree(current_tree, screen_width);
-            build_interactive_list();
-            scroll_pos = 0;
-            current_element_index = -1;
+            status_message = "📄 Parsing HTML...";
+            draw_screen();
 
-            // Update history
-            if (history_pos < static_cast<int>(history.size()) - 1) {
+            // 解析HTML
+            current_tree = html_parser.parse_tree(response.body, url);
+
+            // 添加到缓存
+            add_to_cache(url, response.body);
+
+            status_message = current_tree.title.empty() ? url : current_tree.title;
+        }
+
+        // 下载图片
+        load_images(current_tree);
+
+        // 布局计算
+        current_layout = layout_engine->layout(current_tree);
+
+        current_url = url;
+        scroll_pos = 0;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        active_field = current_tree.form_fields.empty() ? -1 : 0;
+        search_ctx = SearchContext();  // 清除搜索状态
+        search_term.clear();
+
+        // 更新历史（仅在非刷新时）
+        if (!force_refresh) {
+            if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
                 history.erase(history.begin() + history_pos + 1, history.end());
             }
-            history.push_back(current_url);
+            history.push_back(url);
             history_pos = history.size() - 1;
+        }
 
-            status_message = "Form submitted (POST)";
-        } else {
-            // GET request (default)
-            if (target_url.find('?') == std::string::npos) {
-                target_url += "?" + form_data;
-            } else {
-                target_url += "&" + form_data;
+        return true;
+    }
+
+    // 启动异步页面加载
+    void start_async_load(const std::string& url, bool force_refresh = false) {
+        // 检查缓存
+        auto cache_it = page_cache.find(url);
+        bool use_cache = !force_refresh && cache_it != page_cache.end() &&
+                        !cache_it->second.is_expired(CACHE_MAX_AGE);
+
+        if (use_cache) {
+            // 使用缓存，不需要网络请求
+            status_message = "⚡ Loading from cache...";
+            current_tree = html_parser.parse_tree(cache_it->second.html, url);
+            current_layout = layout_engine->layout(current_tree);
+            current_url = url;
+            scroll_pos = 0;
+            active_link = current_tree.links.empty() ? -1 : 0;
+            active_field = current_tree.form_fields.empty() ? -1 : 0;
+            search_ctx = SearchContext();
+            search_term.clear();
+            status_message = "⚡ " + (current_tree.title.empty() ? url : current_tree.title);
+
+            // 更新历史
+            if (!force_refresh) {
+                if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
+                    history.erase(history.begin() + history_pos + 1, history.end());
+                }
+                history.push_back(url);
+                history_pos = history.size() - 1;
             }
-            load_page(target_url);
-            status_message = "Form submitted (GET)";
+
+            // 加载图片（仍然同步，可以后续优化）
+            load_images(current_tree);
+            current_layout = layout_engine->layout(current_tree);
+            return;
+        }
+
+        // 需要网络请求，启动异步加载
+        pending_url = url;
+        pending_force_refresh = force_refresh;
+        loading_state = LoadingState::LOADING_PAGE;
+        spinner_frame = 0;
+        last_spinner_update = std::chrono::steady_clock::now();
+
+        status_message = std::string(SPINNER_FRAMES[0]) + " Connecting to " + extract_host(url) + "...";
+        http_client.start_async_fetch(url);
+    }
+
+    // 轮询异步加载状态，返回true表示还在加载中
+    bool poll_loading() {
+        if (loading_state == LoadingState::IDLE) {
+            return false;
+        }
+
+        // 更新spinner动画
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_spinner_update).count();
+        if (elapsed >= 80) {  // 每80ms更新一帧
+            spinner_frame = (spinner_frame + 1) % SPINNER_FRAME_COUNT;
+            last_spinner_update = now;
+            update_loading_status();
+        }
+
+        if (loading_state == LoadingState::LOADING_PAGE) {
+            auto state = http_client.poll_async();
+
+            switch (state) {
+                case AsyncState::COMPLETE:
+                    handle_load_complete();
+                    return false;
+
+                case AsyncState::FAILED: {
+                    auto result = http_client.get_async_result();
+                    status_message = "❌ " + (result.error_message.empty() ?
+                        "Connection failed" : result.error_message);
+                    loading_state = LoadingState::IDLE;
+                    return false;
+                }
+
+                case AsyncState::CANCELLED:
+                    status_message = "⚠ Loading cancelled";
+                    loading_state = LoadingState::IDLE;
+                    return false;
+
+                case AsyncState::LOADING:
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        return loading_state != LoadingState::IDLE;
+    }
+
+    // 更新加载状态消息
+    void update_loading_status() {
+        std::string spinner = SPINNER_FRAMES[spinner_frame];
+        if (loading_state == LoadingState::LOADING_PAGE) {
+            status_message = spinner + " Loading " + extract_host(pending_url) + "...";
+        } else if (loading_state == LoadingState::LOADING_IMAGES) {
+            status_message = spinner + " Loading images...";
         }
     }
 
-    void draw_status_bar() {
-        attron(COLOR_PAIR(COLOR_STATUS_BAR));
-        mvprintw(screen_height - 1, 0, "%s", std::string(screen_width, ' ').c_str());
+    // 处理页面加载完成
+    void handle_load_complete() {
+        auto response = http_client.get_async_result();
 
+        if (!response.is_success()) {
+            status_message = "❌ HTTP " + std::to_string(response.status_code);
+            loading_state = LoadingState::IDLE;
+            return;
+        }
+
+        // 解析HTML
+        current_tree = html_parser.parse_tree(response.body, pending_url);
+
+        // 添加到缓存
+        add_to_cache(pending_url, response.body);
+
+        // 布局计算
+        current_layout = layout_engine->layout(current_tree);
+
+        current_url = pending_url;
+        scroll_pos = 0;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        active_field = current_tree.form_fields.empty() ? -1 : 0;
+        search_ctx = SearchContext();
+        search_term.clear();
+
+        // 更新历史（仅在非刷新时）
+        if (!pending_force_refresh) {
+            if (history_pos >= 0 && history_pos < static_cast<int>(history.size()) - 1) {
+                history.erase(history.begin() + history_pos + 1, history.end());
+            }
+            history.push_back(pending_url);
+            history_pos = history.size() - 1;
+        }
+
+        status_message = current_tree.title.empty() ? pending_url : current_tree.title;
+
+        // 加载图片（目前仍同步，可后续优化为异步）
+        load_images(current_tree);
+        current_layout = layout_engine->layout(current_tree);
+
+        loading_state = LoadingState::IDLE;
+    }
+
+    // 取消加载
+    void cancel_loading() {
+        if (loading_state != LoadingState::IDLE) {
+            http_client.cancel_async();
+            loading_state = LoadingState::IDLE;
+            status_message = "⚠ Cancelled";
+        }
+    }
+
+    void add_to_cache(const std::string& url, const std::string& html) {
+        // 限制缓存大小
+        if (page_cache.size() >= CACHE_MAX_SIZE) {
+            // 移除最老的缓存条目
+            auto oldest = page_cache.begin();
+            for (auto it = page_cache.begin(); it != page_cache.end(); ++it) {
+                if (it->second.timestamp < oldest->second.timestamp) {
+                    oldest = it;
+                }
+            }
+            page_cache.erase(oldest);
+        }
+
+        CacheEntry entry;
+        entry.html = html;
+        entry.timestamp = std::chrono::steady_clock::now();
+        page_cache[url] = std::move(entry);
+    }
+
+    // 下载并解码页面中的图片
+    void load_images(DocumentTree& tree) {
+        if (tree.images.empty()) {
+            return;
+        }
+
+        int loaded = 0;
+        int total = static_cast<int>(tree.images.size());
+
+        for (DomNode* img_node : tree.images) {
+            if (img_node->img_src.empty()) {
+                continue;
+            }
+
+            // 更新状态
+            loaded++;
+            status_message = "🖼 Loading image " + std::to_string(loaded) + "/" + std::to_string(total) + "...";
+            draw_screen();
+
+            // 下载图片
+            auto response = http_client.fetch_binary(img_node->img_src);
+            if (!response.is_success() || response.data.empty()) {
+                continue;  // 跳过失败的图片
+            }
+
+            // 解码图片
+            tut::ImageData img_data = tut::ImageRenderer::load_from_memory(response.data);
+            if (img_data.is_valid()) {
+                img_node->image_data = std::move(img_data);
+            }
+        }
+    }
+
+    // 从URL中提取主机名
+    std::string extract_host(const std::string& url) {
+        // 简单提取：找到://之后的部分，到第一个/为止
+        size_t proto_end = url.find("://");
+        if (proto_end == std::string::npos) {
+            return url;
+        }
+        size_t host_start = proto_end + 3;
+        size_t host_end = url.find('/', host_start);
+        if (host_end == std::string::npos) {
+            return url.substr(host_start);
+        }
+        return url.substr(host_start, host_end - host_start);
+    }
+
+    void draw_screen() {
+        // 清空缓冲区
+        framebuffer->clear_with_color(colors::BG_PRIMARY);
+
+        int content_height = screen_height - 1;  // 留出状态栏
+
+        // 渲染文档内容
+        RenderContext render_ctx;
+        render_ctx.active_link = active_link;
+        render_ctx.active_field = active_field;
+        render_ctx.search = search_ctx.enabled ? &search_ctx : nullptr;
+
+        DocumentRenderer doc_renderer(*framebuffer);
+        doc_renderer.render(current_layout, scroll_pos, render_ctx);
+
+        // 渲染状态栏
+        draw_status_bar(content_height);
+
+        // 渲染到终端
+        renderer->render(*framebuffer);
+    }
+
+    void draw_status_bar(int y) {
+        // 状态栏背景
+        for (int x = 0; x < screen_width; ++x) {
+            framebuffer->set_cell(x, y, Cell{" ", colors::STATUSBAR_FG, colors::STATUSBAR_BG, ATTR_NONE});
+        }
+
+        // 左侧: 模式
         std::string mode_str;
         InputMode mode = input_handler.get_mode();
         switch (mode) {
@@ -315,258 +450,439 @@ public:
             case InputMode::SEARCH: mode_str = input_handler.get_buffer(); break;
             default: mode_str = ""; break;
         }
+        framebuffer->set_text(1, y, mode_str, colors::STATUSBAR_FG, colors::STATUSBAR_BG);
 
-        mvprintw(screen_height - 1, 0, " %s", mode_str.c_str());
-
+        // 中间: 状态消息或链接URL
+        std::string display_msg;
         if (mode == InputMode::NORMAL) {
-            std::string display_msg;
-            
-            // Priority: Hovered Link URL > Status Message > Title
-            if (current_element_index >= 0 && 
-                current_element_index < static_cast<int>(interactive_elements.size())) {
-                const auto& el = interactive_elements[current_element_index];
-                if (el.link_index >= 0 && el.link_index < static_cast<int>(current_tree.links.size())) {
-                    display_msg = current_tree.links[el.link_index].url;
-                }
+            if (active_link >= 0 && active_link < static_cast<int>(current_tree.links.size())) {
+                display_msg = current_tree.links[active_link].url;
             }
-            
             if (display_msg.empty()) {
                 display_msg = status_message;
             }
 
             if (!display_msg.empty()) {
-                int msg_x = (screen_width - display_msg.length()) / 2;
-                if (msg_x < static_cast<int>(mode_str.length()) + 2) msg_x = mode_str.length() + 2;
-                // Truncate if too long
-                int max_len = screen_width - msg_x - 20; // Reserve space for position info
-                if (max_len > 0) {
-                    if (display_msg.length() > static_cast<size_t>(max_len)) {
-                        display_msg = display_msg.substr(0, max_len - 3) + "...";
-                    }
-                    mvprintw(screen_height - 1, msg_x, "%s", display_msg.c_str());
+                // 截断过长的消息
+                size_t max_len = screen_width - mode_str.length() - 20;
+                if (display_msg.length() > max_len) {
+                    display_msg = display_msg.substr(0, max_len - 3) + "...";
                 }
+                int msg_x = static_cast<int>(mode_str.length()) + 3;
+                framebuffer->set_text(msg_x, y, display_msg, colors::STATUSBAR_FG, colors::STATUSBAR_BG);
             }
         }
 
-        int total_lines = rendered_lines.size();
-        int percentage = (total_lines > 0 && scroll_pos + screen_height - 2 < total_lines) ? 
+        // 右侧: 位置信息
+        int total_lines = current_layout.total_lines;
+        int visible_lines = screen_height - 1;
+        int percentage = (total_lines > 0 && scroll_pos + visible_lines < total_lines) ?
                          (scroll_pos * 100) / total_lines : 100;
         if (total_lines == 0) percentage = 0;
 
-        std::string pos_str = std::to_string(scroll_pos + 1) + "/" + std::to_string(total_lines) + " " + std::to_string(percentage) + "%";
-        mvprintw(screen_height - 1, screen_width - pos_str.length() - 1, "%s", pos_str.c_str());
-
-        attroff(COLOR_PAIR(COLOR_STATUS_BAR));
-    }
-
-    int get_utf8_sequence_length(char c) {
-        if ((c & 0x80) == 0) return 1;
-        if ((c & 0xE0) == 0xC0) return 2;
-        if ((c & 0xF0) == 0xE0) return 3;
-        if ((c & 0xF8) == 0xF0) return 4;
-        return 1; // Fallback
-    }
-
-    void draw_screen() {
-        clear();
-
-        int visible_lines = screen_height - 2;
-        int content_lines = std::min(static_cast<int>(rendered_lines.size()) - scroll_pos, visible_lines);
-        
-        int cursor_y = -1;
-        int cursor_x = -1;
-
-        for (int i = 0; i < content_lines; ++i) {
-            int line_idx = scroll_pos + i;
-            const auto& line = rendered_lines[line_idx];
-
-            // Check if this line is in search results
-            bool in_search_results = !search_term.empty() &&
-                std::find(search_results.begin(), search_results.end(), line_idx) != search_results.end();
-
-            move(i, 0); // Move to start of line
-
-            size_t byte_idx = 0;
-            int current_col = 0; // Track visual column
-            
-            while (byte_idx < line.text.length()) {
-                size_t seq_len = get_utf8_sequence_length(line.text[byte_idx]);
-                // Ensure we don't read past end of string (malformed utf8 protection)
-                if (byte_idx + seq_len > line.text.length()) {
-                    seq_len = line.text.length() - byte_idx;
-                }
-
-                bool is_active = false;
-                bool is_interactive = false;
-                
-                // Check if current byte position falls within an interactive range
-                for (const auto& range : line.interactive_ranges) {
-                    if (byte_idx >= range.start && byte_idx < range.end) {
-                        is_interactive = true;
-                        // Check if this is the currently selected element
-                        if (current_element_index >= 0 && 
-                            current_element_index < static_cast<int>(interactive_elements.size())) {
-                            const auto& el = interactive_elements[current_element_index];
-                            if (el.line_index == line_idx && 
-                                el.range.start == range.start && 
-                                el.range.end == range.end) {
-                                is_active = true;
-                                // Capture cursor position for the START of the active element
-                                if (byte_idx == range.start && cursor_y == -1) {
-                                    cursor_y = i;
-                                    cursor_x = current_col;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-
-                // Apply attributes
-                if (is_active) {
-                    attron(COLOR_PAIR(COLOR_LINK_ACTIVE));
-                } else if (is_interactive) {
-                    attron(COLOR_PAIR(COLOR_LINK));
-                    attron(A_UNDERLINE);
-                } else {
-                    attron(COLOR_PAIR(line.color_pair));
-                    if (line.is_bold) attron(A_BOLD);
-                }
-
-                if (in_search_results) attron(A_REVERSE);
-
-                // Print the UTF-8 sequence
-                addnstr(line.text.c_str() + byte_idx, seq_len);
-                
-                // Approximate column width update (simple)
-                // For proper handling, we should use wcwidth, but for now assuming 1 or 2 based on seq_len is "okay" approximation for cursor placement
-                // actually addnstr advances cursor, getyx is better?
-                // But we are in a loop.
-                int unused_y, x;
-                getyx(stdscr, unused_y, x);
-                (void)unused_y;  // Suppress unused variable warning
-                current_col = x;
-
-                // Clear attributes
-                if (in_search_results) attroff(A_REVERSE);
-
-                if (is_active) {
-                    attroff(COLOR_PAIR(COLOR_LINK_ACTIVE));
-                } else if (is_interactive) {
-                    attroff(A_UNDERLINE);
-                    attroff(COLOR_PAIR(COLOR_LINK));
-                } else {
-                    if (line.is_bold) attroff(A_BOLD);
-                    attroff(COLOR_PAIR(line.color_pair));
-                }
-
-                byte_idx += seq_len;
-            }
-        }
-
-        draw_status_bar();
-        
-        // Place cursor
-        if (cursor_y != -1 && cursor_x != -1) {
-            curs_set(1);
-            move(cursor_y, cursor_x);
-        } else {
-            curs_set(0);
-        }
+        std::string pos_str = std::to_string(scroll_pos + 1) + "/" +
+                             std::to_string(total_lines) + " " +
+                             std::to_string(percentage) + "%";
+        int pos_x = screen_width - static_cast<int>(pos_str.length()) - 1;
+        framebuffer->set_text(pos_x, y, pos_str, colors::STATUSBAR_FG, colors::STATUSBAR_BG);
     }
 
     void handle_action(const InputResult& result) {
-        int visible_lines = screen_height - 2;
-        int max_scroll = std::max(0, static_cast<int>(rendered_lines.size()) - visible_lines);
+        int visible_lines = screen_height - 1;
+        int max_scroll = std::max(0, current_layout.total_lines - visible_lines);
         int count = result.has_count ? result.count : 1;
 
         switch (result.action) {
-            case Action::SCROLL_UP: scroll_pos = std::max(0, scroll_pos - count); break;
-            case Action::SCROLL_DOWN: scroll_pos = std::min(max_scroll, scroll_pos + count); break;
-            case Action::SCROLL_PAGE_UP: scroll_pos = std::max(0, scroll_pos - visible_lines); break;
-            case Action::SCROLL_PAGE_DOWN: scroll_pos = std::min(max_scroll, scroll_pos + visible_lines); break;
-            case Action::GOTO_TOP: scroll_pos = 0; break;
-            case Action::GOTO_BOTTOM: scroll_pos = max_scroll; break;
-            case Action::GOTO_LINE: if (result.number > 0) scroll_pos = std::min(result.number - 1, max_scroll); break;
+            case Action::SCROLL_UP:
+                scroll_pos = std::max(0, scroll_pos - count);
+                break;
+            case Action::SCROLL_DOWN:
+                scroll_pos = std::min(max_scroll, scroll_pos + count);
+                break;
+            case Action::SCROLL_PAGE_UP:
+                scroll_pos = std::max(0, scroll_pos - visible_lines);
+                break;
+            case Action::SCROLL_PAGE_DOWN:
+                scroll_pos = std::min(max_scroll, scroll_pos + visible_lines);
+                break;
+            case Action::GOTO_TOP:
+                scroll_pos = 0;
+                break;
+            case Action::GOTO_BOTTOM:
+                scroll_pos = max_scroll;
+                break;
+            case Action::GOTO_LINE:
+                if (result.number > 0) {
+                    scroll_pos = std::min(result.number - 1, max_scroll);
+                }
+                break;
 
             case Action::NEXT_LINK:
-                if (!interactive_elements.empty()) {
-                    current_element_index = (current_element_index + 1) % interactive_elements.size();
-                    scroll_to_element(current_element_index);
+                if (!current_tree.links.empty()) {
+                    active_link = (active_link + 1) % current_tree.links.size();
+                    scroll_to_link(active_link);
                 }
                 break;
 
             case Action::PREV_LINK:
-                if (!interactive_elements.empty()) {
-                    current_element_index = (current_element_index - 1 + interactive_elements.size()) % interactive_elements.size();
-                    scroll_to_element(current_element_index);
+                if (!current_tree.links.empty()) {
+                    active_link = (active_link - 1 + current_tree.links.size()) % current_tree.links.size();
+                    scroll_to_link(active_link);
                 }
                 break;
 
             case Action::FOLLOW_LINK:
-                activate_element(current_element_index);
+                if (active_link >= 0 && active_link < static_cast<int>(current_tree.links.size())) {
+                    start_async_load(current_tree.links[active_link].url);
+                }
                 break;
 
             case Action::GO_BACK:
-                if (history_pos > 0) { history_pos--; load_page(history[history_pos]); }
-                break;
-            case Action::GO_FORWARD:
-                if (history_pos < static_cast<int>(history.size()) - 1) { history_pos++; load_page(history[history_pos]); }
-                break;
-            case Action::OPEN_URL: if (!result.text.empty()) load_page(result.text); break;
-            case Action::REFRESH: if (!current_url.empty()) load_page(current_url); break;
-            
-            case Action::SEARCH_FORWARD:
-                search_term = result.text;
-                search_results.clear();
-                for (size_t i = 0; i < rendered_lines.size(); ++i) {
-                    if (rendered_lines[i].text.find(search_term) != std::string::npos) search_results.push_back(i);
+                if (history_pos > 0) {
+                    history_pos--;
+                    start_async_load(history[history_pos]);
                 }
-                if (!search_results.empty()) {
-                    scroll_pos = search_results[0];
-                    status_message = "Found " + std::to_string(search_results.size()) + " matches";
-                } else status_message = "Pattern not found";
                 break;
 
+            case Action::GO_FORWARD:
+                if (history_pos < static_cast<int>(history.size()) - 1) {
+                    history_pos++;
+                    start_async_load(history[history_pos]);
+                }
+                break;
+
+            case Action::OPEN_URL:
+                if (!result.text.empty()) {
+                    start_async_load(result.text);
+                }
+                break;
+
+            case Action::REFRESH:
+                if (!current_url.empty()) {
+                    start_async_load(current_url, true);  // 强制刷新，跳过缓存
+                }
+                break;
+
+            case Action::SEARCH_FORWARD: {
+                int count = perform_search(result.text);
+                if (count > 0) {
+                    status_message = "Match 1/" + std::to_string(count);
+                } else if (!result.text.empty()) {
+                    status_message = "Pattern not found: " + result.text;
+                }
+                break;
+            }
+
             case Action::SEARCH_NEXT:
-                if (!search_results.empty()) {
-                    auto it = std::upper_bound(search_results.begin(), search_results.end(), scroll_pos);
-                    scroll_pos = (it != search_results.end()) ? *it : search_results[0];
-                }
+                search_next();
                 break;
+
             case Action::SEARCH_PREV:
-                if (!search_results.empty()) {
-                    auto it = std::lower_bound(search_results.begin(), search_results.end(), scroll_pos);
-                    scroll_pos = (it != search_results.begin()) ? *(--it) : search_results.back();
-                }
+                search_prev();
                 break;
-            
-            case Action::HELP: show_help(); break;
-            case Action::QUIT: break; // Handled in browser.run
-            default: break;
+
+            case Action::HELP:
+                show_help();
+                break;
+
+            case Action::ADD_BOOKMARK:
+                add_bookmark();
+                break;
+
+            case Action::REMOVE_BOOKMARK:
+                remove_bookmark();
+                break;
+
+            case Action::SHOW_BOOKMARKS:
+                show_bookmarks();
+                break;
+
+            case Action::QUIT:
+                break; // 在main loop处理
+
+            default:
+                break;
         }
     }
 
-    void scroll_to_element(int index) {
-        if (index < 0 || index >= static_cast<int>(interactive_elements.size())) return;
-        
-        int line_idx = interactive_elements[index].line_index;
-        int visible_lines = screen_height - 2;
-        
-        if (line_idx < scroll_pos || line_idx >= scroll_pos + visible_lines) {
-            scroll_pos = std::max(0, line_idx - visible_lines / 2);
+    // 执行搜索，返回匹配数量
+    int perform_search(const std::string& term) {
+        search_ctx.matches.clear();
+        search_ctx.current_match_idx = -1;
+        search_ctx.enabled = false;
+
+        if (term.empty()) {
+            return 0;
         }
+
+        search_term = term;
+        search_ctx.enabled = true;
+
+        // 遍历所有布局块和行，查找匹配
+        int doc_line = 0;
+        for (const auto& block : current_layout.blocks) {
+            // 上边距
+            doc_line += block.margin_top;
+
+            // 内容行
+            for (const auto& line : block.lines) {
+                // 构建整行文本用于搜索
+                std::string line_text;
+
+                for (const auto& span : line.spans) {
+                    line_text += span.text;
+                }
+
+                // 搜索匹配（大小写不敏感）
+                std::string lower_line = line_text;
+                std::string lower_term = term;
+                std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(), ::tolower);
+                std::transform(lower_term.begin(), lower_term.end(), lower_term.begin(), ::tolower);
+
+                size_t pos = 0;
+                while ((pos = lower_line.find(lower_term, pos)) != std::string::npos) {
+                    SearchMatch match;
+                    match.line = doc_line;
+                    match.start_col = line.indent + static_cast<int>(pos);
+                    match.length = static_cast<int>(term.length());
+                    search_ctx.matches.push_back(match);
+                    pos += 1;  // 继续搜索下一个匹配
+                }
+
+                doc_line++;
+            }
+
+            // 下边距
+            doc_line += block.margin_bottom;
+        }
+
+        // 如果有匹配，跳转到第一个
+        if (!search_ctx.matches.empty()) {
+            search_ctx.current_match_idx = 0;
+            scroll_to_match(0);
+        }
+
+        return static_cast<int>(search_ctx.matches.size());
+    }
+
+    // 跳转到指定匹配
+    void scroll_to_match(int idx) {
+        if (idx < 0 || idx >= static_cast<int>(search_ctx.matches.size())) {
+            return;
+        }
+
+        search_ctx.current_match_idx = idx;
+        int match_line = search_ctx.matches[idx].line;
+        int visible_lines = screen_height - 1;
+
+        // 确保匹配行在可见区域
+        if (match_line < scroll_pos) {
+            scroll_pos = match_line;
+        } else if (match_line >= scroll_pos + visible_lines) {
+            scroll_pos = match_line - visible_lines / 2;
+        }
+
+        int max_scroll = std::max(0, current_layout.total_lines - visible_lines);
+        scroll_pos = std::max(0, std::min(scroll_pos, max_scroll));
+    }
+
+    // 搜索下一个
+    void search_next() {
+        if (search_ctx.matches.empty()) {
+            if (!search_term.empty()) {
+                status_message = "Pattern not found: " + search_term;
+            }
+            return;
+        }
+
+        search_ctx.current_match_idx = (search_ctx.current_match_idx + 1) % search_ctx.matches.size();
+        scroll_to_match(search_ctx.current_match_idx);
+        status_message = "Match " + std::to_string(search_ctx.current_match_idx + 1) +
+                        "/" + std::to_string(search_ctx.matches.size());
+    }
+
+    // 搜索上一个
+    void search_prev() {
+        if (search_ctx.matches.empty()) {
+            if (!search_term.empty()) {
+                status_message = "Pattern not found: " + search_term;
+            }
+            return;
+        }
+
+        search_ctx.current_match_idx = (search_ctx.current_match_idx - 1 + search_ctx.matches.size()) % search_ctx.matches.size();
+        scroll_to_match(search_ctx.current_match_idx);
+        status_message = "Match " + std::to_string(search_ctx.current_match_idx + 1) +
+                        "/" + std::to_string(search_ctx.matches.size());
+    }
+
+    // 滚动到链接位置
+    void scroll_to_link(int link_idx) {
+        if (link_idx < 0 || link_idx >= static_cast<int>(current_layout.link_positions.size())) {
+            return;
+        }
+
+        const auto& pos = current_layout.link_positions[link_idx];
+        if (pos.start_line < 0) {
+            return;  // 链接位置无效
+        }
+
+        int visible_lines = screen_height - 1;
+        int link_line = pos.start_line;
+
+        // 确保链接行在可见区域
+        if (link_line < scroll_pos) {
+            // 链接在视口上方，滚动使其出现在顶部附近
+            scroll_pos = std::max(0, link_line - 2);
+        } else if (link_line >= scroll_pos + visible_lines) {
+            // 链接在视口下方，滚动使其出现在中间
+            scroll_pos = link_line - visible_lines / 2;
+        }
+
+        int max_scroll = std::max(0, current_layout.total_lines - visible_lines);
+        scroll_pos = std::max(0, std::min(scroll_pos, max_scroll));
     }
 
     void show_help() {
-        // Updated help text would go here
-        std::ostringstream help_html;
-        help_html << "<html><body><h1>Help</h1><p>Use Tab to navigate links and form fields.</p><p>Enter to activate/edit.</p></body></html>";
-        current_tree = html_parser.parse_tree(help_html.str(), "help://");
-        rendered_lines = renderer.render_tree(current_tree, screen_width);
-        build_interactive_list();
+        std::string help_html = R"(
+<!DOCTYPE html>
+<html>
+<head><title>TUT 2.0 Help</title></head>
+<body>
+<h1>TUT 2.0 - Terminal Browser</h1>
+
+<h2>Navigation</h2>
+<ul>
+<li>j/k - Scroll down/up</li>
+<li>Ctrl+d/Ctrl+u - Page down/up</li>
+<li>gg - Go to top</li>
+<li>G - Go to bottom</li>
+</ul>
+
+<h2>Links</h2>
+<ul>
+<li>Tab - Next link</li>
+<li>Shift+Tab - Previous link</li>
+<li>Enter - Follow link</li>
+</ul>
+
+<h2>History</h2>
+<ul>
+<li>h - Go back</li>
+<li>l - Go forward</li>
+</ul>
+
+<h2>Search</h2>
+<ul>
+<li>/ - Search forward</li>
+<li>n - Next match</li>
+<li>N - Previous match</li>
+</ul>
+
+<h2>Bookmarks</h2>
+<ul>
+<li>B - Add bookmark</li>
+<li>D - Remove bookmark</li>
+<li>:bookmarks - Show bookmarks</li>
+</ul>
+
+<h2>Commands</h2>
+<ul>
+<li>:o URL - Open URL</li>
+<li>:bookmarks - Show bookmarks</li>
+<li>:q - Quit</li>
+<li>? - Show this help</li>
+</ul>
+
+<h2>Forms</h2>
+<ul>
+<li>Tab - Navigate links and form fields</li>
+<li>Enter - Activate link or submit form</li>
+</ul>
+
+<hr>
+<p>TUT 2.0 - A modern terminal browser with True Color support</p>
+</body>
+</html>
+)";
+        current_tree = html_parser.parse_tree(help_html, "help://");
+        current_layout = layout_engine->layout(current_tree);
         scroll_pos = 0;
-        current_element_index = -1;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        status_message = "Help - Press any key to continue";
+    }
+
+    void show_bookmarks() {
+        std::ostringstream html;
+        html << R"(
+<!DOCTYPE html>
+<html>
+<head><title>Bookmarks</title></head>
+<body>
+<h1>Bookmarks</h1>
+)";
+
+        const auto& bookmarks = bookmark_manager.get_all();
+
+        if (bookmarks.empty()) {
+            html << "<p>No bookmarks yet.</p>\n";
+            html << "<p>Press <b>B</b> on any page to add a bookmark.</p>\n";
+        } else {
+            html << "<ul>\n";
+            for (const auto& bm : bookmarks) {
+                html << "<li><a href=\"" << bm.url << "\">"
+                     << (bm.title.empty() ? bm.url : bm.title)
+                     << "</a></li>\n";
+            }
+            html << "</ul>\n";
+            html << "<hr>\n";
+            html << "<p>" << bookmarks.size() << " bookmark(s). Press D on any page to remove its bookmark.</p>\n";
+        }
+
+        html << R"(
+</body>
+</html>
+)";
+
+        current_tree = html_parser.parse_tree(html.str(), "bookmarks://");
+        current_layout = layout_engine->layout(current_tree);
+        scroll_pos = 0;
+        active_link = current_tree.links.empty() ? -1 : 0;
+        status_message = "Bookmarks";
+    }
+
+    void add_bookmark() {
+        if (current_url.empty() || current_url.find("://") == std::string::npos) {
+            status_message = "Cannot bookmark this page";
+            return;
+        }
+
+        // 不要书签特殊页面
+        if (current_url.find("help://") == 0 || current_url.find("bookmarks://") == 0) {
+            status_message = "Cannot bookmark special pages";
+            return;
+        }
+
+        std::string title = current_tree.title.empty() ? current_url : current_tree.title;
+
+        if (bookmark_manager.add(current_url, title)) {
+            status_message = "Bookmarked: " + title;
+        } else {
+            status_message = "Already bookmarked";
+        }
+    }
+
+    void remove_bookmark() {
+        if (current_url.empty()) {
+            status_message = "No page to unbookmark";
+            return;
+        }
+
+        if (bookmark_manager.remove(current_url)) {
+            status_message = "Bookmark removed";
+        } else {
+            status_message = "Not bookmarked";
+        }
     }
 };
 
@@ -579,28 +895,54 @@ Browser::Browser() : pImpl(std::make_unique<Impl>()) {
 Browser::~Browser() = default;
 
 void Browser::run(const std::string& initial_url) {
-    pImpl->init_screen();
+    if (!pImpl->init_screen()) {
+        throw std::runtime_error("Failed to initialize terminal");
+    }
 
-    if (!initial_url.empty()) load_url(initial_url);
-    else pImpl->show_help();
+    if (!initial_url.empty()) {
+        pImpl->start_async_load(initial_url);
+    } else {
+        pImpl->show_help();
+    }
 
     bool running = true;
     while (running) {
+        // 轮询异步加载状态
+        pImpl->poll_loading();
+
+        // 渲染屏幕
         pImpl->draw_screen();
-        refresh();
 
-        int ch = getch();
-        if (ch == ERR) { napms(50); continue; }
+        // 获取输入（非阻塞，50ms超时）
+        int ch = pImpl->terminal.get_key(50);
+        if (ch == -1) continue;
 
-        if (ch == KEY_MOUSE) {
-            MEVENT event;
-            if (getmouse(&event) == OK) pImpl->handle_mouse(event);
+        // 处理窗口大小变化
+        if (ch == KEY_RESIZE) {
+            pImpl->handle_resize();
             continue;
         }
 
+        // 如果正在加载，Esc可以取消
+        if (pImpl->loading_state != LoadingState::IDLE && ch == 27) {  // 27 = Esc
+            pImpl->cancel_loading();
+            continue;
+        }
+
+        // 加载时忽略大部分输入，只允许取消和退出
+        if (pImpl->loading_state != LoadingState::IDLE) {
+            if (ch == 'q' || ch == 'Q') {
+                running = false;
+            }
+            continue;  // 忽略其他输入
+        }
+
         auto result = pImpl->input_handler.handle_key(ch);
-        if (result.action == Action::QUIT) running = false;
-        else if (result.action != Action::NONE) pImpl->handle_action(result);
+        if (result.action == Action::QUIT) {
+            running = false;
+        } else if (result.action != Action::NONE) {
+            pImpl->handle_action(result);
+        }
     }
 
     pImpl->cleanup_screen();

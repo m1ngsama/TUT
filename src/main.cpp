@@ -4,7 +4,7 @@
 
 void print_usage(const char* prog_name) {
     std::cout << "TUT - Terminal User Interface Browser\n"
-              << "A vim-style terminal web browser for comfortable reading\n\n"
+              << "A vim-style terminal web browser with True Color support\n\n"
               << "Usage: " << prog_name << " [URL]\n\n"
               << "If no URL is provided, the browser will start with a help page.\n\n"
               << "Examples:\n"
@@ -44,4 +44,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-

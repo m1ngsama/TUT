@@ -2,12 +2,20 @@
 
 #include "http_client.h"
 #include "html_parser.h"
-#include "text_renderer.h"
 #include "input_handler.h"
+#include "render/terminal.h"
+#include "render/renderer.h"
+#include "render/layout.h"
 #include <string>
 #include <vector>
 #include <memory>
 
+/**
+ * Browser - TUT 终端浏览器
+ *
+ * 使用 Terminal + FrameBuffer + Renderer + LayoutEngine 架构
+ * 支持 True Color, Unicode, 差分渲染
+ */
 class Browser {
 public:
     Browser();

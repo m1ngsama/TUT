@@ -48,7 +48,12 @@ bool DomNode::is_block_element() const {
                    tag_name == "pre" || tag_name == "hr" ||
                    tag_name == "table" || tag_name == "tr" ||
                    tag_name == "th" || tag_name == "td" ||
-                   tag_name == "form" || tag_name == "fieldset";
+                   tag_name == "tbody" || tag_name == "thead" ||
+                   tag_name == "tfoot" || tag_name == "caption" ||
+                   tag_name == "form" || tag_name == "fieldset" ||
+                   tag_name == "figure" || tag_name == "figcaption" ||
+                   tag_name == "details" || tag_name == "summary" ||
+                   tag_name == "center" || tag_name == "address";
     }
 }
 
@@ -90,6 +95,11 @@ bool DomNode::should_render() const {
 
 std::string DomNode::get_all_text() const {
     std::string result;
+
+    // 过滤不应该提取文本的元素
+    if (!should_render()) {
+        return "";
+    }
 
     if (node_type == NodeType::TEXT) {
         result = text_content;

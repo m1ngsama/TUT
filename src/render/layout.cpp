@@ -77,20 +77,6 @@ void LayoutEngine::layout_node(const DomNode* node, Context& ctx, std::vector<La
         return;
     }
 
-    // 处理容器元素（html, body, div, form等）- 递归处理子节点
-    if (node->tag_name == "html" || node->tag_name == "body" ||
-        node->tag_name == "head" || node->tag_name == "main" ||
-        node->tag_name == "article" || node->tag_name == "section" ||
-        node->tag_name == "div" || node->tag_name == "header" ||
-        node->tag_name == "footer" || node->tag_name == "nav" ||
-        node->tag_name == "aside" || node->tag_name == "form" ||
-        node->tag_name == "fieldset") {
-        for (const auto& child : node->children) {
-            layout_node(child.get(), ctx, blocks);
-        }
-        return;
-    }
-
     // 处理表单内联元素
     if (node->element_type == ElementType::INPUT ||
         node->element_type == ElementType::BUTTON ||
@@ -106,10 +92,86 @@ void LayoutEngine::layout_node(const DomNode* node, Context& ctx, std::vector<La
         return;
     }
 
+    // 处理块级元素
     if (node->is_block_element()) {
         layout_block_element(node, ctx, blocks);
+        return;
     }
-    // 内联元素在块级元素内部处理
+
+    // 处理链接 - 当链接单独出现时（不在段落内），创建一个单独的块
+    if (node->element_type == ElementType::LINK && node->link_index >= 0) {
+        // 检查链接是否有可见文本
+        std::string link_text = node->get_all_text();
+        // 去除空白
+        size_t start = link_text.find_first_not_of(" \t\n\r");
+        size_t end = link_text.find_last_not_of(" \t\n\r");
+        if (start != std::string::npos && end != std::string::npos) {
+            link_text = link_text.substr(start, end - start + 1);
+        } else {
+            link_text = "";
+        }
+
+        if (!link_text.empty()) {
+            LayoutBlock block;
+            block.type = ElementType::PARAGRAPH;
+            block.margin_top = 0;
+            block.margin_bottom = 0;
+
+            LayoutLine line;
+            line.indent = MARGIN_LEFT;
+
+            StyledSpan span;
+            span.text = link_text;
+            span.fg = colors::LINK_FG;
+            span.attrs = ATTR_UNDERLINE;
+            span.link_index = node->link_index;
+            line.spans.push_back(span);
+
+            block.lines.push_back(line);
+            blocks.push_back(block);
+        }
+        return;
+    }
+
+    // 处理容器元素 - 递归处理子节点
+    // 这包括：html, body, div, table, span, center 等所有容器类元素
+    if (node->node_type == NodeType::ELEMENT && !node->children.empty()) {
+        for (const auto& child : node->children) {
+            layout_node(child.get(), ctx, blocks);
+        }
+        return;
+    }
+
+    // 处理独立文本节点
+    if (node->node_type == NodeType::TEXT && !node->text_content.empty()) {
+        std::string text = node->text_content;
+        // 去除首尾空白
+        size_t start = text.find_first_not_of(" \t\n\r");
+        size_t end = text.find_last_not_of(" \t\n\r");
+        if (start != std::string::npos && end != std::string::npos) {
+            text = text.substr(start, end - start + 1);
+        } else {
+            return; // 空白文本，跳过
+        }
+
+        if (!text.empty()) {
+            LayoutBlock block;
+            block.type = ElementType::TEXT;
+            block.margin_top = 0;
+            block.margin_bottom = 0;
+
+            std::vector<StyledSpan> spans;
+            StyledSpan span;
+            span.text = text;
+            span.fg = colors::FG_PRIMARY;
+            spans.push_back(span);
+
+            block.lines = wrap_text(spans, content_width_, MARGIN_LEFT);
+            if (!block.lines.empty()) {
+                blocks.push_back(block);
+            }
+        }
+    }
 }
 
 void LayoutEngine::layout_block_element(const DomNode* node, Context& ctx, std::vector<LayoutBlock>& blocks) {
@@ -485,6 +547,41 @@ void LayoutEngine::layout_image_element(const DomNode* node, Context& /*ctx*/, s
     blocks.push_back(block);
 }
 
+// 辅助函数：检查是否需要在两个文本之间添加空格
+static bool needs_space_between(const std::string& prev, const std::string& next) {
+    if (prev.empty() || next.empty()) return false;
+
+    char last_char = prev.back();
+    char first_char = next.front();
+
+    // 检查前一个是否以空白结尾
+    bool prev_ends_with_space = (last_char == ' ' || last_char == '\t' ||
+                                  last_char == '\n' || last_char == '\r');
+    if (prev_ends_with_space) return false;
+
+    // 检查当前是否以空白开头
+    bool curr_starts_with_space = (first_char == ' ' || first_char == '\t' ||
+                                    first_char == '\n' || first_char == '\r');
+    if (curr_starts_with_space) return false;
+
+    // 检查是否是标点符号（不需要空格）
+    bool is_punct = (first_char == '.' || first_char == ',' ||
+                     first_char == '!' || first_char == '?' ||
+                     first_char == ':' || first_char == ';' ||
+                     first_char == ')' || first_char == ']' ||
+                     first_char == '}' || first_char == '|' ||
+                     first_char == '\'' || first_char == '"');
+    if (is_punct) return false;
+
+    // 检查前一个字符是否是特殊符号（不需要空格）
+    bool prev_is_open = (last_char == '(' || last_char == '[' ||
+                         last_char == '{' || last_char == '\'' ||
+                         last_char == '"');
+    if (prev_is_open) return false;
+
+    return true;
+}
+
 void LayoutEngine::collect_inline_content(const DomNode* node, Context& ctx, std::vector<StyledSpan>& spans) {
     if (!node) return;
 
@@ -502,10 +599,21 @@ void LayoutEngine::collect_inline_content(const DomNode* node, Context& ctx, std
         int link_idx = node->link_index;
 
         // 递归处理子节点
-        for (const auto& child : node->children) {
+        for (size_t i = 0; i < node->children.size(); ++i) {
+            const auto& child = node->children[i];
+
             if (child->node_type == NodeType::TEXT) {
+                std::string text = child->text_content;
+
+                // 检查是否需要在之前的内容和当前内容之间添加空格
+                if (!spans.empty() && !text.empty()) {
+                    if (needs_space_between(spans.back().text, text)) {
+                        spans.back().text += " ";
+                    }
+                }
+
                 StyledSpan span;
-                span.text = child->text_content;
+                span.text = text;
                 span.fg = fg;
                 span.attrs = attrs;
                 span.link_index = link_idx;
@@ -516,6 +624,16 @@ void LayoutEngine::collect_inline_content(const DomNode* node, Context& ctx, std
 
                 spans.push_back(span);
             } else if (!child->is_block_element()) {
+                // 获取子节点的全部文本，用于检查是否需要空格
+                std::string child_text = child->get_all_text();
+
+                // 在递归调用前检查空格
+                if (!spans.empty() && !child_text.empty()) {
+                    if (needs_space_between(spans.back().text, child_text)) {
+                        spans.back().text += " ";
+                    }
+                }
+
                 collect_inline_content(child.get(), ctx, spans);
             }
         }
@@ -525,8 +643,17 @@ void LayoutEngine::collect_inline_content(const DomNode* node, Context& ctx, std
 void LayoutEngine::layout_text(const DomNode* node, Context& ctx, std::vector<StyledSpan>& spans) {
     if (!node || node->text_content.empty()) return;
 
+    std::string text = node->text_content;
+
+    // 检查是否需要在之前的内容和当前内容之间添加空格
+    if (!spans.empty() && !text.empty()) {
+        if (needs_space_between(spans.back().text, text)) {
+            spans.back().text += " ";
+        }
+    }
+
     StyledSpan span;
-    span.text = node->text_content;
+    span.text = text;
     span.fg = colors::FG_PRIMARY;
 
     if (ctx.in_blockquote) {
@@ -546,12 +673,13 @@ std::vector<LayoutLine> LayoutEngine::wrap_text(const std::vector<StyledSpan>& s
     LayoutLine current_line;
     current_line.indent = indent;
     size_t current_width = 0;
+    bool is_line_start = true;  // 整行的开始标记
 
     for (const auto& span : spans) {
         // 分词处理
         std::istringstream iss(span.text);
         std::string word;
-        bool first_word = true;
+        bool first_word_in_span = true;
 
         while (iss >> word) {
             size_t word_width = Unicode::display_width(word);
@@ -565,12 +693,20 @@ std::vector<LayoutLine> LayoutEngine::wrap_text(const std::vector<StyledSpan>& s
                 current_line = LayoutLine();
                 current_line.indent = indent;
                 current_width = 0;
-                first_word = true;
+                is_line_start = true;
             }
 
-            // 添加空格（如果不是行首）
-            if (current_width > 0 && !first_word) {
-                if (!current_line.spans.empty()) {
+            // 添加空格（如果不是行首且不是第一个单词）
+            // 需要在不同 span 之间也添加空格
+            if (!is_line_start) {
+                // 检查是否需要空格（避免在标点前加空格）
+                char first_char = word.front();
+                bool is_punct = (first_char == '.' || first_char == ',' ||
+                                 first_char == '!' || first_char == '?' ||
+                                 first_char == ':' || first_char == ';' ||
+                                 first_char == ')' || first_char == ']' ||
+                                 first_char == '}' || first_char == '|');
+                if (!is_punct && !current_line.spans.empty()) {
                     current_line.spans.back().text += " ";
                     current_width += 1;
                 }
@@ -581,7 +717,8 @@ std::vector<LayoutLine> LayoutEngine::wrap_text(const std::vector<StyledSpan>& s
             word_span.text = word;
             current_line.spans.push_back(word_span);
             current_width += word_width;
-            first_word = false;
+            is_line_start = false;
+            first_word_in_span = false;
         }
     }
 
