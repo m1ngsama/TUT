@@ -139,3 +139,33 @@ add_executable(test_history
     src/history.cpp
     tests/test_history.cpp
 )
+
+# 异步图片下载测试
+add_executable(test_async_images
+    src/http_client.cpp
+    tests/test_async_images.cpp
+)
+
+target_link_libraries(test_async_images
+    CURL::libcurl
+)
+
+# 简单图片测试
+add_executable(test_simple_image
+    src/http_client.cpp
+    tests/test_simple_image.cpp
+)
+
+target_link_libraries(test_simple_image
+    CURL::libcurl
+)
+
+# 最小图片测试
+add_executable(test_image_minimal
+    src/http_client.cpp
+    tests/test_image_minimal.cpp
+)
+
+target_link_libraries(test_image_minimal
+    CURL::libcurl
+)

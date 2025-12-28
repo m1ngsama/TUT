@@ -17,6 +17,15 @@ static size_t binary_write_callback(void* contents, size_t size, size_t nmemb, s
     return total_size;
 }
 
+// 内部图片下载任务
+struct InternalImageTask {
+    CURL* easy_handle = nullptr;
+    std::string url;
+    void* user_data = nullptr;
+    std::vector<uint8_t> data;
+    bool is_loading = false;
+};
+
 class HttpClient::Impl {
 public:
     CURL* curl;
@@ -25,12 +34,19 @@ public:
     bool follow_redirects;
     std::string cookie_file;
 
-    // 异步请求相关
+    // 异步请求相关 (页面)
     CURLM* multi_handle = nullptr;
     CURL* async_easy = nullptr;
     AsyncState async_state = AsyncState::IDLE;
     std::string async_response_body;
     HttpResponse async_result;
+
+    // 异步图片下载相关
+    CURLM* image_multi = nullptr;  // 专用于图片的multi handle
+    std::vector<InternalImageTask> pending_images;  // 待下载队列
+    std::vector<InternalImageTask> loading_images;  // 正在下载
+    std::vector<ImageDownloadTask> completed_images;  // 已完成
+    int max_concurrent_images = 3;
 
     Impl() : timeout(30),
              user_agent("TUT-Browser/2.0 (Terminal User Interface Browser)"),
@@ -49,12 +65,22 @@ public:
         if (!multi_handle) {
             throw std::runtime_error("Failed to initialize CURL multi handle");
         }
+
+        // 初始化image multi handle用于图片下载
+        image_multi = curl_multi_init();
+        if (!image_multi) {
+            throw std::runtime_error("Failed to initialize image CURL multi handle");
+        }
     }
 
     ~Impl() {
         // 清理异步请求
         cleanup_async();
+        cleanup_all_images();
 
+        if (image_multi) {
+            curl_multi_cleanup(image_multi);
+        }
         if (multi_handle) {
             curl_multi_cleanup(multi_handle);
         }
@@ -95,6 +121,46 @@ public:
         }
 
         curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "");
+    }
+
+    void cleanup_all_images() {
+        // 清理所有正在加载的图片
+        for (auto& task : loading_images) {
+            if (task.easy_handle) {
+                curl_multi_remove_handle(image_multi, task.easy_handle);
+                curl_easy_cleanup(task.easy_handle);
+            }
+        }
+        loading_images.clear();
+
+        // 清理待下载的图片
+        for (auto& task : pending_images) {
+            if (task.easy_handle) {
+                curl_easy_cleanup(task.easy_handle);
+            }
+        }
+        pending_images.clear();
+        completed_images.clear();
+    }
+
+    // 启动一个图片下载任务
+    void start_image_download(InternalImageTask& task) {
+        task.easy_handle = curl_easy_init();
+        if (!task.easy_handle) {
+            return;  // 跳过失败的任务
+        }
+
+        // 配置请求
+        setup_easy_handle(task.easy_handle, task.url);
+
+        // 设置写回调
+        task.data.clear();
+        curl_easy_setopt(task.easy_handle, CURLOPT_WRITEFUNCTION, binary_write_callback);
+        curl_easy_setopt(task.easy_handle, CURLOPT_WRITEDATA, &task.data);
+
+        // 添加到multi handle
+        curl_multi_add_handle(image_multi, task.easy_handle);
+        task.is_loading = true;
     }
 };
 
@@ -452,4 +518,114 @@ void HttpClient::cancel_async() {
 
 bool HttpClient::is_async_active() const {
     return pImpl->async_state == AsyncState::LOADING;
+}
+
+// ========== 异步图片下载接口 ==========
+
+void HttpClient::add_image_download(const std::string& url, void* user_data) {
+    InternalImageTask task;
+    task.url = url;
+    task.user_data = user_data;
+    pImpl->pending_images.push_back(std::move(task));
+}
+
+void HttpClient::poll_image_downloads() {
+    // 启动新的下载任务，直到达到最大并发数
+    while (!pImpl->pending_images.empty() &&
+           static_cast<int>(pImpl->loading_images.size()) < pImpl->max_concurrent_images) {
+        InternalImageTask task = std::move(pImpl->pending_images.front());
+        pImpl->pending_images.erase(pImpl->pending_images.begin());
+
+        pImpl->start_image_download(task);
+        pImpl->loading_images.push_back(std::move(task));
+    }
+
+    if (pImpl->loading_images.empty()) {
+        return;  // 没有正在下载的任务
+    }
+
+    // 执行非阻塞的multi perform
+    int still_running = 0;
+    CURLMcode mc = curl_multi_perform(pImpl->image_multi, &still_running);
+
+    if (mc != CURLM_OK) {
+        // 发生错误，放弃所有正在下载的任务
+        pImpl->cleanup_all_images();
+        return;
+    }
+
+    // 检查是否有完成的请求
+    int msgs_left = 0;
+    CURLMsg* msg;
+    std::vector<std::pair<CURL*, CURLcode>> to_remove;  // 记录需要移除的handles和结果
+
+    while ((msg = curl_multi_info_read(pImpl->image_multi, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+            to_remove.push_back({msg->easy_handle, msg->data.result});
+        }
+    }
+
+    // 处理完成的任务
+    for (const auto& [easy, curl_result] : to_remove) {
+        // 找到对应的任务
+        for (auto it = pImpl->loading_images.begin(); it != pImpl->loading_images.end(); ++it) {
+            if (it->easy_handle == easy) {
+                ImageDownloadTask completed;
+                completed.url = it->url;
+                completed.user_data = it->user_data;
+
+                if (curl_result == CURLE_OK) {
+                    // 获取响应信息
+                    long http_code = 0;
+                    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+                    completed.status_code = static_cast<int>(http_code);
+
+                    char* content_type = nullptr;
+                    curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &content_type);
+                    if (content_type) {
+                        completed.content_type = content_type;
+                    }
+
+                    completed.data = std::move(it->data);
+                } else {
+                    completed.error_message = curl_easy_strerror(curl_result);
+                    completed.status_code = 0;
+                }
+
+                pImpl->completed_images.push_back(std::move(completed));
+
+                // 清理easy handle
+                curl_multi_remove_handle(pImpl->image_multi, easy);
+                curl_easy_cleanup(easy);
+
+                // 从loading列表中移除
+                pImpl->loading_images.erase(it);
+                break;
+            }
+        }
+    }
+}
+
+std::vector<ImageDownloadTask> HttpClient::get_completed_images() {
+    std::vector<ImageDownloadTask> result = std::move(pImpl->completed_images);
+    pImpl->completed_images.clear();
+    return result;
+}
+
+void HttpClient::cancel_all_images() {
+    pImpl->cleanup_all_images();
+}
+
+int HttpClient::get_pending_image_count() const {
+    return static_cast<int>(pImpl->pending_images.size());
+}
+
+int HttpClient::get_loading_image_count() const {
+    return static_cast<int>(pImpl->loading_images.size());
+}
+
+void HttpClient::set_max_concurrent_images(int max) {
+    if (max > 0 && max <= 10) {  // 限制在1-10之间
+        pImpl->max_concurrent_images = max;
+    }
 }

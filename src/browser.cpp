@@ -97,6 +97,11 @@ public:
     static constexpr int CACHE_MAX_AGE = 300;  // 5分钟缓存
     static constexpr size_t CACHE_MAX_SIZE = 20;  // 最多缓存20个页面
 
+    // 图片下载状态
+    int images_total = 0;
+    int images_loaded = 0;
+    int images_cached = 0;
+
     // 图片缓存
     std::map<std::string, ImageCacheEntry> image_cache;
     static constexpr int IMAGE_CACHE_MAX_AGE = 600;  // 10分钟缓存
@@ -184,8 +189,8 @@ public:
             status_message = current_tree.title.empty() ? url : current_tree.title;
         }
 
-        // 下载图片
-        load_images(current_tree);
+        // 下载图片（异步）
+        queue_images(current_tree);
 
         // 布局计算
         current_layout = layout_engine->layout(current_tree);
@@ -242,8 +247,8 @@ public:
                 history_manager.add(url, current_tree.title);
             }
 
-            // 加载图片（仍然同步，可以后续优化）
-            load_images(current_tree);
+            // 加载图片（异步）
+            queue_images(current_tree);
             current_layout = layout_engine->layout(current_tree);
             return;
         }
@@ -301,6 +306,69 @@ public:
                 default:
                     return false;
             }
+        } else if (loading_state == LoadingState::LOADING_IMAGES) {
+            // 轮询图片下载
+            http_client.poll_image_downloads();
+
+            // 处理已完成的图片
+            auto completed = http_client.get_completed_images();
+            bool need_relayout = false;
+
+            for (auto& task : completed) {
+                images_loaded++;
+
+                if (!task.is_success() || task.data.empty()) {
+                    continue;  // 跳过失败的图片
+                }
+
+                // 解码图片
+                tut::ImageData img_data = tut::ImageRenderer::load_from_memory(task.data);
+                if (img_data.is_valid()) {
+                    // 设置到对应的DomNode
+                    DomNode* img_node = static_cast<DomNode*>(task.user_data);
+                    if (img_node) {
+                        img_node->image_data = img_data;
+                        need_relayout = true;
+
+                        // 添加到缓存
+                        if (image_cache.size() >= IMAGE_CACHE_MAX_SIZE) {
+                            // 移除最老的缓存条目
+                            auto oldest = image_cache.begin();
+                            for (auto it = image_cache.begin(); it != image_cache.end(); ++it) {
+                                if (it->second.timestamp < oldest->second.timestamp) {
+                                    oldest = it;
+                                }
+                            }
+                            image_cache.erase(oldest);
+                        }
+
+                        ImageCacheEntry entry;
+                        entry.image_data = std::move(img_data);
+                        entry.timestamp = std::chrono::steady_clock::now();
+                        image_cache[task.url] = std::move(entry);
+                    }
+                }
+            }
+
+            // 如果有图片完成，重新布局
+            if (need_relayout) {
+                current_layout = layout_engine->layout(current_tree);
+            }
+
+            // 检查是否所有图片都已完成
+            if (http_client.get_pending_image_count() == 0 &&
+                http_client.get_loading_image_count() == 0) {
+                if (images_total > 0) {
+                    status_message = "✓ Loaded " + std::to_string(images_total) + " images";
+                    if (images_cached > 0) {
+                        status_message += " (" + std::to_string(images_cached) + " from cache)";
+                    }
+                }
+                loading_state = LoadingState::IDLE;
+                return false;
+            }
+
+            return true;
         }
 
         return loading_state != LoadingState::IDLE;
@@ -312,7 +380,11 @@ public:
         if (loading_state == LoadingState::LOADING_PAGE) {
             status_message = spinner + " Loading " + extract_host(pending_url) + "...";
         } else if (loading_state == LoadingState::LOADING_IMAGES) {
-            status_message = spinner + " Loading images...";
+            status_message = spinner + " Loading images " + std::to_string(images_loaded) +
+                           "/" + std::to_string(images_total);
+            if (images_cached > 0) {
+                status_message += " (cached: " + std::to_string(images_cached) + ")";
+            }
         }
     }
 
@@ -355,17 +427,22 @@ public:
 
         status_message = current_tree.title.empty() ? pending_url : current_tree.title;
 
-        // 加载图片（目前仍同步，可后续优化为异步）
-        load_images(current_tree);
+        // 加载图片（异步）
+        queue_images(current_tree);
         current_layout = layout_engine->layout(current_tree);
 
-        loading_state = LoadingState::IDLE;
+        // 不设置为IDLE，等待图片加载完成
+        // loading_state will be set by poll_loading when images finish
     }
 
     // 取消加载
     void cancel_loading() {
         if (loading_state != LoadingState::IDLE) {
-            http_client.cancel_async();
+            if (loading_state == LoadingState::LOADING_PAGE) {
+                http_client.cancel_async();
+            } else if (loading_state == LoadingState::LOADING_IMAGES) {
+                http_client.cancel_all_images();
+            }
             loading_state = LoadingState::IDLE;
             status_message = "⚠ Cancelled";
         }
@@ -391,72 +468,49 @@ public:
     }
 
     // 下载并解码页面中的图片
-    void load_images(DocumentTree& tree) {
+    // 将图片加入异步下载队列
+    void queue_images(DocumentTree& tree) {
         if (tree.images.empty()) {
+            loading_state = LoadingState::IDLE;
             return;
         }
 
-        int loaded = 0;
-        int cached = 0;
-        int total = static_cast<int>(tree.images.size());
+        images_cached = 0;
+        images_total = 0;
+        images_loaded = 0;
 
         for (DomNode* img_node : tree.images) {
             if (img_node->img_src.empty()) {
                 continue;
             }
 
-            loaded++;
+            images_total++;
 
             // 检查缓存
             auto cache_it = image_cache.find(img_node->img_src);
             if (cache_it != image_cache.end() && !cache_it->second.is_expired(IMAGE_CACHE_MAX_AGE)) {
                 // 使用缓存的图片
                 img_node->image_data = cache_it->second.image_data;
-                cached++;
-                status_message = "🖼 Loading image " + std::to_string(loaded) + "/" + std::to_string(total) +
-                                " (cached: " + std::to_string(cached) + ")";
-                draw_screen();
+                images_cached++;
+                images_loaded++;
                 continue;
             }
 
-            // 更新状态
-            status_message = "🖼 Downloading image " + std::to_string(loaded) + "/" + std::to_string(total) + "...";
-            draw_screen();
-
-            // 下载图片
-            auto response = http_client.fetch_binary(img_node->img_src);
-            if (!response.is_success() || response.data.empty()) {
-                continue;  // 跳过失败的图片
-            }
-
-            // 解码图片
-            tut::ImageData img_data = tut::ImageRenderer::load_from_memory(response.data);
-            if (img_data.is_valid()) {
-                img_node->image_data = img_data;
-
-                // 添加到缓存
-                // 限制缓存大小
-                if (image_cache.size() >= IMAGE_CACHE_MAX_SIZE) {
-                    // 移除最老的缓存条目
-                    auto oldest = image_cache.begin();
-                    for (auto it = image_cache.begin(); it != image_cache.end(); ++it) {
-                        if (it->second.timestamp < oldest->second.timestamp) {
-                            oldest = it;
-                        }
-                    }
-                    image_cache.erase(oldest);
-                }
-
-                ImageCacheEntry entry;
-                entry.image_data = std::move(img_data);
-                entry.timestamp = std::chrono::steady_clock::now();
-                image_cache[img_node->img_src] = std::move(entry);
-            }
+            // 添加到下载队列
+            http_client.add_image_download(img_node->img_src, img_node);
         }
 
-        if (cached > 0) {
-            status_message = "✓ Loaded " + std::to_string(total) + " images (" +
-                           std::to_string(cached) + " from cache)";
+        // 如果所有图片都在缓存中，直接完成
+        if (http_client.get_pending_image_count() == 0 &&
+            http_client.get_loading_image_count() == 0) {
+            if (images_cached > 0) {
+                status_message = "✓ Loaded " + std::to_string(images_total) + " images (" +
+                               std::to_string(images_cached) + " from cache)";
+            }
+            loading_state = LoadingState::IDLE;
+        } else {
+            loading_state = LoadingState::LOADING_IMAGES;
+            update_loading_status();
         }
     }
 
