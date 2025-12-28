@@ -218,6 +218,9 @@ public:
 
     // 启动异步页面加载
     void start_async_load(const std::string& url, bool force_refresh = false) {
+        // 取消任何正在进行的图片下载 (避免访问旧树的节点)
+        http_client.cancel_all_images();
+
         // 检查缓存
         auto cache_it = page_cache.find(url);
         bool use_cache = !force_refresh && cache_it != page_cache.end() &&
@@ -326,7 +329,19 @@ public:
                 if (img_data.is_valid()) {
                     // 设置到对应的DomNode
                     DomNode* img_node = static_cast<DomNode*>(task.user_data);
+
+                    // 验证节点仍然有效 (仍在当前树的images列表中)
+                    bool node_valid = false;
                     if (img_node) {
+                        for (const auto* node : current_tree.images) {
+                            if (node == img_node) {
+                                node_valid = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (node_valid) {
                         img_node->image_data = img_data;
                         need_relayout = true;
 
