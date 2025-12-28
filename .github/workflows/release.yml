@@ -47,7 +47,7 @@ jobs:
 
     - name: Rename binary with platform suffix
       run: |
-        mv build/tut2 build/tut-${{ matrix.name }}
+        mv build/tut build/tut-${{ matrix.name }}
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
