@@ -1,0 +1,23 @@
+# TUT Solarized Dark Theme
+# Based on Solarized Dark color palette
+
+[meta]
+name = "solarized-dark"
+description = "Solarized dark color palette theme"
+
+[colors]
+background = "#002b36"
+foreground = "#839496"
+accent = "#268bd2"
+border = "#073642"
+selection = "#073642"
+link = "#2aa198"
+visited_link = "#6c71c4"
+error = "#dc322f"
+success = "#859900"
+warning = "#b58900"
+
+[ui]
+border_style = "rounded"
+show_shadows = false
+transparency = false

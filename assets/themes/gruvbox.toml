@@ -1,0 +1,23 @@
+# TUT Gruvbox Theme
+# Based on Gruvbox Dark color palette
+
+[meta]
+name = "gruvbox"
+description = "Gruvbox dark color palette theme"
+
+[colors]
+background = "#282828"
+foreground = "#ebdbb2"
+accent = "#fabd2f"
+border = "#504945"
+selection = "#3c3836"
+link = "#83a598"
+visited_link = "#d3869b"
+error = "#fb4934"
+success = "#b8bb26"
+warning = "#fe8019"
+
+[ui]
+border_style = "rounded"
+show_shadows = false
+transparency = false

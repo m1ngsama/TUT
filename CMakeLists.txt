@@ -1,171 +1,314 @@
-cmake_minimum_required(VERSION 3.15)
-project(TUT VERSION 2.0.0 LANGUAGES CXX)
+# CMakeLists.txt
+# TUT - Terminal UI Textual Browser
+# https://github.com/m1ngsama/TUT
 
-# C++17标准
+cmake_minimum_required(VERSION 3.20)
+project(TUT
+    VERSION 0.1.0
+    DESCRIPTION "Terminal UI Textual Browser with btop-style interface"
+    HOMEPAGE_URL "https://github.com/m1ngsama/TUT"
+    LANGUAGES CXX
+)
+
+# ============================================================================
+# C++ 标准配置
+# ============================================================================
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 导出编译命令 (用于 clangd 等工具)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ============================================================================
+# 构建选项
+# ============================================================================
+option(TUT_STATIC_BUILD "Build static binary" OFF)
+option(TUT_BUILD_TESTS "Build tests" ON)
+option(TUT_BUILD_BENCHMARKS "Build benchmarks" OFF)
+option(TUT_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(TUT_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+
+# 构建类型
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# ============================================================================
 # 编译选项
+# ============================================================================
+# 基础警告选项
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-# macOS: Use Homebrew ncurses if available
-if(APPLE)
-    set(CMAKE_PREFIX_PATH "/opt/homebrew/opt/ncurses" ${CMAKE_PREFIX_PATH})
+# Debug 和 Release 特定选项
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+
+# Sanitizers
+if(TUT_ENABLE_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
 endif()
 
-# 查找依赖库
-find_package(CURL REQUIRED)
-find_package(Curses REQUIRED)
+if(TUT_ENABLE_UBSAN)
+    add_compile_options(-fsanitize=undefined)
+    add_link_options(-fsanitize=undefined)
+endif()
+
+# 静态链接选项
+if(TUT_STATIC_BUILD)
+    if(NOT APPLE)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+    endif()
+    set(BUILD_SHARED_LIBS OFF)
+endif()
+
+# ============================================================================
+# 依赖管理 (优先使用系统包，回退到 FetchContent)
+# ============================================================================
+include(FetchContent)
+set(FETCHCONTENT_QUIET OFF)
+
+# ------------------------------------------------------------------------------
+# FTXUI - TUI 框架
+# macOS: brew install ftxui
+# ------------------------------------------------------------------------------
+find_package(ftxui CONFIG QUIET)
+if(NOT ftxui_FOUND)
+    message(STATUS "FTXUI not found, using FetchContent...")
+    FetchContent_Declare(
+        ftxui
+        GIT_REPOSITORY https://github.com/ArthurSonzogni/ftxui
+        GIT_TAG v5.0.0
+        GIT_SHALLOW TRUE
+    )
+    set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(ftxui)
+else()
+    message(STATUS "Found FTXUI: ${ftxui_DIR}")
+endif()
+
+# ------------------------------------------------------------------------------
+# cpp-httplib - HTTP 客户端 (Header-only)
+# macOS: brew install cpp-httplib
+# ------------------------------------------------------------------------------
+find_package(httplib CONFIG QUIET)
+if(NOT httplib_FOUND)
+    message(STATUS "cpp-httplib not found, using FetchContent...")
+    FetchContent_Declare(
+        httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib
+        GIT_TAG v0.14.3
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(httplib)
+else()
+    message(STATUS "Found cpp-httplib: ${httplib_DIR}")
+endif()
+
+# ------------------------------------------------------------------------------
+# toml11 - TOML 配置解析 (Header-only)
+# macOS: brew install toml11
+# ------------------------------------------------------------------------------
+find_package(toml11 CONFIG QUIET)
+if(NOT toml11_FOUND)
+    message(STATUS "toml11 not found, using FetchContent...")
+    FetchContent_Declare(
+        toml11
+        GIT_REPOSITORY https://github.com/ToruNiina/toml11
+        GIT_TAG v3.8.1
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(toml11)
+else()
+    message(STATUS "Found toml11: ${toml11_DIR}")
+endif()
+
+# ------------------------------------------------------------------------------
+# gumbo-parser - HTML 解析器 (需要系统安装)
+# macOS: brew install gumbo-parser
+# Linux: apt install libgumbo-dev
+# ------------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GUMBO REQUIRED gumbo)
 
-# 包含目录
-include_directories(
+# ------------------------------------------------------------------------------
+# OpenSSL - HTTPS 支持 (用于 cpp-httplib)
+# ------------------------------------------------------------------------------
+find_package(OpenSSL REQUIRED)
+
+# ------------------------------------------------------------------------------
+# 线程库
+# ------------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+
+# ============================================================================
+# 版本信息生成
+# ============================================================================
+configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/version.hpp.in"
+    "${CMAKE_BINARY_DIR}/include/tut/version.hpp"
+    @ONLY
+)
+
+# ============================================================================
+# 源文件列表
+# ============================================================================
+set(TUT_CORE_SOURCES
+    src/core/browser_engine.cpp
+    src/core/url_parser.cpp
+    src/core/http_client.cpp
+)
+
+set(TUT_UI_SOURCES
+    src/ui/main_window.cpp
+    src/ui/address_bar.cpp
+    src/ui/content_view.cpp
+    src/ui/bookmark_panel.cpp
+    src/ui/status_bar.cpp
+)
+
+set(TUT_RENDERER_SOURCES
+    src/renderer/html_renderer.cpp
+    src/renderer/text_formatter.cpp
+    src/renderer/style_parser.cpp
+)
+
+set(TUT_UTILS_SOURCES
+    src/utils/logger.cpp
+    src/utils/config.cpp
+    src/utils/theme.cpp
+)
+
+set(TUT_ALL_SOURCES
+    ${TUT_CORE_SOURCES}
+    ${TUT_UI_SOURCES}
+    ${TUT_RENDERER_SOURCES}
+    ${TUT_UTILS_SOURCES}
+)
+
+# ============================================================================
+# TUT 核心库 (用于测试复用)
+# ============================================================================
+add_library(tut_lib STATIC ${TUT_ALL_SOURCES})
+
+target_include_directories(tut_lib PUBLIC
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/src/render
-    ${CMAKE_SOURCE_DIR}/src/utils
-    ${CURL_INCLUDE_DIRS}
-    ${CURSES_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
     ${GUMBO_INCLUDE_DIRS}
 )
 
-# ==================== TUT 主程序 ====================
-
-add_executable(tut
-    src/main.cpp
-    src/browser.cpp
-    src/http_client.cpp
-    src/input_handler.cpp
-    src/bookmark.cpp
-    src/history.cpp
-    src/render/terminal.cpp
-    src/render/renderer.cpp
-    src/render/layout.cpp
-    src/render/image.cpp
-    src/utils/unicode.cpp
-    src/dom_tree.cpp
-    src/html_parser.cpp
-)
-
-target_link_directories(tut PRIVATE
+target_link_directories(tut_lib PUBLIC
     ${GUMBO_LIBRARY_DIRS}
 )
 
-target_link_libraries(tut
-    ${CURSES_LIBRARIES}
-    CURL::libcurl
+target_link_libraries(tut_lib PUBLIC
+    ftxui::screen
+    ftxui::dom
+    ftxui::component
+    httplib::httplib
+    toml11::toml11
     ${GUMBO_LIBRARIES}
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
 )
 
-# ==================== 测试程序 ====================
+# ============================================================================
+# TUT 可执行文件
+# ============================================================================
+add_executable(tut src/main.cpp)
 
-# Terminal 测试
-add_executable(test_terminal
-    src/render/terminal.cpp
-    tests/test_terminal.cpp
+target_link_libraries(tut PRIVATE tut_lib)
+
+# ============================================================================
+# 安装规则
+# ============================================================================
+include(GNUInstallDirs)
+
+install(TARGETS tut
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-target_link_libraries(test_terminal
-    ${CURSES_LIBRARIES}
+install(DIRECTORY assets/themes/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/tut/themes
+    OPTIONAL
 )
 
-# Renderer 测试
-add_executable(test_renderer
-    src/render/terminal.cpp
-    src/render/renderer.cpp
-    src/utils/unicode.cpp
-    tests/test_renderer.cpp
+install(DIRECTORY assets/keybindings/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/tut/keybindings
+    OPTIONAL
 )
 
-target_link_libraries(test_renderer
-    ${CURSES_LIBRARIES}
-)
+# ============================================================================
+# 测试
+# ============================================================================
+if(TUT_BUILD_TESTS)
+    enable_testing()
 
-# Layout 测试
-add_executable(test_layout
-    src/render/terminal.cpp
-    src/render/renderer.cpp
-    src/render/layout.cpp
-    src/render/image.cpp
-    src/utils/unicode.cpp
-    src/dom_tree.cpp
-    src/html_parser.cpp
-    tests/test_layout.cpp
-)
+    # Google Test
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest
+        GIT_TAG v1.14.0
+        GIT_SHALLOW TRUE
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
 
-target_link_directories(test_layout PRIVATE
-    ${GUMBO_LIBRARY_DIRS}
-)
+    # 添加测试子目录
+    add_subdirectory(tests)
+endif()
 
-target_link_libraries(test_layout
-    ${CURSES_LIBRARIES}
-    ${GUMBO_LIBRARIES}
-)
+# ============================================================================
+# 打包配置 (CPack)
+# ============================================================================
+set(CPACK_PACKAGE_NAME "tut")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY ${PROJECT_DESCRIPTION})
+set(CPACK_PACKAGE_VENDOR "m1ngsama")
+set(CPACK_PACKAGE_CONTACT "m1ngsama")
+set(CPACK_PACKAGE_HOMEPAGE_URL ${PROJECT_HOMEPAGE_URL})
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_SOURCE_DIR}/README.md")
 
-# HTTP 异步测试
-add_executable(test_http_async
-    src/http_client.cpp
-    tests/test_http_async.cpp
-)
+# 打包格式
+set(CPACK_GENERATOR "TGZ;ZIP")
+if(APPLE)
+    list(APPEND CPACK_GENERATOR "DragNDrop")
+elseif(UNIX)
+    list(APPEND CPACK_GENERATOR "DEB;RPM")
+endif()
 
-target_link_libraries(test_http_async
-    CURL::libcurl
-)
+# Debian 包配置
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libgumbo1, libssl1.1 | libssl3")
+set(CPACK_DEBIAN_PACKAGE_SECTION "web")
 
-# HTML 解析测试
-add_executable(test_html_parse
-    src/html_parser.cpp
-    src/dom_tree.cpp
-    tests/test_html_parse.cpp
-)
+# RPM 包配置
+set(CPACK_RPM_PACKAGE_REQUIRES "gumbo-parser, openssl-libs")
+set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
 
-target_link_directories(test_html_parse PRIVATE
-    ${GUMBO_LIBRARY_DIRS}
-)
+include(CPack)
 
-target_link_libraries(test_html_parse
-    ${GUMBO_LIBRARIES}
-)
-
-# 书签测试
-add_executable(test_bookmark
-    src/bookmark.cpp
-    tests/test_bookmark.cpp
-)
-
-# 历史记录测试
-add_executable(test_history
-    src/history.cpp
-    tests/test_history.cpp
-)
-
-# 异步图片下载测试
-add_executable(test_async_images
-    src/http_client.cpp
-    tests/test_async_images.cpp
-)
-
-target_link_libraries(test_async_images
-    CURL::libcurl
-)
-
-# 简单图片测试
-add_executable(test_simple_image
-    src/http_client.cpp
-    tests/test_simple_image.cpp
-)
-
-target_link_libraries(test_simple_image
-    CURL::libcurl
-)
-
-# 最小图片测试
-add_executable(test_image_minimal
-    src/http_client.cpp
-    tests/test_image_minimal.cpp
-)
-
-target_link_libraries(test_image_minimal
-    CURL::libcurl
-)
+# ============================================================================
+# 构建信息摘要
+# ============================================================================
+message(STATUS "")
+message(STATUS "========== TUT Build Configuration ==========")
+message(STATUS "Version:          ${PROJECT_VERSION}")
+message(STATUS "Build type:       ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ Standard:     ${CMAKE_CXX_STANDARD}")
+message(STATUS "C++ Compiler:     ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "Static build:     ${TUT_STATIC_BUILD}")
+message(STATUS "Build tests:      ${TUT_BUILD_TESTS}")
+message(STATUS "Build benchmarks: ${TUT_BUILD_BENCHMARKS}")
+message(STATUS "ASAN enabled:     ${TUT_ENABLE_ASAN}")
+message(STATUS "UBSAN enabled:    ${TUT_ENABLE_UBSAN}")
+message(STATUS "Install prefix:   ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "==============================================")
+message(STATUS "")
