@@ -82,6 +82,7 @@ cmake --build build -j$(nproc)
 | `g` | Go to top |
 | `G` | Go to bottom |
 | `Backspace` | Go back |
+| `f` | Go forward |
 
 ### Links
 | Key | Action |

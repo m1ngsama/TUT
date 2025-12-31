@@ -309,6 +309,12 @@ int MainWindow::run() {
             }
             return true;
         }
+        if (event == Event::Character('f') && impl_->can_go_forward_) {
+            if (impl_->on_event_) {
+                impl_->on_event_(WindowEvent::Forward);
+            }
+            return true;
+        }
 
         // Refresh
         if (event == Event::Character('r') || event == Event::F5) {

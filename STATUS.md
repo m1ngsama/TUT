@@ -34,7 +34,7 @@
   - **Content Scrolling** - j/k, g/G, Space/b for navigation
   - **Link Navigation** - Tab, number keys (1-9), Enter to follow
   - **Address Bar** - 'o' to open, type URL, Enter to navigate
-  - **Browser Controls** - Backspace to go back, r/F5 to refresh
+  - **Browser Controls** - Backspace to go back, 'f' to go forward, r/F5 to refresh
   - **Real-time Status** - Load stats, scroll position, selected link
   - **Visual Feedback** - Navigation button states, link highlighting
 
@@ -63,10 +63,6 @@
   - n/N navigation not working
   - No highlight of matches
 
-- ⚠️ **Forward Navigation** - Not yet wired up
-  - Forward button shows but doesn't work
-  - Engine supports it, just needs UI connection
-
 ### Feature Gaps
 - ⚠️ No form support (input fields, buttons, etc.)
 - ⚠️ No image rendering (even ASCII art)
@@ -75,13 +71,7 @@
 
 ## 🎯 Next Steps Priority
 
-### Phase 1: Polish Interactive Features (High Priority)
-
-1. **Wire Up Forward Navigation** (src/main.cpp)
-   - Connect forward button click to engine.goForward()
-   - Add keyboard shortcut (maybe Shift+Backspace or Alt+→)
-
-### Phase 2: Enhanced UX (Medium Priority)
+### Phase 1: Enhanced UX (High Priority)
 4. **Implement Search** (src/ui/content_view.cpp)
    - Add / to start search
    - Highlight matches
@@ -131,6 +121,7 @@ Interactive test:
 ✅ Press '1' to jump to link 1 - WORKS
 ✅ Enter to follow link - WORKS
 ✅ Backspace to go back - WORKS
+✅ 'f' to go forward - WORKS
 ✅ 'r' to refresh - WORKS
 ✅ 'o' to open address bar - WORKS
 ```

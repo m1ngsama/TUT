@@ -49,6 +49,7 @@ void printHelp(const char* prog_name) {
               << "  Shift+Tab    Previous link\n"
               << "  Enter        Follow link\n"
               << "  Backspace    Go back\n"
+              << "  f            Go forward\n"
               << "  /            Search in page\n"
               << "  n/N          Next/previous search result\n"
               << "  Ctrl+L       Focus address bar\n"

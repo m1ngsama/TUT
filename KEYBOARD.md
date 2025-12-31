@@ -7,6 +7,7 @@
 |-----|--------|
 | `o` | Open address bar (type URL and press Enter) |
 | `Backspace` | Go back |
+| `f` | Go forward |
 | `r` or `F5` | Refresh current page |
 | `q` or `Esc` or `F10` | Quit browser |
 
@@ -95,7 +96,6 @@
 ## 🐛 Known Limitations
 
 - Ctrl+L not yet working for address bar (use 'o' instead)
-- Forward navigation not yet implemented
 - No search functionality yet (/ key)
 - No bookmarks yet (Ctrl+D)
 - No history panel yet (F3)
