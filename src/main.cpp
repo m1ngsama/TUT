@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <chrono>
 
 #include "tut/version.hpp"
 #include "core/browser_engine.hpp"
@@ -138,16 +139,152 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "Navigating to: " << url;
             window.setLoading(true);
 
+            auto start_time = std::chrono::steady_clock::now();
+
             if (engine.loadUrl(url)) {
+                auto end_time = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(end_time - start_time).count();
+
+                // Update window content
                 window.setTitle(engine.getTitle());
                 window.setContent(engine.getRenderedContent());
                 window.setUrl(url);
+
+                // Convert LinkInfo to DisplayLink
+                std::vector<DisplayLink> display_links;
+                for (const auto& link : engine.extractLinks()) {
+                    DisplayLink dl;
+                    dl.text = link.text;
+                    dl.url = link.url;
+                    dl.visited = false;
+                    display_links.push_back(dl);
+                }
+                window.setLinks(display_links);
+
+                // Update navigation state
+                window.setCanGoBack(engine.canGoBack());
+                window.setCanGoForward(engine.canGoForward());
+
+                // Update stats (assuming response body size)
+                size_t content_size = engine.getRenderedContent().size();
+                window.setLoadStats(elapsed, content_size, static_cast<int>(display_links.size()));
+
                 window.setStatusMessage("Loaded: " + url);
             } else {
                 window.setStatusMessage("Failed to load: " + url);
             }
 
             window.setLoading(false);
+        });
+
+        // 设置链接点击回调
+        window.onLinkClick([&engine, &window](int index) {
+            auto links = engine.extractLinks();
+            if (index >= 0 && index < static_cast<int>(links.size())) {
+                const std::string& link_url = links[index].url;
+                LOG_INFO << "Following link [" << index + 1 << "]: " << link_url;
+
+                // Trigger navigation
+                window.setLoading(true);
+
+                auto start_time = std::chrono::steady_clock::now();
+
+                if (engine.loadUrl(link_url)) {
+                    auto end_time = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(end_time - start_time).count();
+
+                    window.setTitle(engine.getTitle());
+                    window.setContent(engine.getRenderedContent());
+                    window.setUrl(link_url);
+
+                    // Convert LinkInfo to DisplayLink
+                    std::vector<DisplayLink> display_links;
+                    for (const auto& link : engine.extractLinks()) {
+                        DisplayLink dl;
+                        dl.text = link.text;
+                        dl.url = link.url;
+                        dl.visited = false;
+                        display_links.push_back(dl);
+                    }
+                    window.setLinks(display_links);
+
+                    window.setCanGoBack(engine.canGoBack());
+                    window.setCanGoForward(engine.canGoForward());
+
+                    size_t content_size = engine.getRenderedContent().size();
+                    window.setLoadStats(elapsed, content_size, static_cast<int>(display_links.size()));
+
+                    window.setStatusMessage("Loaded: " + link_url);
+                } else {
+                    window.setStatusMessage("Failed to load: " + link_url);
+                }
+
+                window.setLoading(false);
+            }
+        });
+
+        // 设置窗口事件回调
+        window.onEvent([&engine, &window](WindowEvent event) {
+            switch (event) {
+                case WindowEvent::Back:
+                    if (engine.goBack()) {
+                        window.setTitle(engine.getTitle());
+                        window.setContent(engine.getRenderedContent());
+                        window.setUrl(engine.getCurrentUrl());
+
+                        std::vector<DisplayLink> display_links;
+                        for (const auto& link : engine.extractLinks()) {
+                            DisplayLink dl;
+                            dl.text = link.text;
+                            dl.url = link.url;
+                            dl.visited = false;
+                            display_links.push_back(dl);
+                        }
+                        window.setLinks(display_links);
+
+                        window.setCanGoBack(engine.canGoBack());
+                        window.setCanGoForward(engine.canGoForward());
+                    }
+                    break;
+                case WindowEvent::Forward:
+                    if (engine.goForward()) {
+                        window.setTitle(engine.getTitle());
+                        window.setContent(engine.getRenderedContent());
+                        window.setUrl(engine.getCurrentUrl());
+
+                        std::vector<DisplayLink> display_links;
+                        for (const auto& link : engine.extractLinks()) {
+                            DisplayLink dl;
+                            dl.text = link.text;
+                            dl.url = link.url;
+                            dl.visited = false;
+                            display_links.push_back(dl);
+                        }
+                        window.setLinks(display_links);
+
+                        window.setCanGoBack(engine.canGoBack());
+                        window.setCanGoForward(engine.canGoForward());
+                    }
+                    break;
+                case WindowEvent::Refresh:
+                    if (engine.refresh()) {
+                        window.setTitle(engine.getTitle());
+                        window.setContent(engine.getRenderedContent());
+
+                        std::vector<DisplayLink> display_links;
+                        for (const auto& link : engine.extractLinks()) {
+                            DisplayLink dl;
+                            dl.text = link.text;
+                            dl.url = link.url;
+                            dl.visited = false;
+                            display_links.push_back(dl);
+                        }
+                        window.setLinks(display_links);
+                    }
+                    break;
+                default:
+                    break;
+            }
         });
 
         // 初始化窗口
@@ -162,6 +299,18 @@ int main(int argc, char* argv[]) {
             window.setUrl(initial_url);
             window.setTitle(engine.getTitle());
             window.setContent(engine.getRenderedContent());
+
+            std::vector<DisplayLink> display_links;
+            for (const auto& link : engine.extractLinks()) {
+                DisplayLink dl;
+                dl.text = link.text;
+                dl.url = link.url;
+                dl.visited = false;
+                display_links.push_back(dl);
+            }
+            window.setLinks(display_links);
+            window.setCanGoBack(engine.canGoBack());
+            window.setCanGoForward(engine.canGoForward());
         } else {
             window.setUrl("about:blank");
             window.setTitle("TUT - Terminal UI Textual Browser");
