@@ -11,10 +11,9 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include "../core/types.hpp"
 
 namespace tut {
-
-struct LinkInfo;
 
 /**
  * @brief 内容视图组件类

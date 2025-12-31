@@ -10,10 +10,9 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include "../core/types.hpp"
 
 namespace tut {
-
-struct LinkInfo;
 
 /**
  * @brief 渲染选项
