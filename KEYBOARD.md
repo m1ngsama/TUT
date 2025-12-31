@@ -60,6 +60,18 @@
 # 4. Press 'Esc' to cancel
 ```
 
+### In-Page Search
+```bash
+# Search for text on current page
+# 1. Press '/' to open search bar
+# 2. Type your search query (case-insensitive)
+# 3. Press 'Enter' to find all matches
+# 4. Press 'n' to go to next match
+# 5. Press 'N' to go to previous match
+# 6. Matches are highlighted (yellow = current, blue = other matches)
+# 7. Status bar shows "Match X/Y" count
+```
+
 ## 🎨 UI Elements
 
 ### Top Bar
@@ -93,16 +105,22 @@
 4. **Efficient Browsing**: Use `g` to jump to top, `G` to jump to bottom
 5. **Address Bar**: Type `o` quickly to enter a new URL
 
+### Search
+| Key | Action |
+|-----|--------|
+| `/` | Start search (type query and press Enter) |
+| `n` | Next search result |
+| `N` | Previous search result |
+| `Esc` | Cancel search |
+
 ## 🐛 Known Limitations
 
 - Ctrl+L not yet working for address bar (use 'o' instead)
-- No search functionality yet (/ key)
 - No bookmarks yet (Ctrl+D)
 - No history panel yet (F3)
 
 ## 🚀 Coming Soon
 
-- [ ] In-page search (`/` to search, `n`/`N` to navigate results)
 - [ ] Bookmarks (add, remove, list)
 - [ ] History (view and navigate)
 - [ ] Better link highlighting

@@ -35,8 +35,9 @@
   - **Link Navigation** - Tab, number keys (1-9), Enter to follow
   - **Address Bar** - 'o' to open, type URL, Enter to navigate
   - **Browser Controls** - Backspace to go back, 'f' to go forward, r/F5 to refresh
-  - **Real-time Status** - Load stats, scroll position, selected link
-  - **Visual Feedback** - Navigation button states, link highlighting
+  - **In-Page Search** - '/' to search, n/N to navigate results, highlighted matches
+  - **Real-time Status** - Load stats, scroll position, selected link, search results
+  - **Visual Feedback** - Navigation button states, link highlighting, search highlighting
 
 ### Build & Deployment
 - ✅ Binary size: **827KB** (well under 1MB target!)
@@ -58,11 +59,6 @@
   - No visual history panel (F3)
   - No persistence across sessions
 
-- ⚠️ **Search** - Not implemented
-  - / search command not working
-  - n/N navigation not working
-  - No highlight of matches
-
 ### Feature Gaps
 - ⚠️ No form support (input fields, buttons, etc.)
 - ⚠️ No image rendering (even ASCII art)
@@ -72,18 +68,14 @@
 ## 🎯 Next Steps Priority
 
 ### Phase 1: Enhanced UX (High Priority)
-4. **Implement Search** (src/ui/content_view.cpp)
-   - Add / to start search
-   - Highlight matches
-   - n/N to navigate results
 
-5. **Add Bookmark System** (new files)
+1. **Add Bookmark System** (new files)
    - Implement bookmark storage (JSON file)
    - Create bookmark panel UI
    - Add Ctrl+D to bookmark
    - F2 to view bookmarks
 
-6. **Add History** (new files)
+2. **Add History** (new files)
    - Implement history storage (JSON file)
    - Create history panel UI
    - F3 to view history
@@ -122,6 +114,8 @@ Interactive test:
 ✅ Enter to follow link - WORKS
 ✅ Backspace to go back - WORKS
 ✅ 'f' to go forward - WORKS
+✅ '/' to search - WORKS
+✅ 'n'/'N' to navigate search results - WORKS
 ✅ 'r' to refresh - WORKS
 ✅ 'o' to open address bar - WORKS
 ```
