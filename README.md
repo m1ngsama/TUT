@@ -1,272 +1,201 @@
-TUT(1) - Terminal User Interface Browser
-========================================
+# TUT - Terminal UI Textual Browser
 
-NAME
-----
-tut - vim-style terminal web browser
+A lightweight, high-performance terminal browser with a btop-style interface.
 
-SYNOPSIS
---------
-**tut** [*URL*]
+![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![C++](https://img.shields.io/badge/C%2B%2B-17-orange)
 
-**tut** **-h** | **--help**
+## Features
 
-DESCRIPTION
------------
-**tut** is a text-mode web browser designed for comfortable reading in the
-terminal. It extracts and displays the textual content of web pages with a
-clean, centered layout optimized for reading, while providing vim-style
-keyboard navigation.
+- **btop-style UI** - Modern four-panel layout with rounded borders
+- **Lightweight** - Binary size < 1MB, memory usage < 50MB
+- **Fast startup** - Launch in < 500ms
+- **Vim-style navigation** - j/k scrolling, / search, g/G jump
+- **Keyboard-driven** - Full keyboard navigation with function key shortcuts
+- **Themeable** - Multiple color themes (default, nord, gruvbox, solarized)
+- **Configurable** - TOML-based configuration
 
-The browser does not execute JavaScript or display images. It is designed
-for reading static HTML content, documentation, and text-heavy websites.
+## Screenshot
 
-OPTIONS
--------
-*URL*
-    Open the specified URL on startup. If omitted, displays the built-in
-    help page.
+```
+╭──────────────────────────────────────────────────────────────────────────────╮
+│[◀] [▶] [⟳] ╭────────────────────────────────────────────────────────╮ [⚙] [?]│
+│           │https://example.com                                      │        │
+│           ╰────────────────────────────────────────────────────────╯        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                          Example Domain                                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│This domain is for use in illustrative examples in documents.                 │
+│                                                                              │
+│[1] More information...                                                       │
+│                                                                              │
+├────────────────────────────────────────┬─────────────────────────────────────┤
+│📑 Bookmarks                            │📊 Status                            │
+│  example.com                           │  ⬇ 1.2 KB  🕐 0.3s                  │
+├────────────────────────────────────────┴─────────────────────────────────────┤
+│[F1]Help [F2]Bookmarks [F3]History [F10]Quit                                  │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
 
-**-h**, **--help**
-    Display usage information and exit.
+## Installation
 
-KEYBINDINGS
------------
-**tut** uses vim-style keybindings throughout.
-
-### Navigation
-
-**j**, **Down**
-    Scroll down one line.
-
-**k**, **Up**
-    Scroll up one line.
-
-**Ctrl-D**, **Space**
-    Scroll down one page.
-
-**Ctrl-U**, **b**
-    Scroll up one page.
-
-**gg**
-    Jump to top of page.
-
-**G**
-    Jump to bottom of page.
-
-**[***count***]G**
-    Jump to line *count* (e.g., **50G** jumps to line 50).
-
-**[***count***]j**, **[***count***]k**
-    Scroll down/up *count* lines (e.g., **5j** scrolls down 5 lines).
-
-### Link Navigation
-
-**Tab**
-    Move to next link.
-
-**Shift-Tab**, **T**
-    Move to previous link.
-
-**Enter**
-    Follow current link.
-
-**h**, **Left**
-    Go back in history.
-
-**l**, **Right**
-    Go forward in history.
-
-### Search
-
-**/**
-    Start search. Enter search term and press **Enter**.
-
-**n**
-    Jump to next search match.
-
-**N**
-    Jump to previous search match.
-
-### Marks
-
-**m***[a-z]*
-    Set mark at current position (e.g., **ma**, **mb**).
-
-**'***[a-z]*
-    Jump to mark (e.g., **'a**, **'b**).
-
-### Mouse
-
-**Left Click**
-    Click on links to follow them directly.
-
-**Scroll Wheel Up/Down**
-    Scroll page up or down.
-
-Works with most modern terminal emulators that support mouse events.
-
-### Commands
-
-Press **:** to enter command mode. Available commands:
-
-**:q**, **:quit**
-    Quit the browser.
-
-**:o** *URL*, **:open** *URL*
-    Open *URL*.
-
-**:r**, **:refresh**
-    Reload current page.
-
-**:h**, **:help**
-    Display help page.
-
-**:***number*
-    Jump to line *number*.
-
-### Other
-
-**r**
-    Reload current page.
-
-**q**
-    Quit the browser.
-
-**?**
-    Display help page.
-
-**ESC**
-    Cancel command or search input.
-
-LIMITATIONS
------------
-**tut** does not execute JavaScript. Modern single-page applications (SPAs)
-built with React, Vue, Angular, or similar frameworks will not work correctly,
-as they require JavaScript to render content.
-
-To determine if a site will work with **tut**, use:
-
-    curl https://example.com | less
-
-If you can see the actual content in the HTML source, the site will work.
-If you only see JavaScript code or empty div elements, it will not.
-
-Additionally:
-- No image display
-- No CSS layout support
-- No AJAX or dynamic content loading
-
-EXAMPLES
---------
-View the built-in help:
-
-    tut
-
-Browse Hacker News:
-
-    tut https://news.ycombinator.com
-
-Read Wikipedia:
-
-    tut https://en.wikipedia.org/wiki/Unix_philosophy
-
-Open a URL, search for "unix", and navigate:
-
-    tut https://example.com
-    /unix<Enter>
-    n
-
-DEPENDENCIES
-------------
-- ncurses or ncursesw (for terminal UI)
-- libcurl (for HTTPS support)
-- CMake >= 3.15 (build time)
-- C++17 compiler (build time)
-
-INSTALLATION
-------------
-### From Source
+### Prerequisites
 
 **macOS (Homebrew):**
-
-    brew install cmake ncurses curl
-    mkdir -p build && cd build
-    cmake ..
-    cmake --build .
-    sudo install -m 755 tut /usr/local/bin/
+```bash
+brew install cmake gumbo-parser openssl ftxui cpp-httplib toml11
+```
 
 **Linux (Debian/Ubuntu):**
+```bash
+sudo apt install cmake libgumbo-dev libssl-dev
+```
 
-    sudo apt-get install cmake libncursesw5-dev libcurl4-openssl-dev
-    mkdir -p build && cd build
-    cmake ..
-    cmake --build .
-    sudo install -m 755 tut /usr/local/bin/
+### Building from Source
 
-**Linux (Fedora/RHEL):**
+```bash
+git clone https://github.com/m1ngsama/TUT.git
+cd TUT
+cmake -B build -DCMAKE_PREFIX_PATH=/opt/homebrew  # macOS
+cmake -B build                                      # Linux
+cmake --build build -j$(nproc)
+```
 
-    sudo dnf install cmake gcc-c++ ncurses-devel libcurl-devel
-    mkdir -p build && cd build
-    cmake ..
-    cmake --build .
-    sudo install -m 755 tut /usr/local/bin/
+### Running
 
-### Using Makefile
+```bash
+./build/tut                      # Start with blank page
+./build/tut https://example.com  # Open URL directly
+./build/tut --help               # Show help
+```
 
-    make
-    sudo make install
+## Keyboard Shortcuts
 
-FILES
------
-No configuration files are used. The browser is stateless and does not
-store history, cookies, or cache.
+### Navigation
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Scroll down |
+| `k` / `↑` | Scroll up |
+| `Space` | Page down |
+| `b` | Page up |
+| `g` | Go to top |
+| `G` | Go to bottom |
+| `Backspace` | Go back |
 
-ENVIRONMENT
------------
-**tut** respects the following environment variables:
+### Links
+| Key | Action |
+|-----|--------|
+| `Tab` | Next link |
+| `Shift+Tab` | Previous link |
+| `Enter` | Follow link |
+| `1-9` | Jump to link by number |
 
-**TERM**
-    Terminal type. Must support basic cursor movement and colors.
+### Search
+| Key | Action |
+|-----|--------|
+| `/` | Start search |
+| `n` | Next result |
+| `N` | Previous result |
 
-**LINES**, **COLUMNS**
-    Terminal size. Automatically detected via ncurses.
+### UI
+| Key | Action |
+|-----|--------|
+| `Ctrl+L` | Focus address bar |
+| `F1` / `?` | Help |
+| `F2` | Bookmarks |
+| `F3` | History |
+| `Ctrl+D` | Add bookmark |
+| `Ctrl+Q` / `F10` / `q` | Quit |
 
-EXIT STATUS
------------
-**0**
-    Success.
+## Configuration
 
-**1**
-    Error occurred (e.g., invalid URL, network error, ncurses initialization
-    failure).
+Configuration files are stored in `~/.config/tut/`:
 
-PHILOSOPHY
-----------
-**tut** follows the Unix philosophy:
+```
+~/.config/tut/
+├── config.toml      # Main configuration
+└── themes/          # Custom themes
+    └── mytheme.toml
+```
 
-1. Do one thing well: display and navigate text content from the web.
-2. Work with other programs: output can be piped, URLs can come from stdin.
-3. Simple and minimal: no configuration files, no persistent state.
-4. Text-focused: everything is text, processed and displayed cleanly.
+### Example config.toml
 
-The design emphasizes keyboard efficiency, clean output, and staying out
-of your way.
+```toml
+[general]
+theme = "default"
+homepage = "https://example.com"
+debug = false
 
-SEE ALSO
---------
-lynx(1), w3m(1), curl(1), vim(1)
+[browser]
+timeout = 30
+user_agent = "TUT/0.1.0"
 
-BUGS
-----
-Report bugs at: https://github.com/m1ngsama/TUT/issues
+[ui]
+word_wrap = true
+show_images = true
+```
 
-AUTHORS
--------
-m1ngsama <contact@m1ng.space>
+## Project Structure
 
-Inspired by lynx, w3m, and vim.
+```
+TUT/
+├── CMakeLists.txt          # Build configuration
+├── README.md               # This file
+├── LICENSE                 # MIT License
+├── cmake/                  # CMake modules
+│   └── version.hpp.in
+├── src/                    # Source code
+│   ├── main.cpp           # Entry point
+│   ├── core/              # Browser engine, HTTP, URL parsing
+│   ├── ui/                # FTXUI components
+│   ├── renderer/          # HTML rendering
+│   └── utils/             # Logger, config, themes
+├── tests/                  # Unit and integration tests
+│   ├── unit/
+│   └── integration/
+└── assets/                 # Default configurations
+    ├── config.toml
+    ├── themes/
+    └── keybindings/
+```
 
-LICENSE
--------
-MIT License. See LICENSE file for details.
+## Dependencies
+
+| Library | Purpose | Version |
+|---------|---------|---------|
+| [FTXUI](https://github.com/ArthurSonzogni/ftxui) | Terminal UI framework | 5.0+ |
+| [cpp-httplib](https://github.com/yhirose/cpp-httplib) | HTTP client | 0.14+ |
+| [gumbo-parser](https://github.com/google/gumbo-parser) | HTML parsing | 0.10+ |
+| [toml11](https://github.com/ToruNiina/toml11) | TOML configuration | 3.8+ |
+| [OpenSSL](https://www.openssl.org/) | HTTPS support | 1.1+ |
+
+## Limitations
+
+- **No JavaScript** - SPAs and dynamic content won't work
+- **No CSS layout** - Only basic text formatting
+- **No images** - ASCII art rendering planned for future
+- **Text-only** - Focused on readable content
+
+## Contributing
+
+Contributions are welcome! Please read the coding style guidelines:
+
+- C++17 standard
+- Google C++ Style Guide
+- Use `.hpp` for headers, `.cpp` for implementation
+- All public APIs must have documentation comments
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## Authors
+
+- **m1ngsama** - [GitHub](https://github.com/m1ngsama)
+
+## Acknowledgments
+
+- Inspired by [btop](https://github.com/aristocratos/btop) for UI design
+- [FTXUI](https://github.com/ArthurSonzogni/ftxui) for the amazing TUI framework
+- [lynx](https://lynx.invisible-island.net/) and [w3m](http://w3m.sourceforge.net/) for inspiration
