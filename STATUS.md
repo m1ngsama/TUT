@@ -37,6 +37,7 @@
   - **Browser Controls** - Backspace to go back, 'f' to go forward, r/F5 to refresh
   - **In-Page Search** - '/' to search, n/N to navigate results, highlighted matches
   - **Bookmark System** - Ctrl+D to add/remove, F2 to toggle panel, JSON persistence
+  - **History System** - Auto-record visits, F3 to toggle panel, updates on revisit, JSON persistence
   - **Real-time Status** - Load stats, scroll position, selected link, search results
   - **Visual Feedback** - Navigation button states, link highlighting, search highlighting
 
@@ -49,12 +50,6 @@
 
 ## ⚠️ Known Limitations
 
-### UI Components (Not Yet Fully Implemented)
-- ⚠️ **History Panel** - Backend works, UI not implemented
-  - Back navigation works with Backspace
-  - No visual history panel (F3)
-  - No persistence across sessions
-
 ### Feature Gaps
 - ⚠️ No form support (input fields, buttons, etc.)
 - ⚠️ No image rendering (even ASCII art)
@@ -63,27 +58,19 @@
 
 ## 🎯 Next Steps Priority
 
-### Phase 1: Enhanced UX (High Priority)
-
-1. **Add History** (new files)
-   - Implement history storage (JSON file)
-   - Create history panel UI
-   - F3 to view history
-   - Auto-record visited pages
-
-### Phase 3: Advanced Features (Low Priority)
-7. **Improve Rendering**
+### Phase 2: Advanced Features (Medium Priority)
+1. **Improve Rendering**
    - Better word wrapping
    - Table rendering
    - Code block formatting
    - Better list indentation
 
-8. **Add Form Support**
+2. **Add Form Support**
    - Input field rendering
    - Button rendering
    - Form submission
 
-9. **Add Image Support**
+3. **Add Image Support**
    - ASCII art rendering
    - Image-to-text conversion
 
@@ -108,6 +95,8 @@ Interactive test:
 ✅ 'n'/'N' to navigate search results - WORKS
 ✅ Ctrl+D to add/remove bookmark - WORKS
 ✅ F2 to toggle bookmark panel - WORKS
+✅ F3 to toggle history panel - WORKS
+✅ Auto-record page visits in history - WORKS
 ✅ 'r' to refresh - WORKS
 ✅ 'o' to open address bar - WORKS
 ```

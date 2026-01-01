@@ -163,6 +163,7 @@ set(TUT_CORE_SOURCES
     src/core/url_parser.cpp
     src/core/http_client.cpp
     src/core/bookmark_manager.cpp
+    src/core/history_manager.cpp
 )
 
 set(TUT_UI_SOURCES

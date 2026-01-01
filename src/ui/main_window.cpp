@@ -52,6 +52,11 @@ public:
     std::vector<DisplayBookmark> bookmarks_;
     int selected_bookmark_{-1};
 
+    // History state
+    bool history_panel_visible_{false};
+    std::vector<DisplayBookmark> history_;
+    int selected_history_{-1};
+
     void setContent(const std::string& content) {
         content_lines_.clear();
         std::istringstream iss(content);
@@ -325,6 +330,35 @@ int MainWindow::run() {
                 }) | flex,
                 separator(),
                 vbox({
+                    text("📚 History") | bold,
+                    [this]() -> Element {
+                        if (!impl_->history_.empty()) {
+                            Elements history_lines;
+                            int max_display = 5;  // Show up to 5 history entries
+                            int end = std::min(max_display, static_cast<int>(impl_->history_.size()));
+                            for (int i = 0; i < end; i++) {
+                                const auto& entry = impl_->history_[i];
+                                auto line = text("  [" + std::to_string(i + 1) + "] " + entry.title);
+                                if (i == impl_->selected_history_) {
+                                    line = line | bold | color(Color::Cyan);
+                                } else {
+                                    line = line | dim;
+                                }
+                                history_lines.push_back(line);
+                            }
+                            if (impl_->history_.size() > static_cast<size_t>(max_display)) {
+                                history_lines.push_back(
+                                    text("  +" + std::to_string(impl_->history_.size() - max_display) + " more...") | dim
+                                );
+                            }
+                            return vbox(history_lines);
+                        } else {
+                            return text("  (empty)") | dim;
+                        }
+                    }()
+                }) | flex,
+                separator(),
+                vbox({
                     text("📊 Status") | bold,
                     status_panel->Render(),
                 }) | flex,
@@ -514,6 +548,15 @@ int MainWindow::run() {
             return true;
         }
 
+        // Toggle history panel (F3)
+        if (event == Event::F3) {
+            impl_->history_panel_visible_ = !impl_->history_panel_visible_;
+            if (impl_->on_event_) {
+                impl_->on_event_(WindowEvent::OpenHistory);
+            }
+            return true;
+        }
+
         return false;
     });
 
@@ -551,8 +594,9 @@ void MainWindow::setBookmarks(const std::vector<DisplayBookmark>& bookmarks) {
     impl_->selected_bookmark_ = bookmarks.empty() ? -1 : 0;
 }
 
-void MainWindow::setHistory(const std::vector<DisplayBookmark>& /*history*/) {
-    // TODO: Implement history display
+void MainWindow::setHistory(const std::vector<DisplayBookmark>& history) {
+    impl_->history_ = history;
+    impl_->selected_history_ = history.empty() ? -1 : 0;
 }
 
 void MainWindow::setCanGoBack(bool can) {

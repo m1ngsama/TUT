@@ -13,6 +13,7 @@
 #include "tut/version.hpp"
 #include "core/browser_engine.hpp"
 #include "core/bookmark_manager.hpp"
+#include "core/history_manager.hpp"
 #include "ui/main_window.hpp"
 #include "utils/logger.hpp"
 #include "utils/config.hpp"
@@ -136,11 +137,14 @@ int main(int argc, char* argv[]) {
         // 创建书签管理器
         BookmarkManager bookmarks;
 
+        // 创建历史记录管理器
+        HistoryManager history;
+
         // 创建主窗口
         MainWindow window;
 
         // 设置导航回调
-        window.onNavigate([&engine, &window](const std::string& url) {
+        window.onNavigate([&engine, &window, &history](const std::string& url) {
             LOG_INFO << "Navigating to: " << url;
             window.setLoading(true);
 
@@ -154,6 +158,9 @@ int main(int argc, char* argv[]) {
                 window.setTitle(engine.getTitle());
                 window.setContent(engine.getRenderedContent());
                 window.setUrl(url);
+
+                // Record in history
+                history.recordVisit(engine.getTitle(), url);
 
                 // Convert LinkInfo to DisplayLink
                 std::vector<DisplayLink> display_links;
@@ -183,7 +190,7 @@ int main(int argc, char* argv[]) {
         });
 
         // 设置链接点击回调
-        window.onLinkClick([&engine, &window](int index) {
+        window.onLinkClick([&engine, &window, &history](int index) {
             auto links = engine.extractLinks();
             if (index >= 0 && index < static_cast<int>(links.size())) {
                 const std::string& link_url = links[index].url;
@@ -201,6 +208,9 @@ int main(int argc, char* argv[]) {
                     window.setTitle(engine.getTitle());
                     window.setContent(engine.getRenderedContent());
                     window.setUrl(link_url);
+
+                    // Record in history
+                    history.recordVisit(engine.getTitle(), link_url);
 
                     // Convert LinkInfo to DisplayLink
                     std::vector<DisplayLink> display_links;
@@ -240,11 +250,24 @@ int main(int argc, char* argv[]) {
             window.setBookmarks(display_bookmarks);
         };
 
-        // Initialize bookmarks display
+        // Helper to update history display
+        auto updateHistory = [&history, &window]() {
+            std::vector<DisplayBookmark> display_history;
+            for (const auto& entry : history.getRecent(10)) {  // Show recent 10
+                DisplayBookmark db;
+                db.title = entry.title;
+                db.url = entry.url;
+                display_history.push_back(db);
+            }
+            window.setHistory(display_history);
+        };
+
+        // Initialize displays
         updateBookmarks();
+        updateHistory();
 
         // 设置窗口事件回调
-        window.onEvent([&engine, &window, &bookmarks, &updateBookmarks](WindowEvent event) {
+        window.onEvent([&engine, &window, &bookmarks, &updateBookmarks, &updateHistory](WindowEvent event) {
             switch (event) {
                 case WindowEvent::AddBookmark:
                     {
@@ -264,6 +287,9 @@ int main(int argc, char* argv[]) {
                     break;
                 case WindowEvent::OpenBookmarks:
                     updateBookmarks();
+                    break;
+                case WindowEvent::OpenHistory:
+                    updateHistory();
                     break;
                 case WindowEvent::Back:
                     if (engine.goBack()) {
