@@ -113,15 +113,21 @@
 | `N` | Previous search result |
 | `Esc` | Cancel search |
 
+### Bookmarks
+| Key | Action |
+|-----|--------|
+| `Ctrl+D` | Add/remove current page as bookmark |
+| `F2` | Toggle bookmark panel |
+
 ## 🐛 Known Limitations
 
 - Ctrl+L not yet working for address bar (use 'o' instead)
-- No bookmarks yet (Ctrl+D)
 - No history panel yet (F3)
+- Cannot navigate to bookmarks from panel yet (coming soon)
 
 ## 🚀 Coming Soon
 
-- [ ] Bookmarks (add, remove, list)
+- [ ] Navigate to bookmarks from panel (click/select)
 - [ ] History (view and navigate)
 - [ ] Better link highlighting
 - [ ] Form support

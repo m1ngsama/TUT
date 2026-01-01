@@ -47,6 +47,11 @@ public:
     std::vector<int> search_matches_;  // Line indices with matches
     int current_match_{-1};  // Index into search_matches_
 
+    // Bookmark state
+    bool bookmark_panel_visible_{false};
+    std::vector<DisplayBookmark> bookmarks_;
+    int selected_bookmark_{-1};
+
     void setContent(const std::string& content) {
         content_lines_.clear();
         std::istringstream iss(content);
@@ -292,7 +297,31 @@ int MainWindow::run() {
             hbox({
                 vbox({
                     text("📑 Bookmarks") | bold,
-                    text("  (empty)") | dim,
+                    [this]() -> Element {
+                        if (!impl_->bookmarks_.empty()) {
+                            Elements bookmark_lines;
+                            int max_display = 5;  // Show up to 5 bookmarks
+                            int end = std::min(max_display, static_cast<int>(impl_->bookmarks_.size()));
+                            for (int i = 0; i < end; i++) {
+                                const auto& bm = impl_->bookmarks_[i];
+                                auto line = text("  [" + std::to_string(i + 1) + "] " + bm.title);
+                                if (i == impl_->selected_bookmark_) {
+                                    line = line | bold | color(Color::Yellow);
+                                } else {
+                                    line = line | dim;
+                                }
+                                bookmark_lines.push_back(line);
+                            }
+                            if (impl_->bookmarks_.size() > static_cast<size_t>(max_display)) {
+                                bookmark_lines.push_back(
+                                    text("  +" + std::to_string(impl_->bookmarks_.size() - max_display) + " more...") | dim
+                                );
+                            }
+                            return vbox(bookmark_lines);
+                        } else {
+                            return text("  (empty)") | dim;
+                        }
+                    }()
                 }) | flex,
                 separator(),
                 vbox({
@@ -468,6 +497,23 @@ int MainWindow::run() {
             return true;
         }
 
+        // Add bookmark (Ctrl+D)
+        if (event == Event::Special("\x04")) {  // Ctrl+D
+            if (impl_->on_event_) {
+                impl_->on_event_(WindowEvent::AddBookmark);
+            }
+            return true;
+        }
+
+        // Toggle bookmark panel (F2)
+        if (event == Event::F2) {
+            impl_->bookmark_panel_visible_ = !impl_->bookmark_panel_visible_;
+            if (impl_->on_event_) {
+                impl_->on_event_(WindowEvent::OpenBookmarks);
+            }
+            return true;
+        }
+
         return false;
     });
 
@@ -500,8 +546,9 @@ void MainWindow::setLinks(const std::vector<DisplayLink>& links) {
     impl_->selected_link_ = links.empty() ? -1 : 0;
 }
 
-void MainWindow::setBookmarks(const std::vector<DisplayBookmark>& /*bookmarks*/) {
-    // TODO: Implement bookmark display
+void MainWindow::setBookmarks(const std::vector<DisplayBookmark>& bookmarks) {
+    impl_->bookmarks_ = bookmarks;
+    impl_->selected_bookmark_ = bookmarks.empty() ? -1 : 0;
 }
 
 void MainWindow::setHistory(const std::vector<DisplayBookmark>& /*history*/) {

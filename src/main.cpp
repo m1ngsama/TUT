@@ -12,6 +12,7 @@
 
 #include "tut/version.hpp"
 #include "core/browser_engine.hpp"
+#include "core/bookmark_manager.hpp"
 #include "ui/main_window.hpp"
 #include "utils/logger.hpp"
 #include "utils/config.hpp"
@@ -132,6 +133,9 @@ int main(int argc, char* argv[]) {
         // 创建浏览器引擎
         BrowserEngine engine;
 
+        // 创建书签管理器
+        BookmarkManager bookmarks;
+
         // 创建主窗口
         MainWindow window;
 
@@ -224,9 +228,43 @@ int main(int argc, char* argv[]) {
             }
         });
 
+        // Helper to update bookmark display
+        auto updateBookmarks = [&bookmarks, &window]() {
+            std::vector<DisplayBookmark> display_bookmarks;
+            for (const auto& bm : bookmarks.getAll()) {
+                DisplayBookmark db;
+                db.title = bm.title;
+                db.url = bm.url;
+                display_bookmarks.push_back(db);
+            }
+            window.setBookmarks(display_bookmarks);
+        };
+
+        // Initialize bookmarks display
+        updateBookmarks();
+
         // 设置窗口事件回调
-        window.onEvent([&engine, &window](WindowEvent event) {
+        window.onEvent([&engine, &window, &bookmarks, &updateBookmarks](WindowEvent event) {
             switch (event) {
+                case WindowEvent::AddBookmark:
+                    {
+                        std::string current_url = engine.getCurrentUrl();
+                        std::string current_title = engine.getTitle();
+                        if (!current_url.empty() && current_url != "about:blank") {
+                            if (bookmarks.contains(current_url)) {
+                                bookmarks.remove(current_url);
+                                window.setStatusMessage("Removed bookmark: " + current_title);
+                            } else {
+                                bookmarks.add(current_title, current_url);
+                                window.setStatusMessage("Added bookmark: " + current_title);
+                            }
+                            updateBookmarks();
+                        }
+                    }
+                    break;
+                case WindowEvent::OpenBookmarks:
+                    updateBookmarks();
+                    break;
                 case WindowEvent::Back:
                     if (engine.goBack()) {
                         window.setTitle(engine.getTitle());

@@ -162,6 +162,7 @@ set(TUT_CORE_SOURCES
     src/core/browser_engine.cpp
     src/core/url_parser.cpp
     src/core/http_client.cpp
+    src/core/bookmark_manager.cpp
 )
 
 set(TUT_UI_SOURCES
