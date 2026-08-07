@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{num::NonZeroUsize, ops::Range};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -22,6 +22,29 @@ impl SourceOffset {
     pub(super) fn checked_add(self, bytes: usize) -> Option<Self> {
         let bytes = u64::try_from(bytes).ok()?;
         self.0.checked_add(bytes).map(Self::new)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WindowRequest {
+    start: SourceOffset,
+    target_bytes: NonZeroUsize,
+}
+
+impl WindowRequest {
+    pub(super) const fn new(start: SourceOffset, target_bytes: NonZeroUsize) -> Self {
+        Self {
+            start,
+            target_bytes,
+        }
+    }
+
+    pub(super) const fn start(self) -> SourceOffset {
+        self.start
+    }
+
+    pub(super) const fn target_bytes(self) -> usize {
+        self.target_bytes.get()
     }
 }
 
@@ -73,6 +96,21 @@ impl<'a> SourceText<'a> {
         let end = self.relative_offset(range.end)?;
         self.text.get(start..end)
     }
+
+    pub(super) fn window(self, request: WindowRequest) -> Option<Self> {
+        let start = self.relative_offset(request.start())?;
+        if !self.text.is_char_boundary(start) {
+            return None;
+        }
+
+        let mut end = start
+            .saturating_add(request.target_bytes())
+            .min(self.text.len());
+        while end < self.text.len() && !self.text.is_char_boundary(end) {
+            end += 1;
+        }
+        Self::with_start(self.text.get(start..end)?, request.start())
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +137,28 @@ mod tests {
         assert_eq!(
             source.slice(SourceOffset::new(10)..SourceOffset::new(11)),
             None
+        );
+    }
+
+    #[test]
+    fn windows_make_progress_without_splitting_utf8() {
+        let start = SourceOffset::new(u64::from(u32::MAX) + 9);
+        let source = SourceText::with_start("a🙂éz", start).unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+
+        let first = source.window(WindowRequest::new(start, one)).unwrap();
+        let second = source.window(WindowRequest::new(first.end(), one)).unwrap();
+        let third = source
+            .window(WindowRequest::new(second.end(), one))
+            .unwrap();
+
+        assert_eq!(first.as_str(), "a");
+        assert_eq!(second.as_str(), "🙂");
+        assert_eq!(third.as_str(), "é");
+        assert!(
+            source
+                .window(WindowRequest::new(start.checked_add(2).unwrap(), one))
+                .is_none()
         );
     }
 }

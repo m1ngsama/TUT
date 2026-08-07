@@ -189,9 +189,16 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
 
     let mut prefix = String::new();
     prefix
-        .try_reserve_exact(7)
+        .try_reserve_exact(50)
         .map_err(|_| TutError::Allocation("status text"))?;
-    write!(prefix, "{}%", state.progress.min(100)).expect("String formatting is infallible");
+    write!(
+        prefix,
+        "{}%  {}/{}",
+        state.progress.min(100),
+        state.current_line,
+        state.total_lines
+    )
+    .expect("reserved String formatting is infallible");
     if query.is_some() {
         prefix.push_str("  /");
     }
@@ -328,7 +335,7 @@ mod tests {
         app.update(Action::Resize(Geometry::new(40, 5))).unwrap();
         let buffer = draw(&app, 40, 5);
         assert!(row_text(&buffer, 0).starts_with("book.txt"));
-        assert_eq!(row_text(&buffer, 3), "100%");
+        assert_eq!(row_text(&buffer, 3), "100%  1/1");
         assert!(row_text(&buffer, 4).contains("move"));
     }
 

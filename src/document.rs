@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{self, Read},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -8,16 +9,19 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::{
     error::{LoadError, sanitize_os},
-    source::{SourceOffset, SourceText},
+    line_index::{LineIndex, LineIndexError, LinePosition},
+    source::{SourceOffset, SourceText, WindowRequest},
 };
 
 pub const MAX_FILE_BYTES: usize = 33_554_432;
 const READ_CHUNK_BYTES: usize = 16 * 1024;
+const INDEX_WINDOW_BYTES: usize = 64 * 1024;
 const UTF8_BOM_BYTES: usize = 3;
 
 #[derive(Debug)]
 pub(super) struct Document {
     store: DocumentStore,
+    line_index: LineIndex,
     display_path: String,
     display_name: String,
 }
@@ -35,19 +39,26 @@ impl Document {
         &self.display_name
     }
 
-    #[cfg(test)]
-    pub(super) fn from_text(path: &Path, text: String) -> Self {
-        Self::new(path, text)
+    pub(super) fn line_position(&self, offset: SourceOffset) -> Option<LinePosition> {
+        self.line_index.position(self.source(), offset)
     }
 
-    fn new(path: &Path, source: String) -> Self {
+    #[cfg(test)]
+    pub(super) fn from_text(path: &Path, text: String) -> Self {
+        Self::new(path, text).expect("test documents fit the line-index budget")
+    }
+
+    fn new(path: &Path, source: String) -> Result<Self, LoadError> {
         let display_path = sanitize_os(path.as_os_str());
         let display_name = sanitize_os(path.file_name().unwrap_or(path.as_os_str()));
-        Self {
-            store: DocumentStore::in_memory(source),
+        let store = DocumentStore::in_memory(source);
+        let line_index = build_line_index(&store, path)?;
+        Ok(Self {
+            store,
+            line_index,
             display_path,
             display_name,
-        }
+        })
     }
 }
 
@@ -64,6 +75,16 @@ impl DocumentStore {
     fn source(&self) -> SourceText<'_> {
         match self {
             Self::InMemory(store) => store.source(),
+        }
+    }
+
+    fn window<'a>(
+        &'a self,
+        request: WindowRequest,
+        scratch: &'a mut Vec<u8>,
+    ) -> io::Result<SourceText<'a>> {
+        match self {
+            Self::InMemory(store) => store.window(request, scratch),
         }
     }
 }
@@ -94,6 +115,16 @@ impl InMemoryStore {
         )
         .expect("an in-memory source span fits in u64 coordinates")
     }
+
+    fn window<'a>(
+        &'a self,
+        request: WindowRequest,
+        _scratch: &'a mut Vec<u8>,
+    ) -> io::Result<SourceText<'a>> {
+        self.source().window(request).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid source window request")
+        })
+    }
 }
 
 pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
@@ -102,7 +133,43 @@ pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
         path: raw.path.clone(),
         offset: error.utf8_error().valid_up_to(),
     })?;
-    Ok(Document::new(&raw.path, source))
+    Document::new(&raw.path, source)
+}
+
+fn build_line_index(store: &DocumentStore, path: &Path) -> Result<LineIndex, LoadError> {
+    let source = store.source();
+    let mut index = LineIndex::new(source.start(), source.end())
+        .map_err(|error| map_line_index_error(path, error))?;
+    let target = NonZeroUsize::new(INDEX_WINDOW_BYTES).expect("index window size is nonzero");
+    let mut scratch = Vec::new();
+    let mut cursor = source.start();
+
+    while cursor < source.end() {
+        let window = store
+            .window(WindowRequest::new(cursor, target), &mut scratch)
+            .map_err(|source| LoadError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        index
+            .extend(window)
+            .map_err(|error| map_line_index_error(path, error))?;
+        cursor = window.end();
+    }
+    index
+        .finish()
+        .map_err(|error| map_line_index_error(path, error))?;
+    Ok(index)
+}
+
+fn map_line_index_error(path: &Path, error: LineIndexError) -> LoadError {
+    match error {
+        LineIndexError::Allocation => LoadError::Allocation("physical-line index"),
+        error => LoadError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, error),
+        },
+    }
 }
 
 struct RawDocument {
@@ -206,6 +273,8 @@ mod tests {
         assert_eq!(source.as_str(), "one\r\ntwo\rthree\n\u{feff}");
         assert_eq!(source.start(), SourceOffset::new(3));
         assert_eq!(source.end(), SourceOffset::new(21));
+        let position = document.line_position(SourceOffset::new(18)).unwrap();
+        assert_eq!((position.current(), position.total()), (4, 4));
         assert_eq!(document.display_name(), "link.txt");
     }
 
@@ -253,5 +322,17 @@ mod tests {
         let document = Document::from_text(&path, "text".to_owned());
         assert_eq!(document.display_path(), "/tmp/book.txt");
         assert_eq!(document.source().as_str(), "text");
+    }
+
+    #[test]
+    fn line_index_handles_crlf_across_store_windows() {
+        let mut text = "a".repeat(INDEX_WINDOW_BYTES - 1);
+        text.push_str("\r\nb");
+        let document = Document::from_text(Path::new("book.txt"), text);
+        let position = document
+            .line_position(SourceOffset::from_usize(INDEX_WINDOW_BYTES + 1))
+            .unwrap();
+
+        assert_eq!((position.current(), position.total()), (2, 2));
     }
 }

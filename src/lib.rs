@@ -10,6 +10,7 @@ mod cli;
 mod document;
 mod error;
 mod layout;
+mod line_index;
 mod search;
 mod source;
 mod tui;

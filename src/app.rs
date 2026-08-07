@@ -10,6 +10,7 @@ use crate::{
         BodyHeight, DOTTED_CIRCLE, DisplayProjection, GraphemeRange, ProjectedAtom,
         REPLACEMENT_CHARACTER, VisualRowIndex, WrapIndex, ensure_wrap_index, progress_percent,
     },
+    line_index::LinePosition,
     search::{IntersectingMatches, MatchIndex, SearchRange},
     source::{SourceOffset, SourceText},
 };
@@ -200,6 +201,8 @@ pub(super) struct RenderState<'a> {
     pub path: &'a str,
     pub rows: Vec<RenderRow<'a>>,
     pub progress: u8,
+    pub current_line: u64,
+    pub total_lines: u64,
     pub status: SearchStatus<'a>,
 }
 
@@ -283,13 +286,27 @@ impl App {
     }
 
     pub(super) fn render_state(&self) -> Result<RenderState<'_>, TutError> {
+        let line = self.line_position();
         Ok(RenderState {
             filename: self.document.display_name(),
             path: self.document.display_path(),
             rows: self.build_render_rows()?,
             progress: self.progress_percent(),
+            current_line: line.current(),
+            total_lines: line.total(),
             status: self.search_status(),
         })
+    }
+
+    fn line_position(&self) -> LinePosition {
+        let offset = self
+            .viewport()
+            .map_or(self.document.source().start(), |viewport| {
+                viewport.first_visible_start
+            });
+        self.document
+            .line_position(offset)
+            .expect("viewport anchors are valid document boundaries")
     }
 
     pub(super) fn update(&mut self, action: Action) -> Result<Outcome, TutError> {
@@ -750,6 +767,8 @@ mod tests {
             index.row_start(VisualRowIndex::new(2)),
             Some(SourceOffset::new(10))
         );
+        let state = app.render_state().unwrap();
+        assert_eq!((state.current_line, state.total_lines), (1, 3));
 
         commit(&mut app, "cat");
         assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(6));
