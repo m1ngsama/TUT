@@ -1,7 +1,8 @@
 use std::{
     fs::File,
-    io::{self, Read},
+    io,
     num::NonZeroUsize,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
 
@@ -128,12 +129,13 @@ impl InMemoryStore {
 }
 
 pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
-    let raw = read_raw(path, MAX_FILE_BYTES)?;
-    let source = String::from_utf8(raw.bytes).map_err(|error| LoadError::InvalidUtf8 {
-        path: raw.path.clone(),
+    let store = FileStore::open(path, MAX_FILE_BYTES)?;
+    let bytes = store.read_bounded(MAX_FILE_BYTES)?;
+    let source = String::from_utf8(bytes).map_err(|error| LoadError::InvalidUtf8 {
+        path: store.path.clone(),
         offset: error.utf8_error().valid_up_to(),
     })?;
-    Document::new(&raw.path, source)
+    Document::new(&store.path, source)
 }
 
 fn build_line_index(store: &DocumentStore, path: &Path) -> Result<LineIndex, LoadError> {
@@ -172,89 +174,90 @@ fn map_line_index_error(path: &Path, error: LineIndexError) -> LoadError {
     }
 }
 
-struct RawDocument {
+struct FileStore {
+    file: File,
     path: PathBuf,
-    bytes: Vec<u8>,
-}
-
-fn read_raw(path: PathBuf, limit: usize) -> Result<RawDocument, LoadError> {
-    let descriptor = rustix::fs::open(
-        &path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|source| LoadError::Open {
-        path: path.clone(),
-        source: io::Error::from(source),
-    })?;
-
-    let mut file = File::from(descriptor);
-    let metadata = file.metadata().map_err(|source| LoadError::Read {
-        path: path.clone(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(LoadError::NotRegular(path));
-    }
-    if metadata.len() > limit as u64 {
-        return Err(LoadError::TooLarge { path, limit });
-    }
-
-    let known_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    let bytes = read_bounded(&mut file, known_len, &path, limit)?;
-    Ok(RawDocument { path, bytes })
-}
-
-fn read_bounded(
-    mut reader: impl Read,
     known_len: usize,
-    path: &Path,
-    limit: usize,
-) -> Result<Vec<u8>, LoadError> {
-    let maximum_read = limit
-        .checked_add(1)
-        .ok_or(LoadError::Allocation("bounded file buffer"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(known_len.min(maximum_read))
-        .map_err(|_| LoadError::Allocation("file buffer"))?;
+}
 
-    let mut chunk = [0_u8; READ_CHUNK_BYTES];
-    while bytes.len() < maximum_read {
-        let request = (maximum_read - bytes.len()).min(chunk.len());
-        let count = loop {
-            match reader.read(&mut chunk[..request]) {
-                Ok(count) => break count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(source) => {
-                    return Err(LoadError::Read {
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                }
-            }
-        };
-        if count == 0 {
-            break;
+impl FileStore {
+    fn open(path: PathBuf, limit: usize) -> Result<Self, LoadError> {
+        let descriptor = rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| LoadError::Open {
+            path: path.clone(),
+            source: io::Error::from(source),
+        })?;
+
+        let file = File::from(descriptor);
+        let metadata = file.metadata().map_err(|source| LoadError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(LoadError::NotRegular(path));
         }
-        bytes
-            .try_reserve(count)
-            .map_err(|_| LoadError::Allocation("file buffer"))?;
-        bytes.extend_from_slice(&chunk[..count]);
+        if metadata.len() > limit as u64 {
+            return Err(LoadError::TooLarge { path, limit });
+        }
+
+        Ok(Self {
+            file,
+            path,
+            known_len: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        })
     }
 
-    if bytes.len() > limit {
-        return Err(LoadError::TooLarge {
-            path: path.to_path_buf(),
-            limit,
-        });
+    fn read_bounded(&self, limit: usize) -> Result<Vec<u8>, LoadError> {
+        let maximum_read = limit
+            .checked_add(1)
+            .ok_or(LoadError::Allocation("bounded file buffer"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.known_len.min(maximum_read))
+            .map_err(|_| LoadError::Allocation("file buffer"))?;
+
+        let mut chunk = [0_u8; READ_CHUNK_BYTES];
+        while bytes.len() < maximum_read {
+            let request = (maximum_read - bytes.len()).min(chunk.len());
+            let offset = u64::try_from(bytes.len()).expect("bounded file offsets fit u64");
+            let count = loop {
+                match self.file.read_at(&mut chunk[..request], offset) {
+                    Ok(count) => break count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(source) => {
+                        return Err(LoadError::Read {
+                            path: self.path.clone(),
+                            source,
+                        });
+                    }
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            bytes
+                .try_reserve(count)
+                .map_err(|_| LoadError::Allocation("file buffer"))?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+
+        if bytes.len() > limit {
+            return Err(LoadError::TooLarge {
+                path: self.path.clone(),
+                limit,
+            });
+        }
+        Ok(bytes)
     }
-    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor};
+    use std::fs;
 
     use tempfile::tempdir;
 
@@ -291,8 +294,12 @@ mod tests {
 
     #[test]
     fn bounded_read_detects_growth_beyond_metadata() {
-        let path = Path::new("growing.txt");
-        let error = read_bounded(Cursor::new(b"12345"), 1, path, 4).unwrap_err();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("growing.txt");
+        fs::write(&path, b"1").unwrap();
+        let store = FileStore::open(path, 4).unwrap();
+        fs::write(&store.path, b"12345").unwrap();
+        let error = store.read_bounded(4).unwrap_err();
         assert!(matches!(error, LoadError::TooLarge { limit: 4, .. }));
     }
 
@@ -300,7 +307,7 @@ mod tests {
     fn rejects_directories() {
         let directory = tempdir().unwrap();
         assert!(matches!(
-            read_raw(directory.path().to_path_buf(), 16),
+            FileStore::open(directory.path().to_path_buf(), 16),
             Err(LoadError::NotRegular(_))
         ));
     }
@@ -313,7 +320,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let fifo = directory.path().join("input.fifo");
         mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
-        assert!(matches!(read_raw(fifo, 16), Err(LoadError::NotRegular(_))));
+        assert!(matches!(
+            FileStore::open(fifo, 16),
+            Err(LoadError::NotRegular(_))
+        ));
     }
 
     #[test]
