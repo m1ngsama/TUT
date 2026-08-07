@@ -74,7 +74,7 @@ impl SignalHandlers {
             (SIGTERM, SIGTERM as usize),
         ] {
             let slot = Arc::clone(&state.0);
-            // The handler performs only a lock-free atomic operation.
+            // SAFETY: The handler performs only a non-panicking atomic compare-exchange.
             let registration = unsafe {
                 low_level::register(signal, move || {
                     let _ = slot.compare_exchange(0, value, Ordering::SeqCst, Ordering::SeqCst);
