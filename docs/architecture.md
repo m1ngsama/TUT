@@ -1,14 +1,14 @@
 # Architecture
 
-TUT is one Rust package with a narrow dependency direction:
+TUT is one Rust package with a narrow dependency direction. `source` defines coordinates and borrowed source spans for `document`, `layout`, and `search`:
 
 ```text
-cli      document      layout      search
-                 \       |       /
-                         app
-                          |
-                         tui
+source -+-> document -+
+        +-> layout ----+-> app -> tui
+        +-> search ----+
 ```
+
+`cli` and `lib` orchestrate this pipeline without reversing its domain dependencies.
 
 `error` is a leaf used by every layer. Domain modules do not depend on Crossterm or Ratatui. The TUI consumes immutable render state from `app` and does not open files, rewrap text, or run search.
 
@@ -16,19 +16,26 @@ cli      document      layout      search
 
 1. `cli` parses `OsString` arguments without terminal or filesystem access.
 2. `lib` validates both terminal streams and installs retained signal handlers.
-3. `document` opens the path nonblocking, validates the opened handle, performs a bounded read, validates UTF-8, and normalizes into one immutable `String`.
-4. `layout` projects extended grapheme clusters into terminal-safe atoms and builds a compact vector of visual-row start offsets.
-5. `search` builds a global non-overlapping literal-match bitset.
-6. `app` owns navigation, resize anchoring, search transactions, and render-state construction.
-7. `tui` maps events, writes frozen atoms directly to terminal cells, and owns terminal setup and restoration.
+3. `document` opens the path nonblocking, validates the opened handle, performs a bounded read, validates UTF-8, and places the original bytes in `DocumentStore::InMemory`.
+4. `document` exposes an immutable `SourceText` view. It logically excludes one leading BOM but preserves its three-byte displacement.
+5. `layout` projects extended grapheme clusters and raw line endings into terminal-safe atoms, then builds a compact vector of visual-row start offsets.
+6. `search` builds a global non-overlapping literal-match bitset over the visible source span.
+7. `app` owns navigation, resize anchoring, search transactions, and render-state construction.
+8. `tui` maps events, writes frozen atoms directly to terminal cells, and owns terminal setup and restoration.
+
+## Storage boundary
+
+`Document` owns display metadata and a closed `DocumentStore` enum. The current `InMemory` variant owns one validated `String`; it does not rewrite BOM or line-ending bytes. `SourceText` is a small borrowed value containing `&str`, an absolute start, and an absolute end. Layout and search therefore depend on a source view rather than on storage ownership.
+
+The next storage variant can provide bounded source windows without changing the meaning of offsets. Paging will require replacing whole-document consumers with explicit window requests, not changing persisted locations or inventing a second coordinate system.
 
 ## Coordinates and layout
 
-Persistent positions are `u32` byte offsets into normalized UTF-8. Visual rows and display columns are derived state. Every visual-row start is a grapheme boundary and row starts are strictly increasing.
+Persistent positions are `SourceOffset(u64)` values measured from the beginning of the original file. A leading BOM makes the first content offset three rather than zero, and CRLF occupies two source bytes. Visual rows and display columns are derived state. Every visual-row start is a UTF-8 grapheme boundary and row starts are strictly increasing.
 
 One projection policy is shared by wrapping and rendering:
 
-- LF is structural.
+- LF, CRLF, and lone CR are structural line endings.
 - Tabs use four-column stops.
 - C0, DEL, and C1 controls become one replacement cell.
 - Standalone zero-width graphemes become one dotted-circle cell.
@@ -39,9 +46,9 @@ The render layer receives the projected symbol and its approved cell width. It n
 
 ## State invariants
 
-`App` keeps a normalized-byte anchor across width changes. `follow_end` is explicit, so a reader at the end remains at the end after reflow. Tiny terminals preserve logical state and accept only resize and quit.
+`App` keeps an absolute source-byte anchor across width changes. `follow_end` is explicit, so a reader at the end remains at the end after reflow. Tiny terminals preserve logical state and accept only resize and quit.
 
-Search editing is separate from the committed query. Committing performs one left-to-right non-overlapping scan. Match ranges use the same normalized byte coordinates as layout, allowing a match to cross soft rows or partially intersect a grapheme while rendering highlights the entire visible grapheme.
+Search editing is separate from the committed query. Committing performs one left-to-right non-overlapping scan. Match ranges use the same absolute source coordinates as layout, allowing a match to cross soft rows or partially intersect a grapheme while rendering highlights the entire visible grapheme.
 
 ## Terminal lifecycle
 
@@ -51,7 +58,7 @@ Restoration always attempts show cursor, leave alternate screen, and disable raw
 
 ## Resource policy
 
-The 0.0.1 raw file limit is 32 MiB. Loading, normalization, reflow, and search construction are linear in source bytes. Persistent layout stores only row starts, and persistent search stores one bit per normalized source byte. Large derived allocations use fallible reservation. Rendering work is bounded by visible source bytes and visible match intersections.
+The 0.0.1 raw file limit is 32 MiB. Loading, UTF-8 validation, reflow, and search construction are linear in source bytes. Persistent layout stores only `u64` row starts, and persistent search stores one bit per readable source byte. Large derived allocations use fallible reservation. Rendering work is bounded by visible source bytes and visible match intersections.
 
 ## Unix and GNU conventions
 

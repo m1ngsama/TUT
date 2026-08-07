@@ -7,11 +7,11 @@ use crate::{
     document::Document,
     error::TutError,
     layout::{
-        BodyHeight, DOTTED_CIRCLE, DisplayProjection, GraphemeRange, NormalizedOffset,
-        ProjectedAtom, REPLACEMENT_CHARACTER, VisualRowIndex, WrapIndex, ensure_wrap_index,
-        progress_percent,
+        BodyHeight, DOTTED_CIRCLE, DisplayProjection, GraphemeRange, ProjectedAtom,
+        REPLACEMENT_CHARACTER, VisualRowIndex, WrapIndex, ensure_wrap_index, progress_percent,
     },
     search::{IntersectingMatches, MatchIndex, SearchRange},
+    source::{SourceOffset, SourceText},
 };
 
 pub(super) const MIN_TERMINAL_COLUMNS: u16 = 16;
@@ -89,8 +89,8 @@ pub(super) enum Outcome {
 pub(super) struct Viewport {
     pub top: VisualRowIndex,
     pub visible_rows: usize,
-    pub first_visible_start: NormalizedOffset,
-    pub visible_end: NormalizedOffset,
+    pub first_visible_start: SourceOffset,
+    pub visible_end: SourceOffset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +206,7 @@ pub(super) struct RenderState<'a> {
 pub(super) struct App {
     document: Document,
     wrap_index: Option<WrapIndex>,
-    anchor: NormalizedOffset,
+    anchor: SourceOffset,
     top: VisualRowIndex,
     follow_end: bool,
     geometry: Geometry,
@@ -217,16 +217,17 @@ pub(super) struct App {
 }
 
 #[cfg(test)]
-pub(super) fn app_from_normalized(path: &std::path::Path, text: String) -> App {
-    App::new(Document::from_normalized(path, text))
+pub(super) fn app_from_text(path: &std::path::Path, text: String) -> App {
+    App::new(Document::from_text(path, text))
 }
 
 impl App {
     pub(super) fn new(document: Document) -> Self {
+        let anchor = document.source().start();
         Self {
             document,
             wrap_index: None,
-            anchor: NormalizedOffset::ZERO,
+            anchor,
             top: VisualRowIndex::ZERO,
             follow_end: false,
             geometry: Geometry::new(0, 0),
@@ -273,10 +274,10 @@ impl App {
     }
 
     pub(super) fn progress_percent(&self) -> u8 {
-        let normalized_len = NormalizedOffset::new(self.document.len_bytes());
+        let source = self.document.source();
         match self.viewport() {
-            Some(viewport) => progress_percent(normalized_len, viewport.visible_end),
-            None if normalized_len == NormalizedOffset::ZERO => 100,
+            Some(viewport) => progress_percent(source, viewport.visible_end),
+            None if source.start() == source.end() => 100,
             None => 0,
         }
     }
@@ -354,7 +355,7 @@ impl App {
 
         let rebuilt = ensure_wrap_index(
             &mut self.wrap_index,
-            self.document.text(),
+            self.document.source(),
             geometry.content_width(),
         )?;
         let index = self
@@ -398,11 +399,11 @@ impl App {
     }
 
     fn document_start(&mut self) -> bool {
-        let changed = self.top != VisualRowIndex::ZERO
-            || self.anchor != NormalizedOffset::ZERO
-            || self.follow_end;
+        let source_start = self.document.source().start();
+        let changed =
+            self.top != VisualRowIndex::ZERO || self.anchor != source_start || self.follow_end;
         self.top = VisualRowIndex::ZERO;
-        self.anchor = NormalizedOffset::ZERO;
+        self.anchor = source_start;
         self.follow_end = false;
         changed
     }
@@ -472,10 +473,12 @@ impl App {
             return Ok(true);
         }
 
-        let first_visible = self.viewport().map_or(NormalizedOffset::ZERO, |viewport| {
-            viewport.first_visible_start
-        });
-        let index = MatchIndex::build(self.document.text(), &draft)?
+        let first_visible = self
+            .viewport()
+            .map_or(self.document.source().start(), |viewport| {
+                viewport.first_visible_start
+            });
+        let index = MatchIndex::build(self.document.source(), &draft)?
             .expect("nonempty query creates an index");
         let selected = index.first_intersecting_or_wrap(first_visible);
         self.committed_query = draft;
@@ -537,10 +540,8 @@ impl App {
         for row_number in viewport.top.as_usize()..viewport.top.as_usize() + viewport.visible_rows {
             let spans = build_render_row(
                 wrap,
-                self.document.text(),
-                VisualRowIndex::new(
-                    u32::try_from(row_number).expect("normalized source bounds row indices"),
-                ),
+                self.document.source(),
+                VisualRowIndex::new(u32::try_from(row_number).expect("source bounds row indices")),
                 &mut matches,
             )?;
             rows.push(RenderRow { spans });
@@ -551,13 +552,13 @@ impl App {
 
 fn build_render_row<'a>(
     wrap: &WrapIndex,
-    text: &'a str,
+    source: SourceText<'a>,
     row: VisualRowIndex,
     matches: &mut MatchCursor<'_>,
 ) -> Result<Vec<RenderSpan<'a>>, TutError> {
     let mut spans = Vec::new();
     for atom in wrap
-        .projected_row(text, row)
+        .projected_row(source, row)
         .expect("indexed row matches immutable document")
     {
         let highlight = matches.role_for(atom.source());
@@ -581,7 +582,7 @@ impl<'a> MatchCursor<'a> {
     fn for_viewport(
         match_index: Option<&'a MatchIndex>,
         current: Option<SearchRange>,
-        visible: Range<NormalizedOffset>,
+        visible: Range<SourceOffset>,
     ) -> Self {
         Self {
             pending: match_index.map(|index| index.intersecting(visible).peekable()),
@@ -643,7 +644,7 @@ mod tests {
     use super::*;
 
     fn reader(text: &str, columns: u16, rows: u16) -> App {
-        let mut app = app_from_normalized(Path::new("/tmp/book.txt"), text.to_owned());
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), text.to_owned());
         app.update(Action::Resize(Geometry::new(columns, rows)))
             .unwrap();
         app
@@ -730,6 +731,36 @@ mod tests {
             state.rows[0].spans[0].text,
             RenderText::Borrowed("c")
         ));
+    }
+
+    #[test]
+    fn bom_and_raw_line_endings_keep_absolute_coordinates_end_to_end() {
+        let mut app = reader("\u{feff}a\r\ncat\rend", 16, 6);
+        let index = app.wrap_index.as_ref().unwrap();
+
+        assert_eq!(
+            app.viewport().unwrap().first_visible_start,
+            SourceOffset::new(3)
+        );
+        assert_eq!(
+            index.row_start(VisualRowIndex::new(1)),
+            Some(SourceOffset::new(6))
+        );
+        assert_eq!(
+            index.row_start(VisualRowIndex::new(2)),
+            Some(SourceOffset::new(10))
+        );
+
+        commit(&mut app, "cat");
+        assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(6));
+        assert_eq!(
+            app.render_state().unwrap().rows[1].spans[0].highlight,
+            Highlight::Current
+        );
+
+        app.update(Action::DocumentEnd).unwrap();
+        app.update(Action::DocumentStart).unwrap();
+        assert_eq!(app.anchor, SourceOffset::new(3));
     }
 
     #[test]

@@ -444,7 +444,7 @@ mod tests {
     use signal_hook::consts::signal::{SIGHUP, SIGTERM};
 
     use super::*;
-    use crate::app::app_from_normalized;
+    use crate::app::app_from_text;
 
     struct FakeDriver {
         calls: Vec<&'static str>,
@@ -538,7 +538,7 @@ mod tests {
     }
 
     fn app() -> App {
-        app_from_normalized(Path::new("/tmp/book.txt"), "body".to_owned())
+        app_from_text(Path::new("/tmp/book.txt"), "body".to_owned())
     }
 
     #[test]

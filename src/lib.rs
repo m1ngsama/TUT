@@ -11,6 +11,7 @@ mod document;
 mod error;
 mod layout;
 mod search;
+mod source;
 mod tui;
 
 use app::App;

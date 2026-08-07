@@ -128,7 +128,7 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
 
     let mut column = DisplayColumn::ZERO;
     let mut x = area.x;
-    for atom in DisplayAtoms::new(text)? {
+    for atom in DisplayAtoms::new(text) {
         let Some(projected) = atom.project(column, content_width) else {
             continue;
         };
@@ -286,7 +286,7 @@ fn fallible_copy(text: &str, context: &'static str) -> Result<String, TutError> 
 fn display_width(text: &str) -> Result<u16, TutError> {
     let content_width = ContentWidth::new(u16::MAX).expect("u16::MAX is nonzero");
     let mut column = DisplayColumn::ZERO;
-    for atom in DisplayAtoms::new(text)? {
+    for atom in DisplayAtoms::new(text) {
         let Some(projected) = atom.project(column, content_width) else {
             continue;
         };
@@ -302,7 +302,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::app::{Action, Geometry, app_from_normalized};
+    use crate::app::{Action, Geometry, app_from_text};
 
     fn draw(app: &crate::app::App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn frame_renders_fixed_regions_and_empty_progress() {
-        let mut app = app_from_normalized(Path::new("/tmp/book.txt"), String::new());
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), String::new());
         app.update(Action::Resize(Geometry::new(40, 5))).unwrap();
         let buffer = draw(&app, 40, 5);
         assert!(row_text(&buffer, 0).starts_with("book.txt"));
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn body_uses_highlight_and_forced_width_metadata() {
-        let mut app = app_from_normalized(Path::new("/tmp/book.txt"), "ｶﾞ cat".to_owned());
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "ｶﾞ cat".to_owned());
         app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
         app.update(Action::BeginSearch).unwrap();
         for character in "cat".chars() {
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn long_queries_preserve_fixed_status_indicators() {
-        let mut app = app_from_normalized(Path::new("/tmp/book.txt"), "body".to_owned());
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
         app.update(Action::Resize(Geometry::new(48, 4))).unwrap();
         app.update(Action::BeginSearch).unwrap();
         for character in "q".repeat(128).chars() {
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn tiny_frames_render_only_the_resize_message() {
-        let app = app_from_normalized(Path::new("/tmp/book.txt"), "body".to_owned());
+        let app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
         let buffer = draw(&app, 12, 3);
         assert_eq!(row_text(&buffer, 0), "terminal too");
         assert_eq!(row_text(&buffer, 1), "");

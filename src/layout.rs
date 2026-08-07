@@ -3,37 +3,14 @@ use std::{collections::VecDeque, num::NonZeroU16, ops::Range};
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
-use crate::error::LayoutError;
+use crate::{
+    error::LayoutError,
+    source::{SourceOffset, SourceText},
+};
 
 pub(super) const REPLACEMENT_CHARACTER: &str = "\u{fffd}";
 pub(super) const DOTTED_CIRCLE: &str = "\u{25cc}";
 const TAB_STOP: u32 = 4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub(super) struct NormalizedOffset(u32);
-
-impl NormalizedOffset {
-    pub(super) const ZERO: Self = Self(0);
-
-    pub(super) const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    pub(super) const fn get(self) -> u32 {
-        self.0
-    }
-
-    pub(super) const fn as_usize(self) -> usize {
-        self.0 as usize
-    }
-
-    pub(super) fn try_from_usize(value: usize) -> Result<Self, LayoutError> {
-        u32::try_from(value)
-            .map(Self)
-            .map_err(|_| LayoutError::NormalizedTextTooLong { bytes: value })
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -111,12 +88,12 @@ impl BodyHeight {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GraphemeRange {
-    start: NormalizedOffset,
-    end: NormalizedOffset,
+    start: SourceOffset,
+    end: SourceOffset,
 }
 
 impl GraphemeRange {
-    pub(super) const fn new(start: NormalizedOffset, end: NormalizedOffset) -> Option<Self> {
+    pub(super) const fn new(start: SourceOffset, end: SourceOffset) -> Option<Self> {
         if start.get() < end.get() {
             Some(Self { start, end })
         } else {
@@ -124,11 +101,11 @@ impl GraphemeRange {
         }
     }
 
-    pub(super) const fn start(self) -> NormalizedOffset {
+    pub(super) const fn start(self) -> SourceOffset {
         self.start
     }
 
-    pub(super) const fn end(self) -> NormalizedOffset {
+    pub(super) const fn end(self) -> SourceOffset {
         self.end
     }
 }
@@ -243,24 +220,27 @@ impl<'a> DisplayAtom<'a> {
 }
 
 pub(super) struct DisplayAtoms<'a> {
-    base: NormalizedOffset,
+    base: SourceOffset,
     inner: GraphemeIndices<'a>,
 }
 
 impl<'a> DisplayAtoms<'a> {
-    pub(super) fn new(text: &'a str) -> Result<Self, LayoutError> {
-        let end = NormalizedOffset::try_from_usize(text.len())?;
-        Ok(Self::between(text, NormalizedOffset::ZERO, end))
+    pub(super) fn new(text: &'a str) -> Self {
+        Self::from_source(SourceText::new(text))
     }
 
-    pub(super) fn between(text: &'a str, start: NormalizedOffset, end: NormalizedOffset) -> Self {
-        let range = start.as_usize()..end.as_usize();
-        debug_assert!(text.is_char_boundary(range.start));
-        debug_assert!(text.is_char_boundary(range.end));
+    fn from_source(source: SourceText<'a>) -> Self {
         Self {
-            base: start,
-            inner: text[range].grapheme_indices(true),
+            base: source.start(),
+            inner: source.as_str().grapheme_indices(true),
         }
+    }
+
+    fn between(source: SourceText<'a>, start: SourceOffset, end: SourceOffset) -> Option<Self> {
+        Some(Self {
+            base: start,
+            inner: source.slice(start..end)?.grapheme_indices(true),
+        })
     }
 }
 
@@ -269,14 +249,16 @@ impl<'a> Iterator for DisplayAtoms<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let (relative_start, grapheme) = self.inner.next()?;
-        let relative_start = u32::try_from(relative_start).expect("validated text bounds offsets");
-        let grapheme_len = u32::try_from(grapheme.len()).expect("validated text bounds graphemes");
-        let measured_width = u32::try_from(UnicodeWidthStr::width(grapheme))
-            .expect("grapheme width is bounded by normalized source size");
-        let start = self.base.get() + relative_start;
-        let end = start + grapheme_len;
+        let measured_width = u32::try_from(UnicodeWidthStr::width(grapheme)).unwrap_or(u32::MAX);
+        let start = self
+            .base
+            .checked_add(relative_start)
+            .expect("source span coordinates were validated");
+        let end = start
+            .checked_add(grapheme.len())
+            .expect("source span coordinates were validated");
 
-        let kind = if grapheme == "\n" {
+        let kind = if matches!(grapheme, "\n" | "\r" | "\r\n") {
             DisplayAtomKind::LineFeed
         } else if grapheme == "\t" {
             DisplayAtomKind::Tab
@@ -289,7 +271,7 @@ impl<'a> Iterator for DisplayAtoms<'a> {
         };
 
         Some(DisplayAtom {
-            source: GraphemeRange::new(NormalizedOffset::new(start), NormalizedOffset::new(end))
+            source: GraphemeRange::new(start, end)
                 .expect("segmentation never yields an empty grapheme"),
             source_text: grapheme,
             kind,
@@ -309,8 +291,9 @@ fn is_terminal_control(character: char) -> bool {
 #[derive(Debug)]
 pub(super) struct WrapIndex {
     width: ContentWidth,
-    normalized_len: NormalizedOffset,
-    starts: Vec<NormalizedOffset>,
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+    starts: Vec<SourceOffset>,
 }
 
 impl WrapIndex {
@@ -318,42 +301,37 @@ impl WrapIndex {
         self.starts.len()
     }
 
-    pub(super) fn row_start(&self, row: VisualRowIndex) -> Option<NormalizedOffset> {
+    pub(super) fn row_start(&self, row: VisualRowIndex) -> Option<SourceOffset> {
         self.starts.get(row.as_usize()).copied()
     }
 
-    pub(super) fn row_range(&self, row: VisualRowIndex) -> Option<Range<NormalizedOffset>> {
+    pub(super) fn row_range(&self, row: VisualRowIndex) -> Option<Range<SourceOffset>> {
         let row = row.as_usize();
         let start = *self.starts.get(row)?;
-        let end = self
-            .starts
-            .get(row + 1)
-            .copied()
-            .unwrap_or(self.normalized_len);
+        let end = self.starts.get(row + 1).copied().unwrap_or(self.source_end);
         Some(start..end)
     }
 
     pub(super) fn projected_row<'a>(
         &self,
-        text: &'a str,
+        source: SourceText<'a>,
         row: VisualRowIndex,
     ) -> Option<ProjectedRowAtoms<'a>> {
-        if text.len() != self.normalized_len.as_usize() {
+        if source.start() != self.source_start || source.end() != self.source_end {
             return None;
         }
         let range = self.row_range(row)?;
         Some(ProjectedRowAtoms {
-            inner: DisplayAtoms::between(text, range.start, range.end),
+            inner: DisplayAtoms::between(source, range.start, range.end)?,
             width: self.width,
             column: DisplayColumn::ZERO,
         })
     }
 
-    pub(super) fn row_at_or_before(&self, offset: NormalizedOffset) -> VisualRowIndex {
+    pub(super) fn row_at_or_before(&self, offset: SourceOffset) -> VisualRowIndex {
         let insertion = self.starts.partition_point(|start| *start <= offset);
         VisualRowIndex::new(
-            u32::try_from(insertion.saturating_sub(1))
-                .expect("normalized source bounds row indices"),
+            u32::try_from(insertion.saturating_sub(1)).expect("source bounds row indices"),
         )
     }
 
@@ -361,12 +339,12 @@ impl WrapIndex {
         let row = self
             .row_count()
             .saturating_sub(usize::from(body_height.get()));
-        VisualRowIndex::new(u32::try_from(row).expect("normalized source bounds row indices"))
+        VisualRowIndex::new(u32::try_from(row).expect("source bounds row indices"))
     }
 
     pub(super) fn resolve_top(
         &self,
-        anchor: NormalizedOffset,
+        anchor: SourceOffset,
         follow_end: bool,
         body_height: BodyHeight,
     ) -> VisualRowIndex {
@@ -378,17 +356,13 @@ impl WrapIndex {
         }
     }
 
-    pub(super) fn visible_end(
-        &self,
-        top: VisualRowIndex,
-        body_height: BodyHeight,
-    ) -> NormalizedOffset {
+    pub(super) fn visible_end(&self, top: VisualRowIndex, body_height: BodyHeight) -> SourceOffset {
         let top = top.as_usize().min(self.row_count().saturating_sub(1));
         let exclusive = (top + usize::from(body_height.get())).min(self.row_count());
         self.starts
             .get(exclusive)
             .copied()
-            .unwrap_or(self.normalized_len)
+            .unwrap_or(self.source_end)
     }
 }
 
@@ -416,66 +390,67 @@ impl<'a> Iterator for ProjectedRowAtoms<'a> {
 
 pub(super) fn rebuild_wrap_index(
     slot: &mut Option<WrapIndex>,
-    text: &str,
+    source: SourceText<'_>,
     width: ContentWidth,
 ) -> Result<(), LayoutError> {
-    let normalized_len = NormalizedOffset::try_from_usize(text.len())?;
     let mut index = slot.take().unwrap_or_else(|| WrapIndex {
         width,
-        normalized_len,
+        source_start: source.start(),
+        source_end: source.end(),
         starts: Vec::new(),
     });
 
     index.width = width;
-    index.normalized_len = normalized_len;
+    index.source_start = source.start();
+    index.source_end = source.end();
     index.starts.clear();
-    build_row_starts(&mut index.starts, text, width)?;
+    build_row_starts(&mut index.starts, source, width)?;
     *slot = Some(index);
     Ok(())
 }
 
 pub(super) fn ensure_wrap_index(
     slot: &mut Option<WrapIndex>,
-    text: &str,
+    source: SourceText<'_>,
     width: Option<ContentWidth>,
 ) -> Result<bool, LayoutError> {
     let Some(width) = width else {
         return Ok(false);
     };
-    if slot
-        .as_ref()
-        .is_some_and(|index| index.width == width && index.normalized_len.as_usize() == text.len())
-    {
+    if slot.as_ref().is_some_and(|index| {
+        index.width == width
+            && index.source_start == source.start()
+            && index.source_end == source.end()
+    }) {
         return Ok(false);
     }
-    rebuild_wrap_index(slot, text, width)?;
+    rebuild_wrap_index(slot, source, width)?;
     Ok(true)
 }
 
-pub(super) fn progress_percent(
-    normalized_len: NormalizedOffset,
-    visible_end: NormalizedOffset,
-) -> u8 {
-    if normalized_len == NormalizedOffset::ZERO || visible_end >= normalized_len {
+pub(super) fn progress_percent(source: SourceText<'_>, visible_end: SourceOffset) -> u8 {
+    if source.start() == source.end() || visible_end >= source.end() {
         return 100;
     }
-    let percent = (u64::from(visible_end.get()) * 100) / u64::from(normalized_len.get());
+    let total = source.end().get() - source.start().get();
+    let visible = visible_end.get().saturating_sub(source.start().get());
+    let percent = (u128::from(visible) * 100) / u128::from(total);
     u8::try_from(percent.min(99)).expect("progress is clamped to 99")
 }
 
 fn build_row_starts(
-    starts: &mut Vec<NormalizedOffset>,
-    text: &str,
+    starts: &mut Vec<SourceOffset>,
+    source: SourceText<'_>,
     width: ContentWidth,
 ) -> Result<(), LayoutError> {
-    try_push_row_start(starts, NormalizedOffset::ZERO)?;
-    let mut atoms = DisplayAtoms::new(text)?;
+    try_push_row_start(starts, source.start())?;
+    let mut atoms = DisplayAtoms::from_source(source);
     let mut pending = VecDeque::<DisplayAtom<'_>>::new();
 
     'rows: loop {
         let mut consumed = 0usize;
         let mut column = DisplayColumn::ZERO;
-        let mut last_whitespace: Option<(usize, NormalizedOffset)> = None;
+        let mut last_whitespace: Option<(usize, SourceOffset)> = None;
 
         loop {
             if consumed == pending.len() {
@@ -548,8 +523,8 @@ fn remove_front<T>(pending: &mut VecDeque<T>, count: usize) {
 }
 
 fn try_push_row_start(
-    starts: &mut Vec<NormalizedOffset>,
-    start: NormalizedOffset,
+    starts: &mut Vec<SourceOffset>,
+    start: SourceOffset,
 ) -> Result<(), LayoutError> {
     if let Some(previous) = starts.last().copied()
         && previous >= start
@@ -572,13 +547,18 @@ mod tests {
 
     fn index(text: &str, width: u16) -> WrapIndex {
         let mut slot = None;
-        rebuild_wrap_index(&mut slot, text, ContentWidth::new(width).unwrap()).unwrap();
+        rebuild_wrap_index(
+            &mut slot,
+            SourceText::new(text),
+            ContentWidth::new(width).unwrap(),
+        )
+        .unwrap();
         slot.unwrap()
     }
 
     fn projected(index: &WrapIndex, text: &str, row: u32) -> Vec<(String, u32)> {
         index
-            .projected_row(text, VisualRowIndex::new(row))
+            .projected_row(SourceText::new(text), VisualRowIndex::new(row))
             .unwrap()
             .map(|atom| {
                 let text = match atom.projection() {
@@ -623,10 +603,7 @@ mod tests {
     fn a_tab_that_cannot_fit_on_a_fresh_row_becomes_one_cell() {
         let text = "a\t";
         let index = index(text, 2);
-        assert_eq!(
-            index.starts,
-            &[NormalizedOffset::ZERO, NormalizedOffset::new(1)]
-        );
+        assert_eq!(index.starts, &[SourceOffset::ZERO, SourceOffset::new(1)]);
         assert_eq!(projected(&index, text, 1), vec![("�".to_owned(), 1)]);
     }
 
@@ -636,16 +613,44 @@ mod tests {
         let height = BodyHeight::new(2).unwrap();
         assert_eq!(index.max_top(height), VisualRowIndex::new(2));
         assert_eq!(
-            index.resolve_top(NormalizedOffset::new(7), false, height),
+            index.resolve_top(SourceOffset::new(7), false, height),
             VisualRowIndex::new(2)
         );
         assert_eq!(
-            progress_percent(NormalizedOffset::new(8), NormalizedOffset::new(4)),
+            progress_percent(SourceText::new("abcdefgh"), SourceOffset::new(4)),
             50
         );
         assert_eq!(
-            progress_percent(NormalizedOffset::ZERO, NormalizedOffset::ZERO),
+            progress_percent(SourceText::new(""), SourceOffset::ZERO),
             100
+        );
+    }
+
+    #[test]
+    fn raw_line_endings_keep_large_source_offsets() {
+        let start = SourceOffset::new(u64::from(u32::MAX) + 11);
+        let source = SourceText::with_start("a\r\nb\rc\n", start).unwrap();
+        let mut slot = None;
+        rebuild_wrap_index(&mut slot, source, ContentWidth::new(8).unwrap()).unwrap();
+        let index = slot.unwrap();
+
+        assert_eq!(
+            index.starts,
+            vec![
+                start,
+                start.checked_add(3).unwrap(),
+                start.checked_add(5).unwrap(),
+                start.checked_add(7).unwrap(),
+            ]
+        );
+        assert_eq!(progress_percent(source, start.checked_add(3).unwrap()), 42);
+        assert_eq!(
+            index
+                .projected_row(source, VisualRowIndex::ZERO)
+                .unwrap()
+                .map(|atom| atom.projection())
+                .collect::<Vec<_>>(),
+            vec![DisplayProjection::Text("a")]
         );
     }
 
@@ -664,24 +669,24 @@ mod tests {
 
         for text in samples {
             for width in 1..=16 {
+                let source = SourceText::new(text);
                 let index = index(text, width);
-                assert_eq!(index.starts.first(), Some(&NormalizedOffset::ZERO));
+                assert_eq!(index.starts.first(), Some(&source.start()));
                 assert!(index.starts.windows(2).all(|pair| pair[0] < pair[1]));
-                assert!(
-                    index
-                        .starts
-                        .iter()
-                        .all(|offset| text.is_char_boundary(offset.as_usize()))
-                );
+                assert!(index.starts.iter().all(|offset| {
+                    source
+                        .relative_offset(*offset)
+                        .is_some_and(|offset| text.is_char_boundary(offset))
+                }));
                 assert!(index.row_count() <= text.graphemes(true).count() + 1);
 
                 for row in 0..index.row_count() {
                     let row = VisualRowIndex::new(u32::try_from(row).unwrap());
                     let range = index.row_range(row).unwrap();
-                    assert!(text.is_char_boundary(range.start.as_usize()));
-                    assert!(text.is_char_boundary(range.end.as_usize()));
+                    assert!(text.is_char_boundary(source.relative_offset(range.start).unwrap()));
+                    assert!(text.is_char_boundary(source.relative_offset(range.end).unwrap()));
                     let used: u32 = index
-                        .projected_row(text, row)
+                        .projected_row(source, row)
                         .unwrap()
                         .map(|atom| atom.width().get())
                         .sum();
@@ -695,7 +700,7 @@ mod tests {
                         ))
                         .unwrap()
                         .end,
-                    NormalizedOffset::new(u32::try_from(text.len()).unwrap())
+                    source.end()
                 );
             }
         }

@@ -6,25 +6,25 @@ use std::{
 
 use rustix::fs::{Mode, OFlags};
 
-use crate::error::{LoadError, sanitize_os};
+use crate::{
+    error::{LoadError, sanitize_os},
+    source::{SourceOffset, SourceText},
+};
 
 pub const MAX_FILE_BYTES: usize = 33_554_432;
 const READ_CHUNK_BYTES: usize = 16 * 1024;
+const UTF8_BOM_BYTES: usize = 3;
 
 #[derive(Debug)]
 pub(super) struct Document {
-    text: String,
+    store: DocumentStore,
     display_path: String,
     display_name: String,
 }
 
 impl Document {
-    pub(super) fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub(super) fn len_bytes(&self) -> u32 {
-        u32::try_from(self.text.len()).expect("normalized text is bounded to 32 MiB")
+    pub(super) fn source(&self) -> SourceText<'_> {
+        self.store.source()
     }
 
     pub(super) fn display_path(&self) -> &str {
@@ -36,32 +36,73 @@ impl Document {
     }
 
     #[cfg(test)]
-    pub(super) fn from_normalized(path: &Path, text: String) -> Self {
+    pub(super) fn from_text(path: &Path, text: String) -> Self {
         Self::new(path, text)
     }
 
-    fn new(path: &Path, text: String) -> Self {
+    fn new(path: &Path, source: String) -> Self {
         let display_path = sanitize_os(path.as_os_str());
         let display_name = sanitize_os(path.file_name().unwrap_or(path.as_os_str()));
         Self {
-            text,
+            store: DocumentStore::in_memory(source),
             display_path,
             display_name,
         }
     }
 }
 
-pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
-    let raw = read_raw(path, MAX_FILE_BYTES)?;
-    if let Err(error) = std::str::from_utf8(&raw.bytes) {
-        return Err(LoadError::InvalidUtf8 {
-            path: raw.path,
-            offset: error.valid_up_to(),
-        });
+#[derive(Debug)]
+enum DocumentStore {
+    InMemory(InMemoryStore),
+}
+
+impl DocumentStore {
+    fn in_memory(source: String) -> Self {
+        Self::InMemory(InMemoryStore::new(source))
     }
 
-    let text = normalize_valid_utf8(raw.bytes);
-    Ok(Document::new(&raw.path, text))
+    fn source(&self) -> SourceText<'_> {
+        match self {
+            Self::InMemory(store) => store.source(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InMemoryStore {
+    source: String,
+    content_start: usize,
+}
+
+impl InMemoryStore {
+    fn new(source: String) -> Self {
+        let content_start = if source.starts_with('\u{feff}') {
+            UTF8_BOM_BYTES
+        } else {
+            0
+        };
+        Self {
+            source,
+            content_start,
+        }
+    }
+
+    fn source(&self) -> SourceText<'_> {
+        SourceText::with_start(
+            &self.source[self.content_start..],
+            SourceOffset::from_usize(self.content_start),
+        )
+        .expect("an in-memory source span fits in u64 coordinates")
+    }
+}
+
+pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
+    let raw = read_raw(path, MAX_FILE_BYTES)?;
+    let source = String::from_utf8(raw.bytes).map_err(|error| LoadError::InvalidUtf8 {
+        path: raw.path.clone(),
+        offset: error.utf8_error().valid_up_to(),
+    })?;
+    Ok(Document::new(&raw.path, source))
 }
 
 struct RawDocument {
@@ -144,29 +185,6 @@ fn read_bounded(
     Ok(bytes)
 }
 
-fn normalize_valid_utf8(mut bytes: Vec<u8>) -> String {
-    let mut read = usize::from(bytes.starts_with(&[0xef, 0xbb, 0xbf])) * 3;
-    let mut write = 0;
-
-    while read < bytes.len() {
-        if bytes[read] == b'\r' {
-            bytes[write] = b'\n';
-            write += 1;
-            read += 1;
-            if read < bytes.len() && bytes[read] == b'\n' {
-                read += 1;
-            }
-        } else {
-            bytes[write] = bytes[read];
-            write += 1;
-            read += 1;
-        }
-    }
-
-    bytes.truncate(write);
-    String::from_utf8(bytes).expect("normalization preserves validated UTF-8")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, io::Cursor};
@@ -176,7 +194,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_symlinks_and_normalizes_valid_utf8_in_order() {
+    fn loads_symlinks_and_preserves_source_coordinates() {
         let directory = tempdir().unwrap();
         let source = directory.path().join("source.txt");
         let link = directory.path().join("link.txt");
@@ -184,7 +202,10 @@ mod tests {
         std::os::unix::fs::symlink(&source, &link).unwrap();
 
         let document = load(link).unwrap();
-        assert_eq!(document.text(), "one\ntwo\nthree\n\u{feff}");
+        let source = document.source();
+        assert_eq!(source.as_str(), "one\r\ntwo\rthree\n\u{feff}");
+        assert_eq!(source.start(), SourceOffset::new(3));
+        assert_eq!(source.end(), SourceOffset::new(21));
         assert_eq!(document.display_name(), "link.txt");
     }
 
@@ -229,8 +250,8 @@ mod tests {
     #[test]
     fn test_constructor_preserves_display_metadata() {
         let path = PathBuf::from("/tmp/book.txt");
-        let document = Document::from_normalized(&path, "text".to_owned());
+        let document = Document::from_text(&path, "text".to_owned());
         assert_eq!(document.display_path(), "/tmp/book.txt");
-        assert_eq!(document.text(), "text");
+        assert_eq!(document.source().as_str(), "text");
     }
 }

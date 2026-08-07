@@ -39,7 +39,7 @@ tut [OPTION]... FILE
 
 Use `tut -- FILE` when the filename begins with `-`. `--help` and `--version` do not require a terminal.
 
-TUT accepts regular files and symlinks to regular files. Input must be valid UTF-8 and no larger than 33,554,432 raw bytes. One leading UTF-8 BOM is removed, and CRLF or lone CR line endings become LF. The source file is never written.
+TUT accepts regular files and symlinks to regular files. Input must be valid UTF-8 and no larger than 33,554,432 raw bytes. One leading UTF-8 BOM is ignored. LF, CRLF, and lone CR are displayed as line endings while their original bytes remain intact in memory. The source file is never written.
 
 ## Keys
 
@@ -71,6 +71,10 @@ Diagnostics use the `tut: message` form on standard error. Terminal control char
 ## Scope
 
 Version 0.0.1 intentionally has no stdin document input, network access, configuration, persistence, plugins, Markdown semantics, or Web support. It uses the narrow Unicode terminal-width policy; rendering can still vary with terminal font and emulator behavior.
+
+## Development
+
+The current architecture uses absolute `u64` source-byte coordinates and an in-memory `DocumentStore` backend. See [docs/architecture.md](docs/architecture.md) for invariants and [docs/roadmap.md](docs/roadmap.md) for the path toward bounded paging, background search, and mature reader workflows.
 
 ## License
 

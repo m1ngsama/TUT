@@ -25,15 +25,13 @@ pub enum LoadError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutError {
-    NormalizedTextTooLong { bytes: usize },
     Allocation,
-    NonIncreasingRowStart { previous: u32, next: u32 },
+    NonIncreasingRowStart { previous: u64, next: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchError {
     Allocation,
-    TextTooLong { bytes: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,9 +122,6 @@ impl TutError {
             Self::NotATerminal => {
                 "interactive reading requires terminal stdin and stdout".to_owned()
             }
-            Self::Layout(LayoutError::NormalizedTextTooLong { bytes }) => {
-                format!("normalized text exceeds u32 coordinates: {bytes} bytes")
-            }
             Self::Layout(LayoutError::Allocation) => {
                 "could not allocate the visual-row index".to_owned()
             }
@@ -135,9 +130,6 @@ impl TutError {
             }
             Self::Search(SearchError::Allocation) => {
                 "could not allocate the search index".to_owned()
-            }
-            Self::Search(SearchError::TextTooLong { bytes }) => {
-                format!("search source exceeds u32 coordinates: {bytes} bytes")
             }
             Self::Io { operation, source } => format!("failed to {operation}: {source}"),
             Self::Allocation(context) => format!("could not allocate {context}"),
