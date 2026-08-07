@@ -8,7 +8,7 @@ use crate::{
     error::TutError,
     layout::{
         BodyHeight, DOTTED_CIRCLE, DisplayProjection, GraphemeRange, ProjectedAtom,
-        REPLACEMENT_CHARACTER, VisualRowIndex, WrapIndex, ensure_wrap_index, progress_percent,
+        REPLACEMENT_CHARACTER, ViewportLayout, ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
     search::{IntersectingMatches, MatchIndex, SearchRange},
@@ -88,7 +88,6 @@ pub(super) enum Outcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Viewport {
-    pub top: VisualRowIndex,
     pub visible_rows: usize,
     pub first_visible_start: SourceOffset,
     pub visible_end: SourceOffset,
@@ -208,9 +207,8 @@ pub(super) struct RenderState<'a> {
 
 pub(super) struct App {
     document: Document,
-    wrap_index: Option<WrapIndex>,
+    layout: Option<ViewportLayout>,
     anchor: SourceOffset,
-    top: VisualRowIndex,
     follow_end: bool,
     geometry: Geometry,
     mode: Mode,
@@ -229,9 +227,8 @@ impl App {
         let anchor = document.source().start();
         Self {
             document,
-            wrap_index: None,
+            layout: None,
             anchor,
-            top: VisualRowIndex::ZERO,
             follow_end: false,
             geometry: Geometry::new(0, 0),
             mode: Mode::Reading,
@@ -264,15 +261,13 @@ impl App {
     }
 
     pub(super) fn viewport(&self) -> Option<Viewport> {
-        let body_height = self.geometry.body_height()?;
-        let index = self.wrap_index.as_ref()?;
-        let remaining = index.row_count().saturating_sub(self.top.as_usize());
-        let visible_rows = remaining.min(usize::from(body_height.get()));
+        let source = self.document.source();
+        let layout = self.layout.as_ref()?;
+        let (visible_rows, visible_end) = layout.visible_extent(source, self.anchor)?;
         Some(Viewport {
-            top: self.top,
             visible_rows,
-            first_visible_start: index.row_start(self.top)?,
-            visible_end: index.visible_end(self.top, body_height),
+            first_visible_start: self.anchor,
+            visible_end,
         })
     }
 
@@ -363,75 +358,59 @@ impl App {
 
     fn resize(&mut self, geometry: Geometry) -> Result<bool, TutError> {
         let geometry_changed = self.geometry != geometry;
-        let old_top = self.top;
+        let old_anchor = self.anchor;
         self.geometry = geometry;
 
         if !geometry.is_usable() {
             return Ok(geometry_changed);
         }
 
-        let rebuilt = ensure_wrap_index(
-            &mut self.wrap_index,
+        let rebuilt = ensure_viewport_layout(
+            &mut self.layout,
             self.document.source(),
             geometry.content_width(),
+            geometry.body_height(),
         )?;
-        let index = self
-            .wrap_index
-            .as_ref()
-            .expect("usable geometry has an index");
-        self.top = index.resolve_top(
-            self.anchor,
-            self.follow_end,
-            geometry.body_height().expect("usable geometry"),
-        );
+        let layout = self.layout.as_ref().expect("usable geometry has a layout");
+        self.anchor = layout
+            .resolve_top(self.document.source(), self.anchor, self.follow_end)
+            .expect("document anchors are valid source boundaries");
 
-        Ok(geometry_changed || rebuilt || old_top != self.top)
+        Ok(geometry_changed || rebuilt || old_anchor != self.anchor)
     }
 
     fn move_rows(&mut self, downward: bool, amount: usize) -> bool {
-        let body_height = self.geometry.body_height().expect("usable geometry");
-        let index = self.wrap_index.as_ref().expect("usable geometry");
-        let max_top = index.max_top(body_height);
-        let old_top = self.top;
+        let layout = self.layout.as_ref().expect("usable geometry");
         let old_anchor = self.anchor;
         let old_follow_end = self.follow_end;
-        let amount = u32::try_from(amount).unwrap_or(u32::MAX);
-        let target = if downward {
-            VisualRowIndex::new(old_top.get().saturating_add(amount).min(max_top.get()))
-        } else {
-            VisualRowIndex::new(old_top.get().saturating_sub(amount))
-        };
+        let target = layout
+            .move_row_start(self.document.source(), self.anchor, downward, amount)
+            .expect("document anchors are valid source boundaries");
 
-        self.anchor = index.row_start(target).expect("clamped row exists");
-        self.top = target;
+        self.anchor = target;
         if downward {
-            if target != old_top && target == max_top {
+            if target != old_anchor && target == layout.max_top() {
                 self.follow_end = true;
             }
         } else {
             self.follow_end = false;
         }
 
-        old_top != self.top || old_anchor != self.anchor || old_follow_end != self.follow_end
+        old_anchor != self.anchor || old_follow_end != self.follow_end
     }
 
     fn document_start(&mut self) -> bool {
         let source_start = self.document.source().start();
-        let changed =
-            self.top != VisualRowIndex::ZERO || self.anchor != source_start || self.follow_end;
-        self.top = VisualRowIndex::ZERO;
+        let changed = self.anchor != source_start || self.follow_end;
         self.anchor = source_start;
         self.follow_end = false;
         changed
     }
 
     fn document_end(&mut self) -> bool {
-        let body_height = self.geometry.body_height().expect("usable geometry");
-        let index = self.wrap_index.as_ref().expect("usable geometry");
-        let top = index.max_top(body_height);
-        let anchor = index.row_start(top).expect("max top exists");
-        let changed = self.top != top || self.anchor != anchor || !self.follow_end;
-        self.top = top;
+        let layout = self.layout.as_ref().expect("usable geometry");
+        let anchor = layout.max_top();
+        let changed = self.anchor != anchor || !self.follow_end;
         self.anchor = anchor;
         self.follow_end = true;
         changed
@@ -526,17 +505,19 @@ impl App {
 
     fn jump_to_match(&mut self, selected: SearchRange) -> bool {
         let body_height = self.geometry.body_height().expect("usable geometry");
-        let index = self.wrap_index.as_ref().expect("usable geometry");
-        let match_row = index.row_at_or_before(selected.start());
-        let intended = VisualRowIndex::new(
-            match_row
-                .get()
-                .saturating_sub(u32::from(body_height.get() / 2)),
-        );
-        let actual = intended.min(index.max_top(body_height));
-        let anchor = index.row_start(intended).expect("intended row exists");
-        let changed = self.top != actual || self.anchor != anchor || self.follow_end;
-        self.top = actual;
+        let layout = self.layout.as_ref().expect("usable geometry");
+        let match_row = layout
+            .row_start_at_or_before(self.document.source(), selected.start())
+            .expect("search matches have valid source boundaries");
+        let anchor = layout
+            .move_row_start(
+                self.document.source(),
+                match_row,
+                false,
+                usize::from(body_height.get() / 2),
+            )
+            .expect("search matches have valid source boundaries");
+        let changed = self.anchor != anchor || self.follow_end;
         self.anchor = anchor;
         self.follow_end = false;
         changed
@@ -546,7 +527,8 @@ impl App {
         let Some(viewport) = self.viewport() else {
             return Ok(Vec::new());
         };
-        let wrap = self.wrap_index.as_ref().expect("viewport has an index");
+        let layout = self.layout.as_ref().expect("viewport has a layout");
+        let source = self.document.source();
         let visible = viewport.first_visible_start..viewport.visible_end;
         let mut matches =
             MatchCursor::for_viewport(self.match_index.as_ref(), self.current_match, visible);
@@ -554,29 +536,31 @@ impl App {
         rows.try_reserve_exact(viewport.visible_rows)
             .map_err(|_| TutError::Allocation("visible rows"))?;
 
-        for row_number in viewport.top.as_usize()..viewport.top.as_usize() + viewport.visible_rows {
-            let spans = build_render_row(
-                wrap,
-                self.document.source(),
-                VisualRowIndex::new(u32::try_from(row_number).expect("source bounds row indices")),
-                &mut matches,
-            )?;
+        let mut start = viewport.first_visible_start;
+        for row_number in 0..viewport.visible_rows {
+            let spans = build_render_row(layout, source, start, &mut matches)?;
             rows.push(RenderRow { spans });
+            if row_number + 1 < viewport.visible_rows {
+                start = layout
+                    .next_row_start(source, start)
+                    .expect("visible row starts are valid source boundaries")
+                    .expect("non-final visible rows have successors");
+            }
         }
         Ok(rows)
     }
 }
 
 fn build_render_row<'a>(
-    wrap: &WrapIndex,
+    layout: &ViewportLayout,
     source: SourceText<'a>,
-    row: VisualRowIndex,
+    start: SourceOffset,
     matches: &mut MatchCursor<'_>,
 ) -> Result<Vec<RenderSpan<'a>>, TutError> {
     let mut spans = Vec::new();
-    for atom in wrap
-        .projected_row(source, row)
-        .expect("indexed row matches immutable document")
+    for atom in layout
+        .projected_row(source, start)
+        .expect("visible row matches immutable document")
     {
         let highlight = matches.role_for(atom.source());
         if spans.len() == spans.capacity() {
@@ -678,13 +662,19 @@ mod tests {
     #[test]
     fn navigation_clamps_and_preserves_end_following_across_reflow() {
         let mut app = reader("0123456789abcdef", 16, 4);
-        assert_eq!(app.viewport().unwrap().top, VisualRowIndex::ZERO);
+        assert_eq!(
+            app.viewport().unwrap().first_visible_start,
+            SourceOffset::ZERO
+        );
         app.update(Action::DocumentEnd).unwrap();
         assert!(app.follow_end);
         assert_eq!(app.progress_percent(), 100);
         app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
         assert!(app.follow_end);
-        assert_eq!(app.viewport().unwrap().top, VisualRowIndex::ZERO);
+        assert_eq!(
+            app.viewport().unwrap().first_visible_start,
+            SourceOffset::ZERO
+        );
         app.update(Action::LineUp).unwrap();
         assert!(!app.follow_end);
     }
@@ -753,18 +743,19 @@ mod tests {
     #[test]
     fn bom_and_raw_line_endings_keep_absolute_coordinates_end_to_end() {
         let mut app = reader("\u{feff}a\r\ncat\rend", 16, 6);
-        let index = app.wrap_index.as_ref().unwrap();
+        let layout = app.layout.as_ref().unwrap();
+        let source = app.document.source();
 
         assert_eq!(
             app.viewport().unwrap().first_visible_start,
             SourceOffset::new(3)
         );
         assert_eq!(
-            index.row_start(VisualRowIndex::new(1)),
+            layout.next_row_start(source, SourceOffset::new(3)).unwrap(),
             Some(SourceOffset::new(6))
         );
         assert_eq!(
-            index.row_start(VisualRowIndex::new(2)),
+            layout.next_row_start(source, SourceOffset::new(6)).unwrap(),
             Some(SourceOffset::new(10))
         );
         let state = app.render_state().unwrap();
@@ -790,5 +781,17 @@ mod tests {
         assert_eq!(span.text.as_str(), "◌\u{200b}");
         assert_eq!(span.projection, RenderProjectionKind::OwnedZeroWidth);
         assert_eq!(span.cell_width, DisplayColumn::new(1));
+    }
+
+    #[test]
+    fn search_near_document_end_clamps_to_the_last_full_viewport() {
+        let mut app = reader("a\nb\nc\nd\nneedle", 16, 6);
+        commit(&mut app, "needle");
+
+        assert_eq!(
+            app.anchor,
+            app.layout.as_ref().expect("usable layout").max_top()
+        );
+        assert_eq!(app.progress_percent(), 100);
     }
 }

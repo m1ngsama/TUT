@@ -32,26 +32,6 @@ impl DisplayColumn {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub(super) struct VisualRowIndex(u32);
-
-impl VisualRowIndex {
-    pub(super) const ZERO: Self = Self(0);
-
-    pub(super) const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    pub(super) const fn get(self) -> u32 {
-        self.0
-    }
-
-    pub(super) const fn as_usize(self) -> usize {
-        self.0 as usize
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub(super) struct ContentWidth(NonZeroU16);
@@ -289,38 +269,21 @@ fn is_terminal_control(character: char) -> bool {
 }
 
 #[derive(Debug)]
-pub(super) struct WrapIndex {
+pub(super) struct ViewportLayout {
     width: ContentWidth,
+    height: BodyHeight,
     source_start: SourceOffset,
     source_end: SourceOffset,
-    starts: Vec<SourceOffset>,
+    max_top: SourceOffset,
 }
 
-impl WrapIndex {
-    pub(super) fn row_count(&self) -> usize {
-        self.starts.len()
-    }
-
-    pub(super) fn row_start(&self, row: VisualRowIndex) -> Option<SourceOffset> {
-        self.starts.get(row.as_usize()).copied()
-    }
-
-    pub(super) fn row_range(&self, row: VisualRowIndex) -> Option<Range<SourceOffset>> {
-        let row = row.as_usize();
-        let start = *self.starts.get(row)?;
-        let end = self.starts.get(row + 1).copied().unwrap_or(self.source_end);
-        Some(start..end)
-    }
-
+impl ViewportLayout {
     pub(super) fn projected_row<'a>(
         &self,
         source: SourceText<'a>,
-        row: VisualRowIndex,
+        start: SourceOffset,
     ) -> Option<ProjectedRowAtoms<'a>> {
-        if source.start() != self.source_start || source.end() != self.source_end {
-            return None;
-        }
-        let range = self.row_range(row)?;
+        let range = self.row_range(source, start)?;
         Some(ProjectedRowAtoms {
             inner: DisplayAtoms::between(source, range.start, range.end)?,
             width: self.width,
@@ -328,42 +291,124 @@ impl WrapIndex {
         })
     }
 
-    pub(super) fn row_at_or_before(&self, offset: SourceOffset) -> VisualRowIndex {
-        let insertion = self.starts.partition_point(|start| *start <= offset);
-        VisualRowIndex::new(
-            u32::try_from(insertion.saturating_sub(1)).expect("source bounds row indices"),
-        )
+    pub(super) fn row_range(
+        &self,
+        source: SourceText<'_>,
+        start: SourceOffset,
+    ) -> Option<Range<SourceOffset>> {
+        let boundary = self.row_boundary(source, start)?;
+        Some(start..boundary.end)
     }
 
-    pub(super) fn max_top(&self, body_height: BodyHeight) -> VisualRowIndex {
-        let row = self
-            .row_count()
-            .saturating_sub(usize::from(body_height.get()));
-        VisualRowIndex::new(u32::try_from(row).expect("source bounds row indices"))
+    pub(super) const fn max_top(&self) -> SourceOffset {
+        self.max_top
     }
 
     pub(super) fn resolve_top(
         &self,
+        source: SourceText<'_>,
         anchor: SourceOffset,
         follow_end: bool,
-        body_height: BodyHeight,
-    ) -> VisualRowIndex {
-        let max_top = self.max_top(body_height);
+    ) -> Option<SourceOffset> {
         if follow_end {
-            max_top
-        } else {
-            self.row_at_or_before(anchor).min(max_top)
+            return self.matches(source).then_some(self.max_top);
         }
+        Some(
+            self.row_start_at_or_before(source, anchor)?
+                .min(self.max_top),
+        )
     }
 
-    pub(super) fn visible_end(&self, top: VisualRowIndex, body_height: BodyHeight) -> SourceOffset {
-        let top = top.as_usize().min(self.row_count().saturating_sub(1));
-        let exclusive = (top + usize::from(body_height.get())).min(self.row_count());
-        self.starts
-            .get(exclusive)
-            .copied()
-            .unwrap_or(self.source_end)
+    pub(super) fn move_row_start(
+        &self,
+        source: SourceText<'_>,
+        start: SourceOffset,
+        downward: bool,
+        amount: usize,
+    ) -> Option<SourceOffset> {
+        let mut current = self.row_start_at_or_before(source, start)?;
+        if downward {
+            current = current.min(self.max_top);
+        }
+        for _ in 0..amount {
+            let next = if downward {
+                self.next_row_start(source, current)?
+                    .unwrap_or(current)
+                    .min(self.max_top)
+            } else {
+                previous_row_start(source, current, self.width)?
+            };
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        Some(current.min(self.max_top))
     }
+
+    pub(super) fn visible_extent(
+        &self,
+        source: SourceText<'_>,
+        top: SourceOffset,
+    ) -> Option<(usize, SourceOffset)> {
+        if !self.matches(source) || top < self.source_start || top > self.max_top {
+            return None;
+        }
+
+        let mut start = top;
+        let mut visible_rows = 0;
+        let mut visible_end = top;
+        while visible_rows < usize::from(self.height.get()) {
+            let boundary = self.row_boundary(source, start)?;
+            visible_rows += 1;
+            visible_end = boundary.end;
+            let Some(next) = boundary.next else {
+                break;
+            };
+            start = next;
+        }
+        Some((visible_rows, visible_end))
+    }
+
+    pub(super) fn next_row_start(
+        &self,
+        source: SourceText<'_>,
+        start: SourceOffset,
+    ) -> Option<Option<SourceOffset>> {
+        Some(self.row_boundary(source, start)?.next)
+    }
+
+    pub(super) fn row_start_at_or_before(
+        &self,
+        source: SourceText<'_>,
+        offset: SourceOffset,
+    ) -> Option<SourceOffset> {
+        if !self.matches(source) {
+            return None;
+        }
+        row_start_at_or_before(source, offset, self.width)
+    }
+
+    fn row_boundary(
+        &self,
+        source: SourceText<'_>,
+        start: SourceOffset,
+    ) -> Option<VisualRowBoundary> {
+        if !self.matches(source) {
+            return None;
+        }
+        visual_row_boundary(source, start, self.width)
+    }
+
+    fn matches(&self, source: SourceText<'_>) -> bool {
+        source.start() == self.source_start && source.end() == self.source_end
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualRowBoundary {
+    end: SourceOffset,
+    next: Option<SourceOffset>,
 }
 
 pub(super) struct ProjectedRowAtoms<'a> {
@@ -388,43 +433,41 @@ impl<'a> Iterator for ProjectedRowAtoms<'a> {
     }
 }
 
-pub(super) fn rebuild_wrap_index(
-    slot: &mut Option<WrapIndex>,
+pub(super) fn rebuild_viewport_layout(
+    slot: &mut Option<ViewportLayout>,
     source: SourceText<'_>,
     width: ContentWidth,
+    height: BodyHeight,
 ) -> Result<(), LayoutError> {
-    let mut index = slot.take().unwrap_or_else(|| WrapIndex {
+    let max_top = last_viewport_start(source, width, height)?;
+    *slot = Some(ViewportLayout {
         width,
+        height,
         source_start: source.start(),
         source_end: source.end(),
-        starts: Vec::new(),
+        max_top,
     });
-
-    index.width = width;
-    index.source_start = source.start();
-    index.source_end = source.end();
-    index.starts.clear();
-    build_row_starts(&mut index.starts, source, width)?;
-    *slot = Some(index);
     Ok(())
 }
 
-pub(super) fn ensure_wrap_index(
-    slot: &mut Option<WrapIndex>,
+pub(super) fn ensure_viewport_layout(
+    slot: &mut Option<ViewportLayout>,
     source: SourceText<'_>,
     width: Option<ContentWidth>,
+    height: Option<BodyHeight>,
 ) -> Result<bool, LayoutError> {
-    let Some(width) = width else {
+    let (Some(width), Some(height)) = (width, height) else {
         return Ok(false);
     };
-    if slot.as_ref().is_some_and(|index| {
-        index.width == width
-            && index.source_start == source.start()
-            && index.source_end == source.end()
+    if slot.as_ref().is_some_and(|layout| {
+        layout.width == width
+            && layout.height == height
+            && layout.source_start == source.start()
+            && layout.source_end == source.end()
     }) {
         return Ok(false);
     }
-    rebuild_wrap_index(slot, source, width)?;
+    rebuild_viewport_layout(slot, source, width, height)?;
     Ok(true)
 }
 
@@ -438,127 +481,180 @@ pub(super) fn progress_percent(source: SourceText<'_>, visible_end: SourceOffset
     u8::try_from(percent.min(99)).expect("progress is clamped to 99")
 }
 
-fn build_row_starts(
-    starts: &mut Vec<SourceOffset>,
+fn visual_row_boundary(
     source: SourceText<'_>,
-    width: ContentWidth,
-) -> Result<(), LayoutError> {
-    try_push_row_start(starts, source.start())?;
-    let mut atoms = DisplayAtoms::from_source(source);
-    let mut pending = VecDeque::<DisplayAtom<'_>>::new();
-
-    'rows: loop {
-        let mut consumed = 0usize;
-        let mut column = DisplayColumn::ZERO;
-        let mut last_whitespace: Option<(usize, SourceOffset)> = None;
-
-        loop {
-            if consumed == pending.len() {
-                match atoms.next() {
-                    Some(atom) => try_push_pending(&mut pending, atom)?,
-                    None => {
-                        remove_front(&mut pending, consumed);
-                        break 'rows;
-                    }
-                }
-            }
-
-            let atom = pending[consumed];
-            if atom.kind() == DisplayAtomKind::LineFeed {
-                let next_start = atom.source().end();
-                remove_front(&mut pending, consumed + 1);
-                try_push_row_start(starts, next_start)?;
-                continue 'rows;
-            }
-
-            let projected = atom
-                .project(column, width)
-                .expect("only line feeds have no projection");
-            if projected.fits_after(column, width) {
-                column = column.plus(projected.width());
-                if atom.is_unicode_whitespace() {
-                    last_whitespace = Some((consumed, atom.source().end()));
-                }
-                consumed += 1;
-                continue;
-            }
-
-            debug_assert!(consumed > 0);
-            let next_start = if let Some((whitespace_index, offset)) = last_whitespace {
-                remove_front(&mut pending, whitespace_index + 1);
-                offset
-            } else {
-                remove_front(&mut pending, consumed);
-                pending
-                    .front()
-                    .expect("overflow atom remains pending")
-                    .source()
-                    .start()
-            };
-            try_push_row_start(starts, next_start)?;
-            continue 'rows;
-        }
-    }
-
-    Ok(())
-}
-
-fn try_push_pending<'a>(
-    pending: &mut VecDeque<DisplayAtom<'a>>,
-    atom: DisplayAtom<'a>,
-) -> Result<(), LayoutError> {
-    if pending.len() == pending.capacity() {
-        pending
-            .try_reserve(1)
-            .map_err(|_| LayoutError::Allocation)?;
-    }
-    pending.push_back(atom);
-    Ok(())
-}
-
-fn remove_front<T>(pending: &mut VecDeque<T>, count: usize) {
-    for _ in 0..count {
-        let _ = pending.pop_front();
-    }
-}
-
-fn try_push_row_start(
-    starts: &mut Vec<SourceOffset>,
     start: SourceOffset,
-) -> Result<(), LayoutError> {
-    if let Some(previous) = starts.last().copied()
-        && previous >= start
-    {
-        return Err(LayoutError::NonIncreasingRowStart {
-            previous: previous.get(),
-            next: start.get(),
+    width: ContentWidth,
+) -> Option<VisualRowBoundary> {
+    let relative = source.relative_offset(start)?;
+    if !source.as_str().is_char_boundary(relative) {
+        return None;
+    }
+
+    let mut column = DisplayColumn::ZERO;
+    let mut consumed = false;
+    let mut last_whitespace = None;
+    for atom in DisplayAtoms::between(source, start, source.end())? {
+        if atom.kind() == DisplayAtomKind::LineFeed {
+            return Some(VisualRowBoundary {
+                end: atom.source().end(),
+                next: Some(atom.source().end()),
+            });
+        }
+
+        let projected = atom
+            .project(column, width)
+            .expect("only line feeds have no projection");
+        if projected.fits_after(column, width) {
+            column = column.plus(projected.width());
+            if atom.is_unicode_whitespace() {
+                last_whitespace = Some(atom.source().end());
+            }
+            consumed = true;
+            continue;
+        }
+
+        debug_assert!(consumed);
+        let next = last_whitespace.unwrap_or_else(|| atom.source().start());
+        return Some(VisualRowBoundary {
+            end: next,
+            next: Some(next),
         });
     }
-    if starts.len() == starts.capacity() {
-        starts.try_reserve(1).map_err(|_| LayoutError::Allocation)?;
+
+    Some(VisualRowBoundary {
+        end: source.end(),
+        next: None,
+    })
+}
+
+fn physical_line_start(source: SourceText<'_>, offset: SourceOffset) -> Option<SourceOffset> {
+    let relative = source.relative_offset(offset)?;
+    if !source.as_str().is_char_boundary(relative) {
+        return None;
     }
-    starts.push(start);
-    Ok(())
+    let bytes = source.as_str().as_bytes();
+    for index in (0..relative).rev() {
+        let line_end = match bytes[index] {
+            b'\n' => index + 1,
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => index + 2,
+            b'\r' => index + 1,
+            _ => continue,
+        };
+        if line_end <= relative {
+            return source.start().checked_add(line_end);
+        }
+    }
+    Some(source.start())
+}
+
+fn previous_row_start(
+    source: SourceText<'_>,
+    start: SourceOffset,
+    width: ContentWidth,
+) -> Option<SourceOffset> {
+    if start <= source.start() {
+        return Some(source.start());
+    }
+    let relative = source.relative_offset(start)?;
+    let previous = source.as_str()[..relative].char_indices().next_back()?.0;
+    let probe = source.start().checked_add(previous)?;
+    row_start_at_or_before(source, probe, width)
+}
+
+fn row_start_at_or_before(
+    source: SourceText<'_>,
+    offset: SourceOffset,
+    width: ContentWidth,
+) -> Option<SourceOffset> {
+    let mut row_start = physical_line_start(source, offset)?;
+    loop {
+        let Some(next) = visual_row_boundary(source, row_start, width)?.next else {
+            return Some(row_start);
+        };
+        if next > offset {
+            return Some(row_start);
+        }
+        row_start = next;
+        if row_start == offset {
+            return Some(row_start);
+        }
+    }
+}
+
+fn last_viewport_start(
+    source: SourceText<'_>,
+    width: ContentWidth,
+    height: BodyHeight,
+) -> Result<SourceOffset, LayoutError> {
+    let capacity = usize::from(height.get());
+    let mut trailing = VecDeque::new();
+    trailing
+        .try_reserve_exact(capacity)
+        .map_err(|_| LayoutError::Allocation)?;
+    let mut start = source.start();
+
+    loop {
+        if trailing.len() == capacity {
+            let _ = trailing.pop_front();
+        }
+        trailing.push_back(start);
+        let Some(next) = visual_row_boundary(source, start, width)
+            .expect("source starts are valid layout boundaries")
+            .next
+        else {
+            break;
+        };
+        if next <= start {
+            return Err(LayoutError::NonIncreasingRowStart {
+                previous: start.get(),
+                next: next.get(),
+            });
+        }
+        start = next;
+    }
+
+    Ok(*trailing
+        .front()
+        .expect("nonzero viewport height retains a row"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn index(text: &str, width: u16) -> WrapIndex {
+    fn layout_for(source: SourceText<'_>, width: u16, height: u16) -> ViewportLayout {
         let mut slot = None;
-        rebuild_wrap_index(
+        rebuild_viewport_layout(
             &mut slot,
-            SourceText::new(text),
+            source,
             ContentWidth::new(width).unwrap(),
+            BodyHeight::new(height).unwrap(),
         )
         .unwrap();
         slot.unwrap()
     }
 
-    fn projected(index: &WrapIndex, text: &str, row: u32) -> Vec<(String, u32)> {
-        index
-            .projected_row(SourceText::new(text), VisualRowIndex::new(row))
+    fn layout(text: &str, width: u16) -> ViewportLayout {
+        layout_for(SourceText::new(text), width, 2)
+    }
+
+    fn row_starts(layout: &ViewportLayout, source: SourceText<'_>) -> Vec<SourceOffset> {
+        let mut starts = vec![source.start()];
+        while let Some(next) = layout
+            .next_row_start(source, *starts.last().unwrap())
+            .unwrap()
+        {
+            starts.push(next);
+        }
+        starts
+    }
+
+    fn projected(layout: &ViewportLayout, text: &str, row: usize) -> Vec<(String, u32)> {
+        let source = SourceText::new(text);
+        let start = row_starts(layout, source)[row];
+        layout
+            .projected_row(source, start)
             .unwrap()
             .map(|atom| {
                 let text = match atom.projection() {
@@ -575,9 +671,9 @@ mod tests {
     #[test]
     fn projection_sanitizes_controls_tabs_and_zero_width_graphemes() {
         let text = "a\t\u{001b}\u{200b}ｶﾞ";
-        let index = index(text, 16);
+        let layout = layout(text, 16);
         assert_eq!(
-            projected(&index, text, 0),
+            projected(&layout, text, 0),
             vec![
                 ("a".to_owned(), 1),
                 ("   ".to_owned(), 3),
@@ -591,35 +687,50 @@ mod tests {
     #[test]
     fn wrapping_is_greedy_and_preserves_whitespace_and_blank_lines() {
         let text = "one two\n\nend\n";
-        let index = index(text, 4);
-        let starts: Vec<_> = index.starts.iter().map(|offset| offset.get()).collect();
+        let layout = layout(text, 4);
+        let starts: Vec<_> = row_starts(&layout, SourceText::new(text))
+            .into_iter()
+            .map(SourceOffset::get)
+            .collect();
         assert_eq!(starts, vec![0, 4, 8, 9, 13]);
-        assert_eq!(projected(&index, text, 0)[3].0, " ");
-        assert!(projected(&index, text, 2).is_empty());
-        assert!(projected(&index, text, 4).is_empty());
+        assert_eq!(projected(&layout, text, 0)[3].0, " ");
+        assert!(projected(&layout, text, 2).is_empty());
+        assert!(projected(&layout, text, 4).is_empty());
     }
 
     #[test]
     fn a_tab_that_cannot_fit_on_a_fresh_row_becomes_one_cell() {
         let text = "a\t";
-        let index = index(text, 2);
-        assert_eq!(index.starts, &[SourceOffset::ZERO, SourceOffset::new(1)]);
-        assert_eq!(projected(&index, text, 1), vec![("�".to_owned(), 1)]);
+        let layout = layout(text, 2);
+        assert_eq!(
+            row_starts(&layout, SourceText::new(text)),
+            [SourceOffset::ZERO, SourceOffset::new(1)]
+        );
+        assert_eq!(projected(&layout, text, 1), vec![("�".to_owned(), 1)]);
     }
 
     #[test]
     fn viewport_resolution_and_progress_are_clamped() {
-        let index = index("abcdefgh", 2);
-        let height = BodyHeight::new(2).unwrap();
-        assert_eq!(index.max_top(height), VisualRowIndex::new(2));
+        let source = SourceText::new("abcdefgh");
+        let layout = layout_for(source, 2, 2);
+        assert_eq!(layout.max_top(), SourceOffset::new(4));
         assert_eq!(
-            index.resolve_top(SourceOffset::new(7), false, height),
-            VisualRowIndex::new(2)
+            layout.resolve_top(source, SourceOffset::new(7), false),
+            Some(SourceOffset::new(4))
         );
         assert_eq!(
-            progress_percent(SourceText::new("abcdefgh"), SourceOffset::new(4)),
-            50
+            layout.move_row_start(source, SourceOffset::ZERO, true, 1),
+            Some(SourceOffset::new(2))
         );
+        assert_eq!(
+            layout.move_row_start(source, SourceOffset::new(2), false, 1),
+            Some(SourceOffset::ZERO)
+        );
+        assert_eq!(
+            layout.move_row_start(source, SourceOffset::ZERO, true, usize::MAX),
+            Some(SourceOffset::new(4))
+        );
+        assert_eq!(progress_percent(source, SourceOffset::new(4)), 50);
         assert_eq!(
             progress_percent(SourceText::new(""), SourceOffset::ZERO),
             100
@@ -630,12 +741,10 @@ mod tests {
     fn raw_line_endings_keep_large_source_offsets() {
         let start = SourceOffset::new(u64::from(u32::MAX) + 11);
         let source = SourceText::with_start("a\r\nb\rc\n", start).unwrap();
-        let mut slot = None;
-        rebuild_wrap_index(&mut slot, source, ContentWidth::new(8).unwrap()).unwrap();
-        let index = slot.unwrap();
+        let layout = layout_for(source, 8, 2);
 
         assert_eq!(
-            index.starts,
+            row_starts(&layout, source),
             vec![
                 start,
                 start.checked_add(3).unwrap(),
@@ -645,8 +754,8 @@ mod tests {
         );
         assert_eq!(progress_percent(source, start.checked_add(3).unwrap()), 42);
         assert_eq!(
-            index
-                .projected_row(source, VisualRowIndex::ZERO)
+            layout
+                .projected_row(source, start)
                 .unwrap()
                 .map(|atom| atom.projection())
                 .collect::<Vec<_>>(),
@@ -670,23 +779,23 @@ mod tests {
         for text in samples {
             for width in 1..=16 {
                 let source = SourceText::new(text);
-                let index = index(text, width);
-                assert_eq!(index.starts.first(), Some(&source.start()));
-                assert!(index.starts.windows(2).all(|pair| pair[0] < pair[1]));
-                assert!(index.starts.iter().all(|offset| {
+                let layout = layout(text, width);
+                let starts = row_starts(&layout, source);
+                assert_eq!(starts.first(), Some(&source.start()));
+                assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(starts.iter().all(|offset| {
                     source
                         .relative_offset(*offset)
                         .is_some_and(|offset| text.is_char_boundary(offset))
                 }));
-                assert!(index.row_count() <= text.graphemes(true).count() + 1);
+                assert!(starts.len() <= text.graphemes(true).count() + 1);
 
-                for row in 0..index.row_count() {
-                    let row = VisualRowIndex::new(u32::try_from(row).unwrap());
-                    let range = index.row_range(row).unwrap();
+                for start in &starts {
+                    let range = layout.row_range(source, *start).unwrap();
                     assert!(text.is_char_boundary(source.relative_offset(range.start).unwrap()));
                     assert!(text.is_char_boundary(source.relative_offset(range.end).unwrap()));
-                    let used: u32 = index
-                        .projected_row(source, row)
+                    let used: u32 = layout
+                        .projected_row(source, *start)
                         .unwrap()
                         .map(|atom| atom.width().get())
                         .sum();
@@ -694,14 +803,64 @@ mod tests {
                 }
 
                 assert_eq!(
-                    index
-                        .row_range(VisualRowIndex::new(
-                            u32::try_from(index.row_count() - 1).unwrap()
-                        ))
+                    layout
+                        .row_range(source, *starts.last().unwrap())
                         .unwrap()
                         .end,
                     source.end()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn local_navigation_round_trips_every_row_boundary() {
+        let samples = [
+            "",
+            "\n",
+            "\r\n",
+            "a\rb\r\nc\n",
+            "one two three four",
+            "e\u{301}🙂\u{200b}\ttext",
+        ];
+
+        for text in samples {
+            for width in 1..=8 {
+                let source = SourceText::new(text);
+                let layout = layout_for(source, width, 1);
+                let starts = row_starts(&layout, source);
+
+                for (index, start) in starts.iter().copied().enumerate() {
+                    assert_eq!(layout.row_start_at_or_before(source, start), Some(start));
+                    let expected_up = starts[index.saturating_sub(1)];
+                    assert_eq!(
+                        layout.move_row_start(source, start, false, 1),
+                        Some(expected_up)
+                    );
+                    let expected_down = starts.get(index + 1).copied().unwrap_or(start);
+                    assert_eq!(
+                        layout.move_row_start(source, start, true, 1),
+                        Some(expected_down)
+                    );
+                }
+
+                for relative in text
+                    .char_indices()
+                    .map(|(relative, _)| relative)
+                    .chain(std::iter::once(text.len()))
+                {
+                    let offset = source.start().checked_add(relative).unwrap();
+                    let expected = starts
+                        .iter()
+                        .copied()
+                        .take_while(|start| *start <= offset)
+                        .last()
+                        .unwrap();
+                    assert_eq!(
+                        layout.row_start_at_or_before(source, offset),
+                        Some(expected)
+                    );
+                }
             }
         }
     }
