@@ -1,202 +1,77 @@
-# TUT - Terminal UI Textual Browser
+# TUT
 
-A lightweight, high-performance terminal browser with a btop-style interface.
+TUT 0.0.1 is a local plain-text reader for macOS and Linux terminals. It reads one UTF-8 file, wraps text by terminal cell width, and provides navigation and literal search without modifying the source.
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![C++](https://img.shields.io/badge/C%2B%2B-17-orange)
+## Requirements
 
-## Features
+- Rust 1.88.0 or later
+- Cargo
+- GNU Make for the conventional build interface
+- A UTF-8 terminal with separate terminal stdin and stdout
 
-- **btop-style UI** - Modern four-panel layout with rounded borders
-- **Lightweight** - Binary size < 1MB, memory usage < 50MB
-- **Fast startup** - Launch in < 500ms
-- **Vim-style navigation** - j/k scrolling, / search, g/G jump
-- **Keyboard-driven** - Full keyboard navigation with function key shortcuts
-- **Themeable** - Multiple color themes (default, nord, gruvbox, solarized)
-- **Configurable** - TOML-based configuration
+## Build and install
 
-## Screenshot
-
-```
-╭──────────────────────────────────────────────────────────────────────────────╮
-│[◀] [▶] [⟳] ╭────────────────────────────────────────────────────────╮ [⚙] [?]│
-│           │https://example.com                                      │        │
-│           ╰────────────────────────────────────────────────────────╯        │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                          Example Domain                                      │
-├──────────────────────────────────────────────────────────────────────────────┤
-│This domain is for use in illustrative examples in documents.                 │
-│                                                                              │
-│[1] More information...                                                       │
-│                                                                              │
-├────────────────────────────────────────┬─────────────────────────────────────┤
-│📑 Bookmarks                            │📊 Status                            │
-│  example.com                           │  ⬇ 1.2 KB  🕐 0.3s                  │
-├────────────────────────────────────────┴─────────────────────────────────────┤
-│[F1]Help [F2]Bookmarks [F3]History [F10]Quit                                  │
-╰──────────────────────────────────────────────────────────────────────────────╯
+```sh
+make
+make check
+make install prefix=/usr/local
 ```
 
-## Installation
+Package builders can stage an installation without changing the live system:
 
-### Prerequisites
-
-**macOS (Homebrew):**
-```bash
-brew install cmake gumbo-parser openssl ftxui cpp-httplib toml11
+```sh
+make install DESTDIR="$package_root" prefix=/usr
+make installcheck DESTDIR="$package_root" prefix=/usr
 ```
 
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt install cmake libgumbo-dev libssl-dev
+Cargo remains available as the lower-level interface:
+
+```sh
+cargo build --release --locked
+cargo test --all-targets --locked
 ```
 
-### Building from Source
+## Usage
 
-```bash
-git clone https://github.com/m1ngsama/TUT.git
-cd TUT
-cmake -B build -DCMAKE_PREFIX_PATH=/opt/homebrew  # macOS
-cmake -B build                                      # Linux
-cmake --build build -j$(nproc)
+```text
+tut [OPTION]... FILE
 ```
 
-### Running
+Use `tut -- FILE` when the filename begins with `-`. `--help` and `--version` do not require a terminal.
 
-```bash
-./build/tut                      # Start with blank page
-./build/tut https://example.com  # Open URL directly
-./build/tut --help               # Show help
-```
+TUT accepts regular files and symlinks to regular files. Input must be valid UTF-8 and no larger than 33,554,432 raw bytes. One leading UTF-8 BOM is removed, and CRLF or lone CR line endings become LF. The source file is never written.
 
-## Keyboard Shortcuts
+## Keys
 
-### Navigation
 | Key | Action |
-|-----|--------|
-| `j` / `↓` | Scroll down |
-| `k` / `↑` | Scroll up |
-| `Space` | Page down |
-| `b` | Page up |
-| `g` | Go to top |
-| `G` | Go to bottom |
-| `Backspace` | Go back |
-| `f` | Go forward |
+|---|---|
+| `j`, Down | Move down one visual row |
+| `k`, Up | Move up one visual row |
+| Space, Page Down, Ctrl-F | Move down one page |
+| `b`, Page Up, Ctrl-B | Move up one page |
+| Ctrl-D, Ctrl-U | Move half a page |
+| `g`, Home | Go to the start |
+| `G`, End | Go to the end |
+| `/` | Edit a literal search |
+| Enter, Escape | Commit or cancel search editing |
+| `n`, `N` | Select the next or previous match |
+| `q`, Ctrl-C | Quit |
 
-### Links
-| Key | Action |
-|-----|--------|
-| `Tab` | Next link |
-| `Shift+Tab` | Previous link |
-| `Enter` | Follow link |
-| `1-9` | Jump to link by number |
+Search is case-sensitive, literal, and byte-preserving. A search draft is limited to 4096 UTF-8 bytes. Backspace removes one extended grapheme cluster.
 
-### Search
-| Key | Action |
-|-----|--------|
-| `/` | Start search |
-| `n` | Next result |
-| `N` | Previous result |
+## Exit status
 
-### UI
-| Key | Action |
-|-----|--------|
-| `Ctrl+L` | Focus address bar |
-| `F1` / `?` | Help |
-| `F2` | Bookmarks |
-| `F3` | History |
-| `Ctrl+D` | Add bookmark |
-| `Ctrl+Q` / `F10` / `q` | Quit |
+- `0` for help, version, normal quit, and keyboard Ctrl-C
+- `1` for file, terminal, allocation, rendering, event, or restoration failure
+- `2` for command-line usage errors
+- `129`, `130`, or `143` for external SIGHUP, SIGINT, or SIGTERM after successful restoration
 
-## Configuration
+Diagnostics use the `tut: message` form on standard error. Terminal control characters in paths and diagnostics are escaped.
 
-Configuration files are stored in `~/.config/tut/`:
+## Scope
 
-```
-~/.config/tut/
-├── config.toml      # Main configuration
-└── themes/          # Custom themes
-    └── mytheme.toml
-```
-
-### Example config.toml
-
-```toml
-[general]
-theme = "default"
-homepage = "https://example.com"
-debug = false
-
-[browser]
-timeout = 30
-user_agent = "TUT/0.1.0"
-
-[ui]
-word_wrap = true
-show_images = true
-```
-
-## Project Structure
-
-```
-TUT/
-├── CMakeLists.txt          # Build configuration
-├── README.md               # This file
-├── LICENSE                 # MIT License
-├── cmake/                  # CMake modules
-│   └── version.hpp.in
-├── src/                    # Source code
-│   ├── main.cpp           # Entry point
-│   ├── core/              # Browser engine, HTTP, URL parsing
-│   ├── ui/                # FTXUI components
-│   ├── renderer/          # HTML rendering
-│   └── utils/             # Logger, config, themes
-├── tests/                  # Unit and integration tests
-│   ├── unit/
-│   └── integration/
-└── assets/                 # Default configurations
-    ├── config.toml
-    ├── themes/
-    └── keybindings/
-```
-
-## Dependencies
-
-| Library | Purpose | Version |
-|---------|---------|---------|
-| [FTXUI](https://github.com/ArthurSonzogni/ftxui) | Terminal UI framework | 5.0+ |
-| [cpp-httplib](https://github.com/yhirose/cpp-httplib) | HTTP client | 0.14+ |
-| [gumbo-parser](https://github.com/google/gumbo-parser) | HTML parsing | 0.10+ |
-| [toml11](https://github.com/ToruNiina/toml11) | TOML configuration | 3.8+ |
-| [OpenSSL](https://www.openssl.org/) | HTTPS support | 1.1+ |
-
-## Limitations
-
-- **No JavaScript** - SPAs and dynamic content won't work
-- **No CSS layout** - Only basic text formatting
-- **No images** - ASCII art rendering planned for future
-- **Text-only** - Focused on readable content
-
-## Contributing
-
-Contributions are welcome! Please read the coding style guidelines:
-
-- C++17 standard
-- Google C++ Style Guide
-- Use `.hpp` for headers, `.cpp` for implementation
-- All public APIs must have documentation comments
+Version 0.0.1 intentionally has no stdin document input, network access, configuration, persistence, plugins, Markdown semantics, or Web support. It uses the narrow Unicode terminal-width policy; rendering can still vary with terminal font and emulator behavior.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Authors
-
-- **m1ngsama** - [GitHub](https://github.com/m1ngsama)
-
-## Acknowledgments
-
-- Inspired by [btop](https://github.com/aristocratos/btop) for UI design
-- [FTXUI](https://github.com/ArthurSonzogni/ftxui) for the amazing TUI framework
-- [lynx](https://lynx.invisible-island.net/) and [w3m](http://w3m.sourceforge.net/) for inspiration
+TUT is free software distributed under the MIT License. See [LICENSE](LICENSE).

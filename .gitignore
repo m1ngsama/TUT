@@ -1,26 +1,6 @@
-# Build artifacts
-build/
-build_ftxui/
-build_*/
-*.o
-*.a
-*.so
-*.dylib
-
-# Executables
-tut
-nbtca_tui
-
-# CMake artifacts
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-install_manifest.txt
-
-# Editor/IDE
+/target/
 .DS_Store
+.idea/
+.vscode/
 *.swp
 *.swo
-*~
-.vscode/
-.idea/
