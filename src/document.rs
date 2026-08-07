@@ -7,6 +7,7 @@ use std::{
 };
 
 use rustix::fs::{Mode, OFlags};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     error::{LoadError, sanitize_os},
@@ -18,11 +19,13 @@ pub const MAX_FILE_BYTES: usize = 33_554_432;
 const SOURCE_WINDOW_BYTES: usize = 64 * 1024;
 const UTF8_BOM_BYTES: usize = 3;
 const UTF8_BOUNDARY_SLOP_BYTES: usize = 3;
+const MAX_GRAPHEME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub(super) struct Document {
     store: DocumentStore,
     line_index: LineIndex,
+    path: PathBuf,
     display_path: String,
     display_name: String,
 }
@@ -44,9 +47,24 @@ impl Document {
         self.line_index.position(self.source(), offset)
     }
 
+    pub(super) fn reader<'a>(&'a self, cache: &'a mut DocumentCache) -> DocumentReader<'a> {
+        DocumentReader {
+            document: self,
+            cache,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn from_text(path: &Path, text: String) -> Self {
         Self::new(path, text).expect("test documents fit the line-index budget")
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_text_at(path: &Path, text: String, start: SourceOffset) -> Self {
+        let store = DocumentStore::InMemory(InMemoryStore::with_start(text, start));
+        let line_index =
+            build_line_index(&store, path).expect("test documents fit the line-index budget");
+        Self::from_parts(path, store, line_index)
     }
 
     #[cfg(test)]
@@ -64,9 +82,260 @@ impl Document {
         Self {
             store,
             line_index,
+            path: path.to_path_buf(),
             display_path: sanitize_os(path.as_os_str()),
             display_name: sanitize_os(path.file_name().unwrap_or(path.as_os_str())),
         }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DocumentCache {
+    chunk: Vec<u8>,
+    grapheme: Vec<u8>,
+    window_bytes: NonZeroUsize,
+}
+
+impl Default for DocumentCache {
+    fn default() -> Self {
+        Self {
+            chunk: Vec::new(),
+            grapheme: Vec::new(),
+            window_bytes: NonZeroUsize::new(SOURCE_WINDOW_BYTES)
+                .expect("source window size is nonzero"),
+        }
+    }
+}
+
+impl DocumentCache {
+    #[cfg(test)]
+    pub(super) fn with_window_bytes(window_bytes: usize) -> Self {
+        Self {
+            window_bytes: NonZeroUsize::new(window_bytes).expect("test window size is nonzero"),
+            ..Self::default()
+        }
+    }
+}
+
+pub(super) struct DocumentReader<'a> {
+    document: &'a Document,
+    cache: &'a mut DocumentCache,
+}
+
+impl<'document> DocumentReader<'document> {
+    pub(super) fn graphemes<'reader>(
+        &'reader mut self,
+        start: SourceOffset,
+    ) -> Result<DocumentGraphemes<'reader, 'document>, LoadError> {
+        let source = self.document.source();
+        source
+            .relative_offset(start)
+            .filter(|relative| source.as_str().is_char_boundary(*relative))
+            .ok_or_else(|| self.protocol_error("invalid grapheme cursor offset"))?;
+        self.cache.grapheme.clear();
+        Ok(DocumentGraphemes {
+            reader: self,
+            cursor: 0,
+            next_start: start,
+            loaded_end: start,
+        })
+    }
+
+    fn forward_window(
+        &mut self,
+        start: SourceOffset,
+        target_bytes: NonZeroUsize,
+    ) -> Result<SourceText<'_>, LoadError> {
+        self.document.store.copy_window(
+            WindowRequest::new(start, target_bytes),
+            &mut self.cache.chunk,
+        )
+    }
+
+    pub(super) fn source_start(&self) -> SourceOffset {
+        self.document.source().start()
+    }
+
+    pub(super) fn source_end(&self) -> SourceOffset {
+        self.document.source().end()
+    }
+
+    pub(super) fn line_start_at_or_before(
+        &self,
+        offset: SourceOffset,
+    ) -> Result<SourceOffset, LoadError> {
+        let source = self.document.source();
+        let relative = source
+            .relative_offset(offset)
+            .filter(|relative| source.as_str().is_char_boundary(*relative))
+            .ok_or_else(|| self.protocol_error("invalid physical-line offset"))?;
+        let bytes = source.as_str().as_bytes();
+        for index in (0..relative).rev() {
+            let line_end = match bytes[index] {
+                b'\n' => index + 1,
+                b'\r' if bytes.get(index + 1) == Some(&b'\n') => index + 2,
+                b'\r' => index + 1,
+                _ => continue,
+            };
+            if line_end <= relative {
+                return source
+                    .start()
+                    .checked_add(line_end)
+                    .ok_or_else(|| self.protocol_error("physical-line coordinates overflow"));
+            }
+        }
+        Ok(source.start())
+    }
+
+    pub(super) fn previous_char_start(
+        &self,
+        offset: SourceOffset,
+    ) -> Result<Option<SourceOffset>, LoadError> {
+        let source = self.document.source();
+        let relative = source
+            .relative_offset(offset)
+            .filter(|relative| source.as_str().is_char_boundary(*relative))
+            .ok_or_else(|| self.protocol_error("invalid character offset"))?;
+        let Some((previous, _)) = source.as_str()[..relative].char_indices().next_back() else {
+            return Ok(None);
+        };
+        source
+            .start()
+            .checked_add(previous)
+            .map(Some)
+            .ok_or_else(|| self.protocol_error("character coordinates overflow"))
+    }
+
+    fn protocol_error(&self, message: &'static str) -> LoadError {
+        LoadError::Read {
+            path: self.document.path.clone(),
+            source: io::Error::new(io::ErrorKind::InvalidData, message),
+        }
+    }
+}
+
+pub(super) struct DocumentGraphemes<'reader, 'document> {
+    reader: &'reader mut DocumentReader<'document>,
+    cursor: usize,
+    next_start: SourceOffset,
+    loaded_end: SourceOffset,
+}
+
+impl DocumentGraphemes<'_, '_> {
+    pub(super) fn next_grapheme(&mut self) -> Result<Option<SourceGrapheme<'_>>, LoadError> {
+        if self.next_start == self.reader.source_end() {
+            return Ok(None);
+        }
+        loop {
+            self.ensure_data()?;
+            let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
+                .expect("document caches contain validated UTF-8");
+            let candidate = &buffer[self.cursor..];
+            let grapheme_bytes = candidate
+                .graphemes(true)
+                .next()
+                .expect("a nonempty source has a grapheme")
+                .len();
+            let complete =
+                grapheme_bytes < candidate.len() || self.loaded_end == self.reader.source_end();
+
+            if complete {
+                return self.emit(grapheme_bytes, grapheme_bytes <= MAX_GRAPHEME_BYTES);
+            }
+            if candidate.len() >= MAX_GRAPHEME_BYTES {
+                return self.emit(candidate.len(), false);
+            }
+            self.compact();
+            self.append_window()?;
+        }
+    }
+
+    fn ensure_data(&mut self) -> Result<(), LoadError> {
+        if self.cursor < self.reader.cache.grapheme.len() {
+            return Ok(());
+        }
+        self.reader.cache.grapheme.clear();
+        self.cursor = 0;
+        self.loaded_end = self.next_start;
+        self.append_window()
+    }
+
+    fn compact(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let remaining = self.reader.cache.grapheme.len() - self.cursor;
+        self.reader.cache.grapheme.copy_within(self.cursor.., 0);
+        self.reader.cache.grapheme.truncate(remaining);
+        self.cursor = 0;
+    }
+
+    fn append_window(&mut self) -> Result<(), LoadError> {
+        let remaining_budget = MAX_GRAPHEME_BYTES
+            .saturating_sub(self.reader.cache.grapheme.len())
+            .max(1);
+        let target = NonZeroUsize::new(self.reader.cache.window_bytes.get().min(remaining_budget))
+            .expect("window targets are nonzero");
+        let expected_start = self.loaded_end;
+        let (start, end, length) = {
+            let window = self.reader.forward_window(expected_start, target)?;
+            (window.start(), window.end(), window.len_bytes())
+        };
+        if start != expected_start || end <= start {
+            return Err(self.reader.protocol_error("non-contiguous document window"));
+        }
+        self.reader
+            .cache
+            .grapheme
+            .try_reserve_exact(length)
+            .map_err(|_| LoadError::Allocation("grapheme buffer"))?;
+        self.reader
+            .cache
+            .grapheme
+            .extend_from_slice(&self.reader.cache.chunk);
+        self.loaded_end = end;
+        Ok(())
+    }
+
+    fn emit(
+        &mut self,
+        length: usize,
+        include_text: bool,
+    ) -> Result<Option<SourceGrapheme<'_>>, LoadError> {
+        let start = self.next_start;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| self.reader.protocol_error("grapheme coordinates overflow"))?;
+        let text_start = self.cursor;
+        self.cursor += length;
+        self.next_start = end;
+        let text = include_text.then(|| {
+            let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
+                .expect("document caches contain validated UTF-8");
+            &buffer[text_start..text_start + length]
+        });
+        Ok(Some(SourceGrapheme { start, end, text }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SourceGrapheme<'a> {
+    start: SourceOffset,
+    end: SourceOffset,
+    text: Option<&'a str>,
+}
+
+impl<'a> SourceGrapheme<'a> {
+    pub(super) const fn start(self) -> SourceOffset {
+        self.start
+    }
+
+    pub(super) const fn end(self) -> SourceOffset {
+        self.end
+    }
+
+    pub(super) const fn text(self) -> Option<&'a str> {
+        self.text
     }
 }
 
@@ -86,10 +355,13 @@ impl DocumentStore {
         }
     }
 
-    #[cfg(test)]
-    fn window(&self, request: WindowRequest) -> io::Result<SourceText<'_>> {
+    fn copy_window<'a>(
+        &self,
+        request: WindowRequest,
+        output: &'a mut Vec<u8>,
+    ) -> Result<SourceText<'a>, LoadError> {
         match self {
-            Self::InMemory(store) => store.window(request),
+            Self::InMemory(store) => store.copy_window(request, output),
         }
     }
 }
@@ -98,6 +370,7 @@ impl DocumentStore {
 struct InMemoryStore {
     source: String,
     content_start: usize,
+    source_start: SourceOffset,
 }
 
 impl InMemoryStore {
@@ -110,23 +383,49 @@ impl InMemoryStore {
         Self {
             source,
             content_start,
+            source_start: SourceOffset::from_usize(content_start),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_start(source: String, source_start: SourceOffset) -> Self {
+        Self {
+            source,
+            content_start: 0,
+            source_start,
         }
     }
 
     fn source(&self) -> SourceText<'_> {
-        SourceText::with_start(
-            &self.source[self.content_start..],
-            SourceOffset::from_usize(self.content_start),
-        )
-        .expect("an in-memory source span fits in u64 coordinates")
+        SourceText::with_start(&self.source[self.content_start..], self.source_start)
+            .expect("an in-memory source span fits in u64 coordinates")
     }
 
-    #[cfg(test)]
-    fn window(&self, request: WindowRequest) -> io::Result<SourceText<'_>> {
-        self.source().window(request).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid source window request")
-        })
+    fn copy_window<'a>(
+        &self,
+        request: WindowRequest,
+        output: &'a mut Vec<u8>,
+    ) -> Result<SourceText<'a>, LoadError> {
+        let source = self
+            .source()
+            .window(request)
+            .expect("document readers request valid forward windows");
+        copy_source(source, output)
     }
+}
+
+fn copy_source<'a>(
+    source: SourceText<'_>,
+    output: &'a mut Vec<u8>,
+) -> Result<SourceText<'a>, LoadError> {
+    output.clear();
+    output
+        .try_reserve_exact(source.len_bytes())
+        .map_err(|_| LoadError::Allocation("source window"))?;
+    output.extend_from_slice(source.as_str().as_bytes());
+    let text = std::str::from_utf8(output).expect("copied source windows remain valid UTF-8");
+    Ok(SourceText::with_start(text, source.start())
+        .expect("copied source windows retain validated coordinates"))
 }
 
 pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
@@ -141,15 +440,11 @@ fn build_line_index(store: &DocumentStore, path: &Path) -> Result<LineIndex, Loa
     let mut index = LineIndex::new(source.start(), source.end())
         .map_err(|error| map_line_index_error(path, error))?;
     let target = NonZeroUsize::new(SOURCE_WINDOW_BYTES).expect("source window size is nonzero");
+    let mut scratch = Vec::new();
     let mut cursor = source.start();
 
     while cursor < source.end() {
-        let window = store
-            .window(WindowRequest::new(cursor, target))
-            .map_err(|source| LoadError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let window = store.copy_window(WindowRequest::new(cursor, target), &mut scratch)?;
         index
             .extend(window)
             .map_err(|error| map_line_index_error(path, error))?;
@@ -385,6 +680,7 @@ mod tests {
     use std::fs;
 
     use tempfile::tempdir;
+    use unicode_segmentation::UnicodeSegmentation;
 
     use super::*;
 
@@ -546,5 +842,69 @@ mod tests {
             .unwrap();
 
         assert_eq!((position.current(), position.total()), (2, 2));
+    }
+
+    #[test]
+    fn incremental_graphemes_match_contiguous_segmentation_at_every_small_window_size() {
+        let text = "\u{feff}a\r\ne\u{301}🇷🇸🇮🇴👩\u{200d}🔬क्\u{200d}ष\u{200b}z";
+        let document = Document::from_text(Path::new("unicode.txt"), text.to_owned());
+        let source = document.source();
+        let expected: Vec<_> = source
+            .as_str()
+            .grapheme_indices(true)
+            .map(|(relative, grapheme)| {
+                (
+                    source.start().checked_add(relative).unwrap(),
+                    grapheme.to_owned(),
+                )
+            })
+            .collect();
+
+        for window_bytes in 1..=8 {
+            let mut cache = DocumentCache::with_window_bytes(window_bytes);
+            let mut reader = document.reader(&mut cache);
+            let mut graphemes = reader.graphemes(source.start()).unwrap();
+            let mut actual = Vec::new();
+            while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+                actual.push((
+                    grapheme.start(),
+                    grapheme
+                        .text()
+                        .expect("test graphemes fit the limit")
+                        .to_owned(),
+                ));
+            }
+            assert_eq!(actual, expected, "window size {window_bytes}");
+        }
+    }
+
+    #[test]
+    fn oversized_graphemes_are_bounded_and_preserve_following_coordinates() {
+        let combining_count = MAX_GRAPHEME_BYTES / '\u{301}'.len_utf8() + 1;
+        let mut text = String::with_capacity(1 + combining_count * '\u{301}'.len_utf8() + 1);
+        text.push('a');
+        text.extend(std::iter::repeat_n('\u{301}', combining_count));
+        text.push('z');
+
+        let document = Document::from_text(Path::new("oversized.txt"), text);
+        let source_end = document.source().end();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+        let first = graphemes.next_grapheme().unwrap().unwrap();
+
+        assert_eq!(first.start(), SourceOffset::ZERO);
+        assert!(first.text().is_none());
+        assert!(first.end().get() <= (MAX_GRAPHEME_BYTES + UTF8_BOUNDARY_SLOP_BYTES) as u64);
+
+        let mut next_start = first.end();
+        let mut saw_final = false;
+        while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+            assert_eq!(grapheme.start(), next_start);
+            saw_final |= grapheme.text() == Some("z");
+            next_start = grapheme.end();
+        }
+        assert!(saw_final);
+        assert_eq!(next_start, source_end);
     }
 }

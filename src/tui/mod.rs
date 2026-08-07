@@ -118,7 +118,7 @@ trait TerminalDriver {
     fn enable_raw_mode(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
     fn hide_cursor(&mut self) -> io::Result<()>;
-    fn draw(&mut self, app: &App) -> Result<(), TutError>;
+    fn draw(&mut self, app: &mut App) -> Result<(), TutError>;
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read(&mut self) -> io::Result<Event>;
     fn show_cursor(&mut self) -> io::Result<()>;
@@ -385,7 +385,7 @@ impl TerminalDriver for CrosstermDriver {
         execute!(self.terminal.backend_mut(), Hide)
     }
 
-    fn draw(&mut self, app: &App) -> Result<(), TutError> {
+    fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
         let state = app.render_state()?;
         let mut view_result = Ok(());
         self.terminal
@@ -496,7 +496,7 @@ mod tests {
             self.call("hide_cursor")
         }
 
-        fn draw(&mut self, _app: &App) -> Result<(), TutError> {
+        fn draw(&mut self, _app: &mut App) -> Result<(), TutError> {
             self.call("draw").map_err(|source| TutError::Io {
                 operation: "draw terminal frame",
                 source,

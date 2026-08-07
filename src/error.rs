@@ -26,7 +26,16 @@ pub enum LoadError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutError {
     Allocation,
-    NonIncreasingRowStart { previous: u64, next: u64 },
+    NonIncreasingRowStart {
+        previous: u64,
+        next: u64,
+    },
+    SourceRangeMismatch {
+        expected_start: u64,
+        expected_end: u64,
+        actual_start: u64,
+        actual_end: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +137,14 @@ impl TutError {
             Self::Layout(LayoutError::NonIncreasingRowStart { previous, next }) => {
                 format!("visual-row starts are not strictly increasing: {previous} then {next}")
             }
+            Self::Layout(LayoutError::SourceRangeMismatch {
+                expected_start,
+                expected_end,
+                actual_start,
+                actual_end,
+            }) => format!(
+                "layout source range {expected_start}..{expected_end} does not match {actual_start}..{actual_end}"
+            ),
             Self::Search(SearchError::Allocation) => {
                 "could not allocate the search index".to_owned()
             }

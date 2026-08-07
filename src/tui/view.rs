@@ -47,12 +47,12 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(
     Ok(())
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, rows: &[RenderRow<'_>]) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, rows: &[RenderRow]) {
     frame.render_widget(ReaderBody { rows }, area);
 }
 
 struct ReaderBody<'a> {
-    rows: &'a [RenderRow<'a>],
+    rows: &'a [RenderRow],
 }
 
 impl Widget for ReaderBody<'_> {
@@ -67,13 +67,13 @@ impl Widget for ReaderBody<'_> {
                 if width > area.right().saturating_sub(x) {
                     break;
                 }
-                x += write_render_span(buffer, x, y, span);
+                x += write_render_span(buffer, x, y, &row.text, span);
             }
         }
     }
 }
 
-fn write_render_span(buffer: &mut Buffer, x: u16, y: u16, span: &RenderSpan<'_>) -> u16 {
+fn write_render_span(buffer: &mut Buffer, x: u16, y: u16, row: &str, span: &RenderSpan) -> u16 {
     let width =
         u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
     let style = style_for(span.highlight);
@@ -97,7 +97,7 @@ fn write_render_span(buffer: &mut Buffer, x: u16, y: u16, span: &RenderSpan<'_>)
         .cell_mut((x, y))
         .expect("span was clipped to the buffer area");
     cell.reset();
-    cell.set_symbol(span.text.as_str())
+    cell.set_symbol(span.text(row))
         .set_style(style)
         .set_diff_option(CellDiffOption::ForcedWidth(forced_width));
     for offset in 1..width {
@@ -128,17 +128,18 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
 
     let mut column = DisplayColumn::ZERO;
     let mut x = area.x;
+    let mut row = String::new();
     for atom in DisplayAtoms::new(text) {
         let Some(projected) = atom.project(column, content_width) else {
             continue;
         };
-        let span = RenderSpan::from_projected(projected, Highlight::None)?;
+        let span = RenderSpan::from_projected(projected, Highlight::None, &mut row)?;
         let width =
             u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
         if width > area.right().saturating_sub(x) {
             break;
         }
-        x += write_render_span(frame.buffer_mut(), x, area.y, &span);
+        x += write_render_span(frame.buffer_mut(), x, area.y, &row, &span);
         column = DisplayColumn::new(column.get() + u32::from(width));
     }
     Ok(())
@@ -311,7 +312,7 @@ mod tests {
     use super::*;
     use crate::app::{Action, Geometry, app_from_text};
 
-    fn draw(app: &crate::app::App, width: u16, height: u16) -> Buffer {
+    fn draw(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = app.render_state().unwrap();
@@ -333,7 +334,7 @@ mod tests {
     fn frame_renders_fixed_regions_and_empty_progress() {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), String::new());
         app.update(Action::Resize(Geometry::new(40, 5))).unwrap();
-        let buffer = draw(&app, 40, 5);
+        let buffer = draw(&mut app, 40, 5);
         assert!(row_text(&buffer, 0).starts_with("book.txt"));
         assert_eq!(row_text(&buffer, 3), "100%  1/1");
         assert!(row_text(&buffer, 4).contains("move"));
@@ -348,7 +349,7 @@ mod tests {
             app.update(Action::SearchInsert(character)).unwrap();
         }
         app.update(Action::SearchCommit).unwrap();
-        let buffer = draw(&app, 20, 4);
+        let buffer = draw(&mut app, 20, 4);
         let first = buffer.cell((0, 1)).unwrap();
         assert_eq!(first.symbol(), "ｶﾞ");
         assert_eq!(
@@ -369,13 +370,13 @@ mod tests {
             app.update(Action::SearchInsert(character)).unwrap();
         }
         app.update(Action::SearchCommit).unwrap();
-        assert!(row_text(&draw(&app, 48, 4), 2).ends_with("— no matches"));
+        assert!(row_text(&draw(&mut app, 48, 4), 2).ends_with("— no matches"));
     }
 
     #[test]
     fn tiny_frames_render_only_the_resize_message() {
-        let app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
-        let buffer = draw(&app, 12, 3);
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
+        let buffer = draw(&mut app, 12, 3);
         assert_eq!(row_text(&buffer, 0), "terminal too");
         assert_eq!(row_text(&buffer, 1), "");
     }

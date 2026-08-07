@@ -97,7 +97,6 @@ impl<'a> SourceText<'a> {
         self.text.get(start..end)
     }
 
-    #[cfg(test)]
     pub(super) fn window(self, request: WindowRequest) -> Option<Self> {
         let start = self.relative_offset(request.start())?;
         if !self.text.is_char_boundary(start) {

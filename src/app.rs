@@ -4,7 +4,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub(super) use crate::layout::{ContentWidth, DisplayAtoms, DisplayColumn};
 use crate::{
-    document::Document,
+    document::{Document, DocumentCache, DocumentReader},
     error::TutError,
     layout::{
         BodyHeight, DOTTED_CIRCLE, DisplayProjection, GraphemeRange, ProjectedAtom,
@@ -12,7 +12,7 @@ use crate::{
     },
     line_index::LinePosition,
     search::{IntersectingMatches, MatchIndex, SearchRange},
-    source::{SourceOffset, SourceText},
+    source::SourceOffset,
 };
 
 pub(super) const MIN_TERMINAL_COLUMNS: u16 = 16;
@@ -107,46 +107,34 @@ pub(super) enum Highlight {
     Current,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RenderText<'a> {
-    Borrowed(&'a str),
-    OwnedZeroWidth(String),
-}
-
-impl RenderText<'_> {
-    pub(super) fn as_str(&self) -> &str {
-        match self {
-            Self::Borrowed(text) => text,
-            Self::OwnedZeroWidth(text) => text,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RenderProjectionKind {
     Text,
     Spaces,
     Replacement,
-    OwnedZeroWidth,
+    DottedCircle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RenderSpan<'a> {
-    pub text: RenderText<'a>,
+pub(super) struct RenderSpan {
+    text: Range<usize>,
     pub projection: RenderProjectionKind,
     pub cell_width: DisplayColumn,
     pub highlight: Highlight,
 }
 
-impl<'a> RenderSpan<'a> {
+impl RenderSpan {
     pub(super) fn from_projected(
-        atom: ProjectedAtom<'a>,
+        atom: ProjectedAtom<'_>,
         highlight: Highlight,
+        output: &mut String,
     ) -> Result<Self, TutError> {
         let cell_width = atom.width();
-        let (projection, text) = match atom.projection() {
+        let start = output.len();
+        let projection = match atom.projection() {
             DisplayProjection::Text(text) => {
-                (RenderProjectionKind::Text, RenderText::Borrowed(text))
+                append_render_text(output, text)?;
+                RenderProjectionKind::Text
             }
             DisplayProjection::Spaces(count) => {
                 let text = match count {
@@ -156,49 +144,60 @@ impl<'a> RenderSpan<'a> {
                     4 => "    ",
                     _ => unreachable!("tab expansion is one through four cells"),
                 };
-                (RenderProjectionKind::Spaces, RenderText::Borrowed(text))
+                append_render_text(output, text)?;
+                RenderProjectionKind::Spaces
             }
-            DisplayProjection::Replacement => (
-                RenderProjectionKind::Replacement,
-                RenderText::Borrowed(REPLACEMENT_CHARACTER),
-            ),
+            DisplayProjection::Replacement => {
+                append_render_text(output, REPLACEMENT_CHARACTER)?;
+                RenderProjectionKind::Replacement
+            }
             DisplayProjection::DottedCircle(source) => {
-                let capacity = DOTTED_CIRCLE
+                let additional = DOTTED_CIRCLE
                     .len()
                     .checked_add(source.len())
                     .ok_or(TutError::Allocation("zero-width render atom"))?;
-                let mut visible = String::new();
-                visible
-                    .try_reserve_exact(capacity)
+                output
+                    .try_reserve_exact(additional)
                     .map_err(|_| TutError::Allocation("zero-width render atom"))?;
-                visible.push_str(DOTTED_CIRCLE);
-                visible.push_str(source);
-                (
-                    RenderProjectionKind::OwnedZeroWidth,
-                    RenderText::OwnedZeroWidth(visible),
-                )
+                output.push_str(DOTTED_CIRCLE);
+                output.push_str(source);
+                RenderProjectionKind::DottedCircle
             }
         };
 
         Ok(Self {
-            text,
+            text: start..output.len(),
             projection,
             cell_width,
             highlight,
         })
     }
+
+    pub(super) fn text<'a>(&self, row: &'a str) -> &'a str {
+        row.get(self.text.clone())
+            .expect("render spans retain valid row-text boundaries")
+    }
+}
+
+fn append_render_text(output: &mut String, text: &str) -> Result<(), TutError> {
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| TutError::Allocation("visible row text"))?;
+    output.push_str(text);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RenderRow<'a> {
-    pub spans: Vec<RenderSpan<'a>>,
+pub(super) struct RenderRow {
+    pub text: String,
+    pub spans: Vec<RenderSpan>,
 }
 
 #[derive(Debug)]
 pub(super) struct RenderState<'a> {
     pub filename: &'a str,
     pub path: &'a str,
-    pub rows: Vec<RenderRow<'a>>,
+    pub rows: Vec<RenderRow>,
     pub progress: u8,
     pub current_line: u64,
     pub total_lines: u64,
@@ -207,6 +206,7 @@ pub(super) struct RenderState<'a> {
 
 pub(super) struct App {
     document: Document,
+    document_cache: DocumentCache,
     layout: Option<ViewportLayout>,
     anchor: SourceOffset,
     follow_end: bool,
@@ -227,6 +227,7 @@ impl App {
         let anchor = document.source().start();
         Self {
             document,
+            document_cache: DocumentCache::default(),
             layout: None,
             anchor,
             follow_end: false,
@@ -260,48 +261,57 @@ impl App {
         }
     }
 
-    pub(super) fn viewport(&self) -> Option<Viewport> {
-        let source = self.document.source();
-        let layout = self.layout.as_ref()?;
-        let (visible_rows, visible_end) = layout.visible_extent(source, self.anchor)?;
-        Some(Viewport {
+    pub(super) fn viewport(&mut self) -> Result<Option<Viewport>, TutError> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Ok(None);
+        };
+        let mut reader = self.document.reader(&mut self.document_cache);
+        let (visible_rows, visible_end) = layout.visible_extent(&mut reader, self.anchor)?;
+        Ok(Some(Viewport {
             visible_rows,
             first_visible_start: self.anchor,
             visible_end,
-        })
+        }))
     }
 
-    pub(super) fn progress_percent(&self) -> u8 {
-        let source = self.document.source();
-        match self.viewport() {
-            Some(viewport) => progress_percent(source, viewport.visible_end),
-            None if source.start() == source.end() => 100,
-            None => 0,
-        }
+    #[cfg(test)]
+    pub(super) fn progress_percent(&mut self) -> Result<u8, TutError> {
+        let viewport = self.viewport()?;
+        Ok(self.progress_for(viewport))
     }
 
-    pub(super) fn render_state(&self) -> Result<RenderState<'_>, TutError> {
-        let line = self.line_position();
+    pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
+        let viewport = self.viewport()?;
+        let line = self.line_position_for(viewport);
+        let progress = self.progress_for(viewport);
+        let rows = self.build_render_rows(viewport)?;
         Ok(RenderState {
             filename: self.document.display_name(),
             path: self.document.display_path(),
-            rows: self.build_render_rows()?,
-            progress: self.progress_percent(),
+            rows,
+            progress,
             current_line: line.current(),
             total_lines: line.total(),
             status: self.search_status(),
         })
     }
 
-    fn line_position(&self) -> LinePosition {
-        let offset = self
-            .viewport()
-            .map_or(self.document.source().start(), |viewport| {
-                viewport.first_visible_start
-            });
+    fn line_position_for(&self, viewport: Option<Viewport>) -> LinePosition {
+        let offset = viewport.map_or(self.document.source().start(), |viewport| {
+            viewport.first_visible_start
+        });
         self.document
             .line_position(offset)
             .expect("viewport anchors are valid document boundaries")
+    }
+
+    fn progress_for(&self, viewport: Option<Viewport>) -> u8 {
+        let source = self.document.source();
+        match viewport {
+            Some(viewport) => progress_percent(source.start(), source.end(), viewport.visible_end),
+            None if source.start() == source.end() => 100,
+            None => 0,
+        }
     }
 
     pub(super) fn update(&mut self, action: Action) -> Result<Outcome, TutError> {
@@ -316,12 +326,12 @@ impl App {
         let editing = matches!(self.mode, Mode::SearchInput { .. });
         let changed = match action {
             Action::Resize(geometry) => self.resize(geometry)?,
-            Action::LineDown if reading => self.move_rows(true, 1),
-            Action::LineUp if reading => self.move_rows(false, 1),
-            Action::PageDown if reading => self.move_rows(true, self.page_amount()),
-            Action::PageUp if reading => self.move_rows(false, self.page_amount()),
-            Action::HalfPageDown if reading => self.move_rows(true, self.half_page_amount()),
-            Action::HalfPageUp if reading => self.move_rows(false, self.half_page_amount()),
+            Action::LineDown if reading => self.move_rows(true, 1)?,
+            Action::LineUp if reading => self.move_rows(false, 1)?,
+            Action::PageDown if reading => self.move_rows(true, self.page_amount())?,
+            Action::PageUp if reading => self.move_rows(false, self.page_amount())?,
+            Action::HalfPageDown if reading => self.move_rows(true, self.half_page_amount())?,
+            Action::HalfPageUp if reading => self.move_rows(false, self.half_page_amount())?,
             Action::DocumentStart if reading => self.document_start(),
             Action::DocumentEnd if reading => self.document_end(),
             Action::BeginSearch if reading => self.begin_search(),
@@ -329,8 +339,8 @@ impl App {
             Action::SearchBackspace if editing => self.backspace_search(),
             Action::SearchCommit if editing => self.commit_search()?,
             Action::SearchCancel if editing => self.cancel_search(),
-            Action::NextMatch if reading => self.select_match(true),
-            Action::PreviousMatch if reading => self.select_match(false),
+            Action::NextMatch if reading => self.select_match(true)?,
+            Action::PreviousMatch if reading => self.select_match(false)?,
             _ => false,
         };
 
@@ -365,27 +375,25 @@ impl App {
             return Ok(geometry_changed);
         }
 
+        let mut reader = self.document.reader(&mut self.document_cache);
         let rebuilt = ensure_viewport_layout(
             &mut self.layout,
-            self.document.source(),
+            &mut reader,
             geometry.content_width(),
             geometry.body_height(),
         )?;
         let layout = self.layout.as_ref().expect("usable geometry has a layout");
-        self.anchor = layout
-            .resolve_top(self.document.source(), self.anchor, self.follow_end)
-            .expect("document anchors are valid source boundaries");
+        self.anchor = layout.resolve_top(&mut reader, self.anchor, self.follow_end)?;
 
         Ok(geometry_changed || rebuilt || old_anchor != self.anchor)
     }
 
-    fn move_rows(&mut self, downward: bool, amount: usize) -> bool {
+    fn move_rows(&mut self, downward: bool, amount: usize) -> Result<bool, TutError> {
         let layout = self.layout.as_ref().expect("usable geometry");
         let old_anchor = self.anchor;
         let old_follow_end = self.follow_end;
-        let target = layout
-            .move_row_start(self.document.source(), self.anchor, downward, amount)
-            .expect("document anchors are valid source boundaries");
+        let mut reader = self.document.reader(&mut self.document_cache);
+        let target = layout.move_row_start(&mut reader, self.anchor, downward, amount)?;
 
         self.anchor = target;
         if downward {
@@ -396,7 +404,7 @@ impl App {
             self.follow_end = false;
         }
 
-        old_anchor != self.anchor || old_follow_end != self.follow_end
+        Ok(old_anchor != self.anchor || old_follow_end != self.follow_end)
     }
 
     fn document_start(&mut self) -> bool {
@@ -470,7 +478,7 @@ impl App {
         }
 
         let first_visible = self
-            .viewport()
+            .viewport()?
             .map_or(self.document.source().start(), |viewport| {
                 viewport.first_visible_start
             });
@@ -481,14 +489,14 @@ impl App {
         self.match_index = Some(index);
         self.current_match = selected;
         if let Some(selected) = selected {
-            self.jump_to_match(selected);
+            let _ = self.jump_to_match(selected)?;
         }
         Ok(true)
     }
 
-    fn select_match(&mut self, forward: bool) -> bool {
+    fn select_match(&mut self, forward: bool) -> Result<bool, TutError> {
         let (Some(index), Some(current)) = (self.match_index.as_ref(), self.current_match) else {
-            return false;
+            return Ok(false);
         };
         let selected = if forward {
             index.next_after(current)
@@ -496,39 +504,38 @@ impl App {
             index.previous_before(current)
         };
         let Some(selected) = selected else {
-            return false;
+            return Ok(false);
         };
         let changed = self.current_match != Some(selected);
         self.current_match = Some(selected);
-        self.jump_to_match(selected) || changed
+        Ok(self.jump_to_match(selected)? || changed)
     }
 
-    fn jump_to_match(&mut self, selected: SearchRange) -> bool {
+    fn jump_to_match(&mut self, selected: SearchRange) -> Result<bool, TutError> {
         let body_height = self.geometry.body_height().expect("usable geometry");
         let layout = self.layout.as_ref().expect("usable geometry");
-        let match_row = layout
-            .row_start_at_or_before(self.document.source(), selected.start())
-            .expect("search matches have valid source boundaries");
-        let anchor = layout
-            .move_row_start(
-                self.document.source(),
-                match_row,
-                false,
-                usize::from(body_height.get() / 2),
-            )
-            .expect("search matches have valid source boundaries");
+        let mut reader = self.document.reader(&mut self.document_cache);
+        let match_row = layout.row_start_at_or_before(&mut reader, selected.start())?;
+        let anchor = layout.move_row_start(
+            &mut reader,
+            match_row,
+            false,
+            usize::from(body_height.get() / 2),
+        )?;
         let changed = self.anchor != anchor || self.follow_end;
         self.anchor = anchor;
         self.follow_end = false;
-        changed
+        Ok(changed)
     }
 
-    fn build_render_rows(&self) -> Result<Vec<RenderRow<'_>>, TutError> {
-        let Some(viewport) = self.viewport() else {
+    fn build_render_rows(
+        &mut self,
+        viewport: Option<Viewport>,
+    ) -> Result<Vec<RenderRow>, TutError> {
+        let Some(viewport) = viewport else {
             return Ok(Vec::new());
         };
         let layout = self.layout.as_ref().expect("viewport has a layout");
-        let source = self.document.source();
         let visible = viewport.first_visible_start..viewport.visible_end;
         let mut matches =
             MatchCursor::for_viewport(self.match_index.as_ref(), self.current_match, visible);
@@ -537,40 +544,38 @@ impl App {
             .map_err(|_| TutError::Allocation("visible rows"))?;
 
         let mut start = viewport.first_visible_start;
+        let mut reader = self.document.reader(&mut self.document_cache);
         for row_number in 0..viewport.visible_rows {
-            let spans = build_render_row(layout, source, start, &mut matches)?;
-            rows.push(RenderRow { spans });
+            let (row, next) = build_render_row(layout, &mut reader, start, &mut matches)?;
+            rows.push(row);
             if row_number + 1 < viewport.visible_rows {
-                start = layout
-                    .next_row_start(source, start)
-                    .expect("visible row starts are valid source boundaries")
-                    .expect("non-final visible rows have successors");
+                start = next.expect("non-final visible rows have successors");
             }
         }
         Ok(rows)
     }
 }
 
-fn build_render_row<'a>(
+fn build_render_row(
     layout: &ViewportLayout,
-    source: SourceText<'a>,
+    reader: &mut DocumentReader<'_>,
     start: SourceOffset,
     matches: &mut MatchCursor<'_>,
-) -> Result<Vec<RenderSpan<'a>>, TutError> {
+) -> Result<(RenderRow, Option<SourceOffset>), TutError> {
+    let mut text = String::new();
     let mut spans = Vec::new();
-    for atom in layout
-        .projected_row(source, start)
-        .expect("visible row matches immutable document")
-    {
+    let next = layout.visit_projected_row(reader, start, |atom| {
         let highlight = matches.role_for(atom.source());
         if spans.len() == spans.capacity() {
             spans
                 .try_reserve(1)
                 .map_err(|_| TutError::Allocation("visible row spans"))?;
         }
-        spans.push(RenderSpan::from_projected(atom, highlight)?);
-    }
-    Ok(spans)
+        let span = RenderSpan::from_projected(atom, highlight, &mut text)?;
+        spans.push(span);
+        Ok(())
+    })?;
+    Ok((RenderRow { text, spans }, next))
 }
 
 struct MatchCursor<'a> {
@@ -663,16 +668,16 @@ mod tests {
     fn navigation_clamps_and_preserves_end_following_across_reflow() {
         let mut app = reader("0123456789abcdef", 16, 4);
         assert_eq!(
-            app.viewport().unwrap().first_visible_start,
+            app.viewport().unwrap().unwrap().first_visible_start,
             SourceOffset::ZERO
         );
         app.update(Action::DocumentEnd).unwrap();
         assert!(app.follow_end);
-        assert_eq!(app.progress_percent(), 100);
+        assert_eq!(app.progress_percent().unwrap(), 100);
         app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
         assert!(app.follow_end);
         assert_eq!(
-            app.viewport().unwrap().first_visible_start,
+            app.viewport().unwrap().unwrap().first_visible_start,
             SourceOffset::ZERO
         );
         app.update(Action::LineUp).unwrap();
@@ -728,36 +733,39 @@ mod tests {
     }
 
     #[test]
-    fn render_state_borrows_text_and_marks_all_matches() {
+    fn render_state_owns_rows_and_marks_all_matches() {
         let mut app = reader("cat cat", 16, 4);
         commit(&mut app, "cat");
         let state = app.render_state().unwrap();
         assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
         assert_eq!(state.rows[0].spans[4].highlight, Highlight::Match);
-        assert!(matches!(
-            state.rows[0].spans[0].text,
-            RenderText::Borrowed("c")
-        ));
+        assert_eq!(state.rows[0].spans[0].text(&state.rows[0].text), "c");
     }
 
     #[test]
     fn bom_and_raw_line_endings_keep_absolute_coordinates_end_to_end() {
         let mut app = reader("\u{feff}a\r\ncat\rend", 16, 6);
-        let layout = app.layout.as_ref().unwrap();
-        let source = app.document.source();
 
         assert_eq!(
-            app.viewport().unwrap().first_visible_start,
+            app.viewport().unwrap().unwrap().first_visible_start,
             SourceOffset::new(3)
         );
-        assert_eq!(
-            layout.next_row_start(source, SourceOffset::new(3)).unwrap(),
-            Some(SourceOffset::new(6))
-        );
-        assert_eq!(
-            layout.next_row_start(source, SourceOffset::new(6)).unwrap(),
-            Some(SourceOffset::new(10))
-        );
+        {
+            let layout = app.layout.as_ref().unwrap();
+            let mut reader = app.document.reader(&mut app.document_cache);
+            assert_eq!(
+                layout
+                    .next_row_start(&mut reader, SourceOffset::new(3))
+                    .unwrap(),
+                Some(SourceOffset::new(6))
+            );
+            assert_eq!(
+                layout
+                    .next_row_start(&mut reader, SourceOffset::new(6))
+                    .unwrap(),
+                Some(SourceOffset::new(10))
+            );
+        }
         let state = app.render_state().unwrap();
         assert_eq!((state.current_line, state.total_lines), (1, 3));
 
@@ -775,11 +783,12 @@ mod tests {
 
     #[test]
     fn zero_width_source_has_one_owned_visible_cell() {
-        let app = reader("\u{200b}", 16, 4);
+        let mut app = reader("\u{200b}", 16, 4);
         let state = app.render_state().unwrap();
-        let span = &state.rows[0].spans[0];
-        assert_eq!(span.text.as_str(), "◌\u{200b}");
-        assert_eq!(span.projection, RenderProjectionKind::OwnedZeroWidth);
+        let row = &state.rows[0];
+        let span = &row.spans[0];
+        assert_eq!(span.text(&row.text), "◌\u{200b}");
+        assert_eq!(span.projection, RenderProjectionKind::DottedCircle);
         assert_eq!(span.cell_width, DisplayColumn::new(1));
     }
 
@@ -792,6 +801,6 @@ mod tests {
             app.anchor,
             app.layout.as_ref().expect("usable layout").max_top()
         );
-        assert_eq!(app.progress_percent(), 100);
+        assert_eq!(app.progress_percent().unwrap(), 100);
     }
 }
