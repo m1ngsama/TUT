@@ -1,4 +1,7 @@
-use std::{num::NonZeroUsize, ops::Range};
+use std::num::NonZeroUsize;
+
+#[cfg(test)]
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -91,12 +94,14 @@ impl<'a> SourceText<'a> {
         usize::try_from(offset.get() - self.start.get()).ok()
     }
 
+    #[cfg(test)]
     pub(super) fn slice(self, range: Range<SourceOffset>) -> Option<&'a str> {
         let start = self.relative_offset(range.start)?;
         let end = self.relative_offset(range.end)?;
         self.text.get(start..end)
     }
 
+    #[cfg(test)]
     pub(super) fn window(self, request: WindowRequest) -> Option<Self> {
         let start = self.relative_offset(request.start())?;
         if !self.text.is_char_boundary(start) {

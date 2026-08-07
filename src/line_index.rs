@@ -104,6 +104,30 @@ pub(super) struct LinePosition {
     total: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LineScan {
+    start: SourceOffset,
+    base_line: u64,
+    total_lines: u64,
+}
+
+impl LineScan {
+    pub(super) const fn start(self) -> SourceOffset {
+        self.start
+    }
+
+    pub(super) fn finish(self, additional_lines: u64) -> Option<LinePosition> {
+        let current = self
+            .base_line
+            .checked_add(additional_lines)?
+            .checked_add(1)?;
+        Some(LinePosition {
+            current,
+            total: self.total_lines,
+        })
+    }
+}
+
 impl LinePosition {
     pub(super) const fn current(self) -> u64 {
         self.current
@@ -241,6 +265,19 @@ impl LineIndex {
         Ok(())
     }
 
+    pub(super) fn scan_from(&self, offset: SourceOffset) -> Option<LineScan> {
+        if !self.finished || offset < self.source_start || offset > self.source_end {
+            return None;
+        }
+        let checkpoint = self.checkpoint_at_or_before(offset);
+        Some(LineScan {
+            start: checkpoint.start,
+            base_line: checkpoint.line.get(),
+            total_lines: self.last_line.get().checked_add(1)?,
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn position(
         &self,
         source: SourceText<'_>,
@@ -333,6 +370,7 @@ impl LineIndex {
     }
 }
 
+#[cfg(test)]
 fn count_line_starts(text: &str, base: SourceOffset, through: SourceOffset) -> Option<u64> {
     let bytes = text.as_bytes();
     let mut count = 0_u64;

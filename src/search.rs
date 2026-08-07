@@ -1,8 +1,9 @@
-use std::ops::Range;
+use std::{num::NonZeroUsize, ops::Range};
 
 use crate::{
-    error::SearchError,
-    source::{SourceOffset, SourceText},
+    document::{DocumentReader, SOURCE_WINDOW_BYTES},
+    error::{SearchError, TutError},
+    source::SourceOffset,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,14 +41,17 @@ pub(super) struct MatchIndex {
 
 impl MatchIndex {
     pub(super) fn build(
-        haystack: SourceText<'_>,
+        reader: &mut DocumentReader<'_>,
         needle: &str,
-    ) -> Result<Option<Self>, SearchError> {
+    ) -> Result<Option<Self>, TutError> {
         if needle.is_empty() {
             return Ok(None);
         }
 
-        let source_len = haystack.len_bytes();
+        let source_start = reader.source_start();
+        let source_end = reader.source_end();
+        let source_len = usize::try_from(source_end.get() - source_start.get())
+            .expect("document spans fit the process address space");
         let query_len = needle.len();
         let storage = required_storage_bytes(source_len);
         let mut bits = Vec::new();
@@ -57,19 +61,54 @@ impl MatchIndex {
 
         let mut index = Self {
             bits,
-            source_start: haystack.start(),
-            source_end: haystack.end(),
+            source_start,
+            source_end,
             source_len,
             query_len,
         };
-        let mut cursor = 0usize;
-        while cursor < haystack.len_bytes() {
-            let Some(relative) = haystack.as_str()[cursor..].find(needle) else {
-                break;
+        let target_bytes = SOURCE_WINDOW_BYTES
+            .checked_add(query_len.saturating_sub(1))
+            .and_then(NonZeroUsize::new)
+            .ok_or(SearchError::Allocation)?;
+        let mut cursor = source_start;
+
+        while cursor < source_end {
+            let next = {
+                let window = reader.window(cursor, target_bytes)?;
+                let text = window.as_str();
+                let safe_relative = if window.end() == source_end {
+                    text.len()
+                } else {
+                    let mut boundary = SOURCE_WINDOW_BYTES.min(text.len());
+                    while boundary < text.len() && !text.is_char_boundary(boundary) {
+                        boundary += 1;
+                    }
+                    boundary
+                };
+                let window_relative = usize::try_from(cursor.get() - source_start.get())
+                    .expect("document spans fit the process address space");
+                let mut search_from = 0;
+                let mut last_match_end = 0;
+
+                while search_from < text.len() {
+                    let Some(relative) = text[search_from..].find(needle) else {
+                        break;
+                    };
+                    let start = search_from + relative;
+                    if start >= safe_relative {
+                        break;
+                    }
+                    index.set_start(window_relative + start);
+                    last_match_end = start + query_len;
+                    search_from = last_match_end;
+                }
+
+                cursor
+                    .checked_add(safe_relative.max(last_match_end))
+                    .expect("bounded search windows fit source coordinates")
             };
-            let start = cursor + relative;
-            index.set_start(start);
-            cursor = start + needle.len();
+            debug_assert!(next > cursor);
+            cursor = next;
         }
 
         Ok(Some(index))
@@ -133,7 +172,7 @@ impl MatchIndex {
             return self.source_len;
         }
         usize::try_from(offset.get() - self.source_start.get())
-            .expect("in-memory source offsets fit usize")
+            .expect("document source offsets fit usize")
     }
 
     fn set_start(&mut self, offset: usize) {
@@ -242,13 +281,25 @@ const fn required_storage_bytes(source_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::document::{Document, DocumentCache};
+
+    fn build_at(text: &str, start: SourceOffset, needle: &str) -> Option<MatchIndex> {
+        let document = Document::from_text_at(Path::new("search.txt"), text.to_owned(), start);
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        MatchIndex::build(&mut reader, needle).unwrap()
+    }
+
+    fn build(text: &str, needle: &str) -> Option<MatchIndex> {
+        build_at(text, SourceOffset::ZERO, needle)
+    }
 
     #[test]
     fn builds_a_global_nonoverlapping_index() {
-        let index = MatchIndex::build(SourceText::new("aaaaaa"), "aa")
-            .unwrap()
-            .unwrap();
+        let index = build("aaaaaa", "aa").unwrap();
         let matches: Vec<_> = index
             .intersecting(SourceOffset::ZERO..SourceOffset::new(6))
             .collect();
@@ -264,9 +315,7 @@ mod tests {
 
     #[test]
     fn navigation_wraps_in_both_directions() {
-        let index = MatchIndex::build(SourceText::new("cat cat"), "cat")
-            .unwrap()
-            .unwrap();
+        let index = build("cat cat", "cat").unwrap();
         let first = index
             .first_intersecting_or_wrap(SourceOffset::ZERO)
             .unwrap();
@@ -278,14 +327,8 @@ mod tests {
 
     #[test]
     fn empty_queries_have_no_index_and_multibyte_queries_use_byte_ranges() {
-        assert!(
-            MatchIndex::build(SourceText::new("text"), "")
-                .unwrap()
-                .is_none()
-        );
-        let index = MatchIndex::build(SourceText::new("é-é"), "é")
-            .unwrap()
-            .unwrap();
+        assert!(build("text", "").is_none());
+        let index = build("é-é", "é").unwrap();
         let first = index
             .first_intersecting_or_wrap(SourceOffset::ZERO)
             .unwrap();
@@ -298,9 +341,7 @@ mod tests {
 
     #[test]
     fn viewport_selection_includes_matches_crossing_its_start() {
-        let index = MatchIndex::build(SourceText::new("abcd--abcd"), "abcd")
-            .unwrap()
-            .unwrap();
+        let index = build("abcd--abcd", "abcd").unwrap();
         assert_eq!(
             index
                 .first_intersecting_or_wrap(SourceOffset::new(3))
@@ -324,8 +365,7 @@ mod tests {
     #[test]
     fn matches_keep_absolute_offsets_above_u32() {
         let start = SourceOffset::new(u64::from(u32::MAX) + 23);
-        let source = SourceText::with_start("cat cat", start).unwrap();
-        let index = MatchIndex::build(source, "cat").unwrap().unwrap();
+        let index = build_at("cat cat", start, "cat").unwrap();
         let first = index.first_intersecting_or_wrap(start).unwrap();
         let second = index.next_after(first).unwrap();
 
@@ -333,5 +373,25 @@ mod tests {
         assert_eq!(first.end(), start.checked_add(3).unwrap());
         assert_eq!(second.start(), start.checked_add(4).unwrap());
         assert_eq!(index.previous_before(first), Some(second));
+    }
+
+    #[test]
+    fn matches_cross_source_window_boundaries() {
+        let mut text = "x".repeat(SOURCE_WINDOW_BYTES - 2);
+        text.push_str("needle tail needle");
+        let index = build(&text, "needle").unwrap();
+        let first = index
+            .first_intersecting_or_wrap(SourceOffset::ZERO)
+            .unwrap();
+        let second = index.next_after(first).unwrap();
+
+        assert_eq!(
+            first.start(),
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES - 2)
+        );
+        assert_eq!(
+            second.start(),
+            first.end().checked_add(" tail ".len()).unwrap()
+        );
     }
 }

@@ -224,7 +224,7 @@ pub(super) fn app_from_text(path: &std::path::Path, text: String) -> App {
 
 impl App {
     pub(super) fn new(document: Document) -> Self {
-        let anchor = document.source().start();
+        let anchor = document.source_start();
         Self {
             document,
             document_cache: DocumentCache::default(),
@@ -282,7 +282,7 @@ impl App {
 
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
         let viewport = self.viewport()?;
-        let line = self.line_position_for(viewport);
+        let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
         let rows = self.build_render_rows(viewport)?;
         Ok(RenderState {
@@ -296,20 +296,22 @@ impl App {
         })
     }
 
-    fn line_position_for(&self, viewport: Option<Viewport>) -> LinePosition {
-        let offset = viewport.map_or(self.document.source().start(), |viewport| {
+    fn line_position_for(&mut self, viewport: Option<Viewport>) -> Result<LinePosition, TutError> {
+        let offset = viewport.map_or(self.document.source_start(), |viewport| {
             viewport.first_visible_start
         });
-        self.document
-            .line_position(offset)
-            .expect("viewport anchors are valid document boundaries")
+        let mut reader = self.document.reader(&mut self.document_cache);
+        Ok(reader.line_position(offset)?)
     }
 
     fn progress_for(&self, viewport: Option<Viewport>) -> u8 {
-        let source = self.document.source();
         match viewport {
-            Some(viewport) => progress_percent(source.start(), source.end(), viewport.visible_end),
-            None if source.start() == source.end() => 100,
+            Some(viewport) => progress_percent(
+                self.document.source_start(),
+                self.document.source_end(),
+                viewport.visible_end,
+            ),
+            None if self.document.source_start() == self.document.source_end() => 100,
             None => 0,
         }
     }
@@ -408,7 +410,7 @@ impl App {
     }
 
     fn document_start(&mut self) -> bool {
-        let source_start = self.document.source().start();
+        let source_start = self.document.source_start();
         let changed = self.anchor != source_start || self.follow_end;
         self.anchor = source_start;
         self.follow_end = false;
@@ -479,11 +481,12 @@ impl App {
 
         let first_visible = self
             .viewport()?
-            .map_or(self.document.source().start(), |viewport| {
+            .map_or(self.document.source_start(), |viewport| {
                 viewport.first_visible_start
             });
-        let index = MatchIndex::build(self.document.source(), &draft)?
-            .expect("nonempty query creates an index");
+        let mut reader = self.document.reader(&mut self.document_cache);
+        let index =
+            MatchIndex::build(&mut reader, &draft)?.expect("nonempty query creates an index");
         let selected = index.first_intersecting_or_wrap(first_visible);
         self.committed_query = draft;
         self.match_index = Some(index);
@@ -645,7 +648,9 @@ fn promote(current_role: Highlight, range: SearchRange, current: Option<SearchRa
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
+
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -779,6 +784,24 @@ mod tests {
         app.update(Action::DocumentEnd).unwrap();
         app.update(Action::DocumentStart).unwrap();
         assert_eq!(app.anchor, SourceOffset::new(3));
+    }
+
+    #[test]
+    fn file_backed_documents_render_and_search_without_a_contiguous_source() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("book.txt");
+        fs::write(&path, "\u{feff}alpha\nneedle\nend").unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+
+        commit(&mut app, "needle");
+        assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(9));
+        let state = app.render_state().unwrap();
+        assert!(state.rows.iter().any(|row| {
+            row.spans
+                .iter()
+                .any(|span| span.highlight == Highlight::Current)
+        }));
     }
 
     #[test]
