@@ -1419,6 +1419,119 @@ mod tests {
     }
 
     #[test]
+    fn incremental_line_queries_match_complete_indexes_at_every_line_ending_split() {
+        let directory = tempdir().unwrap();
+
+        for ending in ["\r", "\n", "\r\n"] {
+            for split in 0..=ending.len() {
+                let header = "head\r\n";
+                let ending_start = SOURCE_WINDOW_BYTES - split;
+                let mut text = String::with_capacity(SOURCE_WINDOW_BYTES + 32);
+                text.push_str(header);
+                text.push_str(&"x".repeat(ending_start - header.len()));
+                text.push_str(ending);
+                text.push_str("tail\nend\rfinal");
+
+                let path = directory
+                    .path()
+                    .join(format!("ending-{}-{split}.txt", ending.len()));
+                fs::write(&path, &text).unwrap();
+                let reference = Document::from_text(Path::new("reference.txt"), text.clone());
+                let mut document = load(path).unwrap();
+                let mut index_cache = DocumentCache::default();
+                assert!(document.advance_line_index(&mut index_cache).unwrap());
+                assert!(!document.line_index_complete());
+
+                let frontier = SourceOffset::from_usize(SOURCE_WINDOW_BYTES);
+                let frontier_pending_cr = text.as_bytes()[SOURCE_WINDOW_BYTES - 1] == b'\r';
+                let ending_end = ending_start + ending.len();
+                let mut probes = vec![
+                    SourceOffset::ZERO,
+                    SourceOffset::from_usize(ending_start.saturating_sub(1)),
+                    frontier,
+                    SourceOffset::from_usize((ending_end + 1).min(text.len())),
+                    SourceOffset::from_usize(text.len()),
+                ];
+                probes.extend(
+                    (ending_start..=ending_end.min(text.len())).map(SourceOffset::from_usize),
+                );
+                probes.sort_unstable();
+                probes.dedup();
+
+                let mut reference_cache = DocumentCache::default();
+                let mut partial_cache = DocumentCache::default();
+                for offset in probes.iter().copied() {
+                    let expected_position = reference
+                        .reader(&mut reference_cache)
+                        .line_position(offset)
+                        .unwrap()
+                        .unwrap();
+                    let actual_position = document
+                        .reader(&mut partial_cache)
+                        .line_position(offset)
+                        .unwrap();
+                    let expected_coverage =
+                        offset < frontier || (offset == frontier && !frontier_pending_cr);
+                    assert_eq!(
+                        document.line_index_covers(offset),
+                        expected_coverage,
+                        "ending={ending:?}, split={split}, offset={}",
+                        offset.get()
+                    );
+                    if expected_coverage {
+                        let actual_position = actual_position.unwrap();
+                        assert_eq!(
+                            actual_position.current(),
+                            expected_position.current(),
+                            "ending={ending:?}, split={split}, offset={}",
+                            offset.get()
+                        );
+                        assert_eq!(actual_position.total(), None);
+                    } else {
+                        assert_eq!(actual_position, None);
+                    }
+
+                    let expected_start = reference
+                        .reader(&mut reference_cache)
+                        .line_start_at_or_before(offset)
+                        .unwrap();
+                    let actual_start = document
+                        .reader(&mut partial_cache)
+                        .line_start_at_or_before(offset)
+                        .unwrap();
+                    assert_eq!(
+                        actual_start,
+                        expected_start,
+                        "ending={ending:?}, split={split}, offset={}",
+                        offset.get()
+                    );
+                }
+
+                finish_index(&mut document).unwrap();
+                assert!(document.line_index_complete());
+                let mut complete_cache = DocumentCache::default();
+                for offset in probes.iter().copied() {
+                    assert!(document.line_index_covers(offset));
+                    let expected_position = reference
+                        .reader(&mut reference_cache)
+                        .line_position(offset)
+                        .unwrap();
+                    let actual_position = document
+                        .reader(&mut complete_cache)
+                        .line_position(offset)
+                        .unwrap();
+                    assert_eq!(
+                        actual_position,
+                        expected_position,
+                        "ending={ending:?}, split={split}, offset={}",
+                        offset.get()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn file_backed_line_scans_match_contiguous_coordinates() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("lines.txt");
