@@ -63,6 +63,40 @@ impl Document {
         }
     }
 
+    pub(super) const fn line_index_complete(&self) -> bool {
+        self.line_index.is_complete()
+    }
+
+    pub(super) fn line_index_covers(&self, offset: SourceOffset) -> bool {
+        self.line_index.covers(offset)
+    }
+
+    pub(super) fn advance_line_index(
+        &mut self,
+        cache: &mut DocumentCache,
+    ) -> Result<bool, LoadError> {
+        if self.line_index.is_complete() {
+            return Ok(false);
+        }
+        let cursor = self.line_index.scanned_to();
+        if cursor < self.source_end {
+            let target =
+                NonZeroUsize::new(SOURCE_WINDOW_BYTES).expect("source window size is nonzero");
+            let window = self
+                .store
+                .copy_window(WindowRequest::new(cursor, target), &mut cache.chunk)?;
+            self.line_index
+                .extend(window)
+                .map_err(|error| map_line_index_error(&self.path, error))?;
+        }
+        if self.line_index.scanned_to() == self.source_end {
+            self.line_index
+                .finish()
+                .map_err(|error| map_line_index_error(&self.path, error))?;
+        }
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(super) fn from_text(path: &Path, text: String) -> Self {
         Self::new(path, text).expect("test documents fit the line-index budget")
@@ -179,9 +213,12 @@ impl<'document> DocumentReader<'document> {
     pub(super) fn line_position(
         &mut self,
         offset: SourceOffset,
-    ) -> Result<LinePosition, LoadError> {
-        let (scan, lines) = self.scan_lines(offset)?;
+    ) -> Result<Option<LinePosition>, LoadError> {
+        let Some((scan, lines)) = self.scan_lines(offset)? else {
+            return Ok(None);
+        };
         scan.finish(lines.count)
+            .map(Some)
             .ok_or_else(|| self.protocol_error("physical-line coordinates overflow"))
     }
 
@@ -189,8 +226,10 @@ impl<'document> DocumentReader<'document> {
         &mut self,
         offset: SourceOffset,
     ) -> Result<SourceOffset, LoadError> {
-        let (_, lines) = self.scan_lines(offset)?;
-        Ok(lines.last_start)
+        match self.scan_lines(offset)? {
+            Some((_, lines)) => Ok(lines.last_start),
+            None => self.find_line_start_backward(offset),
+        }
     }
 
     pub(super) fn previous_char_start(
@@ -205,13 +244,14 @@ impl<'document> DocumentReader<'document> {
         Ok(Some(self.window_ending_at(offset, one)?.start()))
     }
 
-    fn scan_lines(&mut self, offset: SourceOffset) -> Result<(LineScan, ScannedLines), LoadError> {
+    fn scan_lines(
+        &mut self,
+        offset: SourceOffset,
+    ) -> Result<Option<(LineScan, ScannedLines)>, LoadError> {
         self.require_char_boundary(offset, "invalid physical-line offset")?;
-        let scan = self
-            .document
-            .line_index
-            .scan_from(offset)
-            .ok_or_else(|| self.protocol_error("invalid physical-line offset"))?;
+        let Some(scan) = self.document.line_index.scan_from(offset) else {
+            return Ok(None);
+        };
         let scan_end = if offset < self.source_end() {
             offset
                 .checked_add(1)
@@ -219,7 +259,11 @@ impl<'document> DocumentReader<'document> {
         } else {
             offset
         };
-        let mut scanner = LineScanner::new(offset, scan.start());
+        let mut scanner = LineScanner::new(
+            offset,
+            scan.line_start(),
+            scan.pending_cr().then_some(scan.start()),
+        );
         let target = NonZeroUsize::new(SOURCE_WINDOW_BYTES).expect("source window size is nonzero");
         let mut cursor = scan.start();
 
@@ -245,7 +289,51 @@ impl<'document> DocumentReader<'document> {
         scanner
             .finish()
             .ok_or_else(|| self.protocol_error("physical-line coordinates overflow"))?;
-        Ok((scan, scanner.scanned()))
+        Ok(Some((scan, scanner.scanned())))
+    }
+
+    fn find_line_start_backward(
+        &mut self,
+        offset: SourceOffset,
+    ) -> Result<SourceOffset, LoadError> {
+        if offset == self.source_start() {
+            return Ok(offset);
+        }
+        let cr_joins_lf = if offset < self.source_end() {
+            self.document
+                .store
+                .copy_bytes(offset, 1, &mut self.cache.chunk)?;
+            self.cache.chunk[0] == b'\n'
+        } else {
+            false
+        };
+        let target = NonZeroUsize::new(SOURCE_WINDOW_BYTES).expect("source window size is nonzero");
+        let mut cursor = offset;
+
+        while cursor > self.source_start() {
+            let (window_start, found) = {
+                let window = self.window_ending_at(cursor, target)?;
+                let bytes = window.as_str().as_bytes();
+                let found = bytes.iter().enumerate().rev().find_map(|(relative, byte)| {
+                    let is_ignored_cr = cr_joins_lf
+                        && window.end() == offset
+                        && relative + 1 == bytes.len()
+                        && *byte == b'\r';
+                    ((*byte == b'\n' || *byte == b'\r') && !is_ignored_cr).then_some(relative)
+                });
+                (window.start(), found)
+            };
+            if let Some(relative) = found {
+                return window_start
+                    .checked_add(relative + 1)
+                    .ok_or_else(|| self.protocol_error("physical-line coordinates overflow"));
+            }
+            if window_start >= cursor {
+                return Err(self.protocol_error("non-contiguous backward line window"));
+            }
+            cursor = window_start;
+        }
+        Ok(self.source_start())
     }
 
     fn require_char_boundary(
@@ -289,14 +377,18 @@ struct LineScanner {
 }
 
 impl LineScanner {
-    const fn new(through: SourceOffset, start: SourceOffset) -> Self {
+    const fn new(
+        through: SourceOffset,
+        line_start: SourceOffset,
+        pending_cr: Option<SourceOffset>,
+    ) -> Self {
         Self {
             through,
             scanned: ScannedLines {
                 count: 0,
-                last_start: start,
+                last_start: line_start,
             },
-            pending_cr: None,
+            pending_cr,
         }
     }
 
@@ -641,8 +733,9 @@ fn copy_source<'a>(
 
 pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
     let store = FileStore::open(path, MAX_FILE_BYTES)?;
-    let line_index = store.build_line_index(MAX_FILE_BYTES)?;
     let path = store.path.clone();
+    let line_index = LineIndex::new(store.source_start, store.source_end)
+        .map_err(|error| map_line_index_error(&path, error))?;
     Ok(Document::from_parts(
         &path,
         DocumentStore::File(store),
@@ -756,6 +849,7 @@ impl FileStore {
         Ok(store)
     }
 
+    #[cfg(test)]
     fn build_line_index(&self, limit: usize) -> Result<LineIndex, LoadError> {
         let source_len = self.bounded_len(limit)?;
         if SourceOffset::from_usize(source_len) != self.source_end {
@@ -891,6 +985,7 @@ impl FileStore {
         self.require_unchanged()
     }
 
+    #[cfg(test)]
     fn bounded_len(&self, limit: usize) -> Result<usize, LoadError> {
         let metadata = self.file.metadata().map_err(|source| LoadError::Read {
             path: self.path.clone(),
@@ -1046,6 +1141,18 @@ mod tests {
 
     use super::*;
 
+    fn finish_index(document: &mut Document) -> Result<(), LoadError> {
+        let mut cache = DocumentCache::default();
+        while document.advance_line_index(&mut cache)? {}
+        Ok(())
+    }
+
+    fn load_indexed(path: PathBuf) -> Result<Document, LoadError> {
+        let mut document = load(path)?;
+        finish_index(&mut document)?;
+        Ok(document)
+    }
+
     fn read_all(document: &Document) -> String {
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
@@ -1068,7 +1175,7 @@ mod tests {
         fs::write(&source, b"\xef\xbb\xbfone\r\ntwo\rthree\n\xef\xbb\xbf").unwrap();
         std::os::unix::fs::symlink(&source, &link).unwrap();
 
-        let document = load(link).unwrap();
+        let document = load_indexed(link).unwrap();
         assert_eq!(read_all(&document), "one\r\ntwo\rthree\n\u{feff}");
         assert_eq!(document.source_start(), SourceOffset::new(3));
         assert_eq!(document.source_end(), SourceOffset::new(21));
@@ -1076,8 +1183,9 @@ mod tests {
         let position = document
             .reader(&mut cache)
             .line_position(SourceOffset::new(18))
+            .unwrap()
             .unwrap();
-        assert_eq!((position.current(), position.total()), (4, 4));
+        assert_eq!((position.current(), position.total()), (4, Some(4)));
         assert_eq!(document.display_name(), "link.txt");
     }
 
@@ -1087,8 +1195,28 @@ mod tests {
         let path = directory.path().join("invalid.txt");
         fs::write(&path, b"ok\xffbad").unwrap();
         assert!(matches!(
-            load(path),
+            load_indexed(path),
             Err(LoadError::InvalidUtf8 { offset: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn loading_defers_validation_beyond_the_first_index_window() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("deferred-invalid.txt");
+        let invalid_offset = SOURCE_WINDOW_BYTES + 10;
+        let mut bytes = vec![b'a'; invalid_offset];
+        bytes.push(0xff);
+        fs::write(&path, bytes).unwrap();
+
+        let mut document = load(path).unwrap();
+        assert!(!document.line_index_complete());
+        let mut cache = DocumentCache::default();
+        assert!(document.advance_line_index(&mut cache).unwrap());
+        assert!(!document.line_index_complete());
+        assert!(matches!(
+            document.advance_line_index(&mut cache),
+            Err(LoadError::InvalidUtf8 { offset, .. }) if offset == invalid_offset
         ));
     }
 
@@ -1199,7 +1327,7 @@ mod tests {
         fs::write(&path, bytes).unwrap();
 
         assert!(matches!(
-            load(path),
+            load_indexed(path),
             Err(LoadError::InvalidUtf8 { offset, .. })
                 if offset == SOURCE_WINDOW_BYTES - 1
         ));
@@ -1226,7 +1354,7 @@ mod tests {
         fs::write(&path, bytes).unwrap();
 
         assert!(matches!(
-            load(path),
+            load_indexed(path),
             Err(LoadError::InvalidUtf8 { offset, .. })
                 if offset == SOURCE_WINDOW_BYTES - 1
         ));
@@ -1270,14 +1398,15 @@ mod tests {
         let mut text = "a".repeat(SOURCE_WINDOW_BYTES - 1);
         text.push_str("\r\nb");
         fs::write(&path, text).unwrap();
-        let document = load(path).unwrap();
+        let document = load_indexed(path).unwrap();
         let mut cache = DocumentCache::default();
         let position = document
             .reader(&mut cache)
             .line_position(SourceOffset::from_usize(SOURCE_WINDOW_BYTES + 1))
+            .unwrap()
             .unwrap();
 
-        assert_eq!((position.current(), position.total()), (2, 2));
+        assert_eq!((position.current(), position.total()), (2, Some(2)));
     }
 
     #[test]
@@ -1286,7 +1415,7 @@ mod tests {
         let path = directory.path().join("lines.txt");
         let text = "\u{feff}a\r\né\rb\nc";
         fs::write(&path, text).unwrap();
-        let document = load(path).unwrap();
+        let document = load_indexed(path).unwrap();
         let expected = Document::from_text(Path::new("expected.txt"), text.to_owned());
         let source = expected.source();
         let mut cache = DocumentCache::default();
@@ -1300,7 +1429,7 @@ mod tests {
         {
             let offset = source.start().checked_add(relative).unwrap();
             assert_eq!(
-                reader.line_position(offset).unwrap(),
+                reader.line_position(offset).unwrap().unwrap(),
                 expected.line_index.position(source, offset).unwrap()
             );
             let previous = source.as_str()[..relative]
@@ -1309,6 +1438,35 @@ mod tests {
                 .map(|(previous, _)| source.start().checked_add(previous).unwrap());
             assert_eq!(reader.previous_char_start(offset).unwrap(), previous);
         }
+    }
+
+    #[test]
+    fn unindexed_line_starts_are_found_from_bounded_backward_windows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("partial-lines.txt");
+        let mut text = String::from("prefix\r\n");
+        let long_line_start = text.len();
+        text.push_str(&"x".repeat(SOURCE_WINDOW_BYTES + 17));
+        let cr = text.len();
+        text.push_str("\r\nlast");
+        fs::write(&path, text).unwrap();
+
+        let document = load(path).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        assert_eq!(
+            reader
+                .line_start_at_or_before(SourceOffset::from_usize(cr + 1))
+                .unwrap(),
+            SourceOffset::from_usize(long_line_start)
+        );
+        assert_eq!(
+            reader
+                .line_start_at_or_before(SourceOffset::from_usize(cr + 2))
+                .unwrap(),
+            SourceOffset::from_usize(cr + 2)
+        );
+        assert_eq!(reader.line_position(reader.source_end()).unwrap(), None);
     }
 
     #[test]

@@ -192,13 +192,14 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
     prefix
         .try_reserve_exact(50)
         .map_err(|_| TutError::Allocation("status text"))?;
-    write!(
-        prefix,
-        "{}%  {}/{}",
-        state.progress.min(100),
-        state.current_line,
-        state.total_lines
-    )
+    match (state.current_line, state.total_lines) {
+        (Some(current), Some(total)) => {
+            write!(prefix, "{}%  {current}/{total}", state.progress.min(100))
+        }
+        (Some(current), None) => write!(prefix, "{}%  {current}/?", state.progress.min(100)),
+        (None, Some(total)) => write!(prefix, "{}%  ?/{total}", state.progress.min(100)),
+        (None, None) => write!(prefix, "{}%  ?/?", state.progress.min(100),),
+    }
     .expect("reserved String formatting is infallible");
     if query.is_some() {
         prefix.push_str("  /");
@@ -371,6 +372,26 @@ mod tests {
         }
         app.update(Action::SearchCommit).unwrap();
         assert!(row_text(&draw(&mut app, 48, 4), 2).ends_with("— no matches"));
+    }
+
+    #[test]
+    fn incomplete_line_coordinates_are_explicit() {
+        let state = RenderState {
+            filename: "book.txt",
+            path: "/tmp/book.txt",
+            rows: Vec::new(),
+            progress: 12,
+            current_line: Some(7),
+            total_lines: None,
+            status: SearchStatus::None,
+        };
+        assert_eq!(status_text(&state, 40).unwrap(), "12%  7/?");
+
+        let state = RenderState {
+            current_line: None,
+            ..state
+        };
+        assert_eq!(status_text(&state, 40).unwrap(), "12%  ?/?");
     }
 
     #[test]

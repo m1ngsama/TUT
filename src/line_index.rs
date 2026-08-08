@@ -3,7 +3,7 @@ use std::{error::Error, fmt, mem::size_of};
 use crate::source::{SourceOffset, SourceText};
 
 const LINE_INDEX_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
-const INITIAL_CHECKPOINT_INTERVAL: u64 = 1024;
+const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,29 +24,31 @@ impl PhysicalLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LineCheckpoint {
+    scan_at: SourceOffset,
     line: PhysicalLine,
-    start: SourceOffset,
+    line_start: SourceOffset,
+    pending_cr: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LineIndexLimits {
-    initial_interval: u64,
+    initial_interval_bytes: u64,
     max_checkpoints: usize,
 }
 
 impl LineIndexLimits {
     const DEFAULT: Self = Self {
-        initial_interval: INITIAL_CHECKPOINT_INTERVAL,
+        initial_interval_bytes: INITIAL_CHECKPOINT_INTERVAL_BYTES,
         max_checkpoints: LINE_INDEX_MEMORY_BUDGET_BYTES / size_of::<LineCheckpoint>(),
     };
 
     #[cfg(test)]
-    const fn new(initial_interval: u64, max_checkpoints: usize) -> Option<Self> {
-        if initial_interval == 0 || max_checkpoints < 2 {
+    const fn new(initial_interval_bytes: u64, max_checkpoints: usize) -> Option<Self> {
+        if initial_interval_bytes == 0 || max_checkpoints < 2 {
             None
         } else {
             Some(Self {
-                initial_interval,
+                initial_interval_bytes,
                 max_checkpoints,
             })
         }
@@ -101,19 +103,29 @@ impl Error for LineIndexError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LinePosition {
     current: u64,
-    total: u64,
+    total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LineScan {
-    start: SourceOffset,
+    scan_at: SourceOffset,
     base_line: u64,
-    total_lines: u64,
+    line_start: SourceOffset,
+    pending_cr: bool,
+    total_lines: Option<u64>,
 }
 
 impl LineScan {
     pub(super) const fn start(self) -> SourceOffset {
-        self.start
+        self.scan_at
+    }
+
+    pub(super) const fn line_start(self) -> SourceOffset {
+        self.line_start
+    }
+
+    pub(super) const fn pending_cr(self) -> bool {
+        self.pending_cr
     }
 
     pub(super) fn finish(self, additional_lines: u64) -> Option<LinePosition> {
@@ -133,7 +145,7 @@ impl LinePosition {
         self.current
     }
 
-    pub(super) const fn total(self) -> u64 {
+    pub(super) const fn total(self) -> Option<u64> {
         self.total
     }
 }
@@ -144,8 +156,9 @@ pub(super) struct LineIndex {
     source_end: SourceOffset,
     scanned_to: SourceOffset,
     last_line: PhysicalLine,
+    last_line_start: SourceOffset,
     checkpoints: Vec<LineCheckpoint>,
-    checkpoint_interval: u64,
+    checkpoint_interval_bytes: u64,
     max_checkpoints: usize,
     pending_cr: bool,
     finished: bool,
@@ -173,8 +186,10 @@ impl LineIndex {
             .try_reserve_exact(INITIAL_CHECKPOINT_RESERVATION.min(limits.max_checkpoints))
             .map_err(|_| LineIndexError::Allocation)?;
         checkpoints.push(LineCheckpoint {
+            scan_at: source_start,
             line: PhysicalLine::ZERO,
-            start: source_start,
+            line_start: source_start,
+            pending_cr: false,
         });
 
         Ok(Self {
@@ -182,8 +197,9 @@ impl LineIndex {
             source_end,
             scanned_to: source_start,
             last_line: PhysicalLine::ZERO,
+            last_line_start: source_start,
             checkpoints,
-            checkpoint_interval: limits.initial_interval,
+            checkpoint_interval_bytes: limits.initial_interval_bytes,
             max_checkpoints: limits.max_checkpoints,
             pending_cr: false,
             finished: false,
@@ -244,6 +260,7 @@ impl LineIndex {
         }
 
         self.scanned_to = source.end();
+        self.record_checkpoint()?;
         Ok(())
     }
 
@@ -265,15 +282,37 @@ impl LineIndex {
         Ok(())
     }
 
+    pub(super) const fn is_complete(&self) -> bool {
+        self.finished
+    }
+
+    pub(super) const fn scanned_to(&self) -> SourceOffset {
+        self.scanned_to
+    }
+
+    pub(super) fn covers(&self, offset: SourceOffset) -> bool {
+        self.scan_from(offset).is_some()
+    }
+
     pub(super) fn scan_from(&self, offset: SourceOffset) -> Option<LineScan> {
-        if !self.finished || offset < self.source_start || offset > self.source_end {
+        if offset < self.source_start
+            || offset > self.source_end
+            || (!self.finished
+                && (offset > self.scanned_to || (offset == self.scanned_to && self.pending_cr)))
+        {
             return None;
         }
         let checkpoint = self.checkpoint_at_or_before(offset);
         Some(LineScan {
-            start: checkpoint.start,
+            scan_at: checkpoint.scan_at,
             base_line: checkpoint.line.get(),
-            total_lines: self.last_line.get().checked_add(1)?,
+            line_start: checkpoint.line_start,
+            pending_cr: checkpoint.pending_cr,
+            total_lines: if self.finished {
+                self.last_line.get().checked_add(1)
+            } else {
+                None
+            },
         })
     }
 
@@ -299,13 +338,15 @@ impl LineIndex {
             let character = source.as_str()[relative..].chars().next()?;
             offset.checked_add(character.len_utf8())?
         };
-        let text = source.slice(checkpoint.start..scan_end)?;
-        let current = checkpoint
-            .line
-            .get()
-            .checked_add(count_line_starts(text, checkpoint.start, offset)?)?
-            .checked_add(1)?;
-        let total = self.last_line.get().checked_add(1)?;
+        let text = source.slice(checkpoint.scan_at..scan_end)?;
+        let current = checkpoint.line.get().checked_add(count_line_starts(
+            text,
+            checkpoint.scan_at,
+            offset,
+            checkpoint.pending_cr,
+        )?)?;
+        let current = current.checked_add(1)?;
+        let total = self.last_line.get().checked_add(1);
         Some(LinePosition { current, total })
     }
 
@@ -326,28 +367,49 @@ impl LineIndex {
             .next()
             .ok_or(LineIndexError::CoordinateOverflow)?;
         self.last_line = line;
-        if line.get() % self.checkpoint_interval != 0 {
+        self.last_line_start = start;
+        Ok(())
+    }
+
+    fn record_checkpoint(&mut self) -> Result<(), LineIndexError> {
+        let last = self
+            .checkpoints
+            .last()
+            .expect("line indexes retain their source-start checkpoint");
+        if self.scanned_to.get() - last.scan_at.get() < self.checkpoint_interval_bytes {
             return Ok(());
         }
-
         while self.checkpoints.len() >= self.max_checkpoints {
             self.compact()?;
-            if line.get() % self.checkpoint_interval != 0 {
+            let last = self
+                .checkpoints
+                .last()
+                .expect("line indexes retain their source-start checkpoint");
+            if self.scanned_to.get() - last.scan_at.get() < self.checkpoint_interval_bytes {
                 return Ok(());
             }
         }
         self.reserve_checkpoint()?;
-        self.checkpoints.push(LineCheckpoint { line, start });
+        self.checkpoints.push(LineCheckpoint {
+            scan_at: self.scanned_to,
+            line: self.last_line,
+            line_start: self.last_line_start,
+            pending_cr: self.pending_cr,
+        });
         Ok(())
     }
 
     fn compact(&mut self) -> Result<(), LineIndexError> {
-        self.checkpoint_interval = self
-            .checkpoint_interval
+        self.checkpoint_interval_bytes = self
+            .checkpoint_interval_bytes
             .checked_mul(2)
             .ok_or(LineIndexError::CoordinateOverflow)?;
-        self.checkpoints
-            .retain(|checkpoint| checkpoint.line.get() % self.checkpoint_interval == 0);
+        let mut index = 0;
+        self.checkpoints.retain(|_| {
+            let keep = index % 2 == 0;
+            index += 1;
+            keep
+        });
         Ok(())
     }
 
@@ -365,16 +427,31 @@ impl LineIndex {
     fn checkpoint_at_or_before(&self, offset: SourceOffset) -> LineCheckpoint {
         let insertion = self
             .checkpoints
-            .partition_point(|checkpoint| checkpoint.start <= offset);
+            .partition_point(|checkpoint| checkpoint.scan_at <= offset);
         self.checkpoints[insertion.saturating_sub(1)]
     }
 }
 
 #[cfg(test)]
-fn count_line_starts(text: &str, base: SourceOffset, through: SourceOffset) -> Option<u64> {
+fn count_line_starts(
+    text: &str,
+    base: SourceOffset,
+    through: SourceOffset,
+    pending_cr: bool,
+) -> Option<u64> {
     let bytes = text.as_bytes();
     let mut count = 0_u64;
     let mut index = 0;
+    if pending_cr {
+        if bytes.first() == Some(&b'\n') {
+            if base.checked_add(1)? <= through {
+                count = count.checked_add(1)?;
+            }
+            index = 1;
+        } else if base <= through {
+            count = count.checked_add(1)?;
+        }
+    }
     while index < bytes.len() {
         let line_end = match bytes[index] {
             b'\n' => index + 1,
@@ -426,7 +503,41 @@ mod tests {
             for (relative, line) in expected {
                 let offset = start.checked_add(relative).unwrap();
                 assert_eq!(index.position(source, offset).unwrap().current(), line);
-                assert_eq!(index.position(source, offset).unwrap().total(), 5);
+                assert_eq!(index.position(source, offset).unwrap().total(), Some(5));
+            }
+        }
+    }
+
+    #[test]
+    fn byte_checkpoints_preserve_crlf_state_at_every_split() {
+        let start = SourceOffset::new(u64::from(u32::MAX) + 31);
+        let source = SourceText::with_start("a\r\nb\rc\n\n", start).unwrap();
+        let expected = [(0, 1), (3, 2), (5, 3), (7, 4), (8, 5)];
+
+        for chunk_bytes in 1..=source.len_bytes() {
+            let limits = LineIndexLimits::new(1, 64).unwrap();
+            let mut index = LineIndex::with_limits(source.start(), source.end(), limits).unwrap();
+            let mut relative = 0;
+            while relative < source.len_bytes() {
+                let end = (relative + chunk_bytes).min(source.len_bytes());
+                let chunk_start = source.start().checked_add(relative).unwrap();
+                let chunk_end = source.start().checked_add(end).unwrap();
+                index
+                    .extend(
+                        SourceText::with_start(
+                            source.slice(chunk_start..chunk_end).unwrap(),
+                            chunk_start,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                relative = end;
+            }
+            index.finish().unwrap();
+
+            for (relative, line) in expected {
+                let offset = start.checked_add(relative).unwrap();
+                assert_eq!(index.position(source, offset).unwrap().current(), line);
             }
         }
     }
@@ -437,16 +548,22 @@ mod tests {
         let source = SourceText::new(&text);
         let limits = LineIndexLimits::new(1, 4).unwrap();
         let mut index = LineIndex::with_limits(source.start(), source.end(), limits).unwrap();
-        index.extend(source).unwrap();
+        for relative in 0..source.len_bytes() {
+            let start = source.start().checked_add(relative).unwrap();
+            let end = start.checked_add(1).unwrap();
+            index
+                .extend(SourceText::with_start(source.slice(start..end).unwrap(), start).unwrap())
+                .unwrap();
+        }
         index.finish().unwrap();
 
         assert!(index.checkpoints.len() <= 4);
-        assert!(index.checkpoint_interval > 1);
+        assert!(index.checkpoint_interval_bytes > 1);
         assert_eq!(
             index.position(source, SourceOffset::new(97)).unwrap(),
             LinePosition {
                 current: 98,
-                total: 129,
+                total: Some(129),
             }
         );
     }
@@ -474,8 +591,117 @@ mod tests {
             index.position(source, source.start()).unwrap(),
             LinePosition {
                 current: 1,
-                total: 1,
+                total: Some(1),
             }
         );
+    }
+
+    #[test]
+    fn partial_indexes_report_unknown_totals_and_reject_unscanned_offsets() {
+        let source = SourceText::new("a\r\nb\nc");
+        let mut index = LineIndex::new(source.start(), source.end()).unwrap();
+        let first_end = SourceOffset::new(2);
+        index
+            .extend(
+                SourceText::with_start(
+                    source.slice(SourceOffset::ZERO..first_end).unwrap(),
+                    SourceOffset::ZERO,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            index.scan_from(SourceOffset::ZERO).unwrap().finish(0),
+            Some(LinePosition {
+                current: 1,
+                total: None,
+            })
+        );
+        assert!(index.scan_from(first_end).is_none());
+        assert!(index.scan_from(SourceOffset::new(3)).is_none());
+
+        let rest =
+            SourceText::with_start(source.slice(first_end..source.end()).unwrap(), first_end)
+                .unwrap();
+        index.extend(rest).unwrap();
+        index.finish().unwrap();
+        assert_eq!(
+            index.position(source, source.end()).unwrap(),
+            LinePosition {
+                current: 3,
+                total: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn byte_checkpoints_bound_replay_inside_a_long_physical_line() {
+        let text = "x".repeat(4096);
+        let source = SourceText::new(&text);
+        let limits = LineIndexLimits::new(64, 128).unwrap();
+        let mut index = LineIndex::with_limits(source.start(), source.end(), limits).unwrap();
+        let mut start = 0;
+        while start < source.len_bytes() {
+            let end = (start + 17).min(source.len_bytes());
+            let start_offset = SourceOffset::new(start as u64);
+            let end_offset = SourceOffset::new(end as u64);
+            index
+                .extend(
+                    SourceText::with_start(
+                        source.slice(start_offset..end_offset).unwrap(),
+                        start_offset,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            start = end;
+        }
+        index.finish().unwrap();
+
+        let target = SourceOffset::new(4000);
+        let scan = index.scan_from(target).unwrap();
+        assert!(target.get() - scan.start().get() < 81);
+        assert_eq!(scan.line_start(), SourceOffset::ZERO);
+        assert_eq!(
+            index.position(source, target).unwrap(),
+            LinePosition {
+                current: 1,
+                total: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn compacted_checkpoints_preserve_pending_cr_state() {
+        let mut text = "x\r\n".repeat(128);
+        text.push_str("tail");
+        let source = SourceText::new(&text);
+        let reference = build_in_chunks(source, source.len_bytes());
+        let limits = LineIndexLimits::new(1, 4).unwrap();
+        let mut compacted = LineIndex::with_limits(source.start(), source.end(), limits).unwrap();
+
+        for relative in 0..source.len_bytes() {
+            let start = SourceOffset::new(relative as u64);
+            let end = start.checked_add(1).unwrap();
+            compacted
+                .extend(SourceText::with_start(source.slice(start..end).unwrap(), start).unwrap())
+                .unwrap();
+        }
+        compacted.finish().unwrap();
+
+        assert!(compacted.checkpoint_interval_bytes > 1);
+        for relative in source
+            .as_str()
+            .char_indices()
+            .map(|(relative, _)| relative)
+            .chain(std::iter::once(source.len_bytes()))
+        {
+            let offset = SourceOffset::new(relative as u64);
+            assert_eq!(
+                compacted.position(source, offset),
+                reference.position(source, offset)
+            );
+        }
     }
 }

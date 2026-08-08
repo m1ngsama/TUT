@@ -382,8 +382,6 @@ mod pty {
     #[test]
     fn file_errors_happen_before_terminal_mutation() {
         let directory = tempdir().unwrap();
-        let invalid = directory.path().join("invalid.txt");
-        std::fs::write(&invalid, b"ok\xffbad").unwrap();
         let oversize = directory.path().join("oversize.txt");
         File::create(&oversize)
             .unwrap()
@@ -391,7 +389,7 @@ mod pty {
             .unwrap();
         let missing = directory.path().join("missing.txt");
 
-        for path in [&missing, &invalid, &oversize] {
+        for path in [&missing, &oversize] {
             let mut pty = PtyChild::spawn(path).unwrap();
             let status = pty.wait().unwrap();
             assert_eq!(status.code(), Some(1));
@@ -403,5 +401,30 @@ mod pty {
             );
             pty.assert_restored();
         }
+    }
+
+    #[test]
+    fn deferred_validation_errors_restore_the_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        let invalid_offset = tut::MAX_FILE_BYTES.min(2 * 64 * 1024) + 10;
+        let mut bytes = vec![b'a'; invalid_offset];
+        bytes.push(0xff);
+        std::fs::write(file.path(), bytes).unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&pty.stderr_output)
+                .contains(&format!("invalid UTF-8 at byte {invalid_offset}"))
+        );
+        for sequence in [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT] {
+            assert!(
+                pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
     }
 }

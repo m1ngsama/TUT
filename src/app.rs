@@ -199,8 +199,8 @@ pub(super) struct RenderState<'a> {
     pub path: &'a str,
     pub rows: Vec<RenderRow>,
     pub progress: u8,
-    pub current_line: u64,
-    pub total_lines: u64,
+    pub current_line: Option<u64>,
+    pub total_lines: Option<u64>,
     pub status: SearchStatus<'a>,
 }
 
@@ -290,18 +290,36 @@ impl App {
             path: self.document.display_path(),
             rows,
             progress,
-            current_line: line.current(),
-            total_lines: line.total(),
+            current_line: line.map(LinePosition::current),
+            total_lines: line.and_then(LinePosition::total),
             status: self.search_status(),
         })
     }
 
-    fn line_position_for(&mut self, viewport: Option<Viewport>) -> Result<LinePosition, TutError> {
+    fn line_position_for(
+        &mut self,
+        viewport: Option<Viewport>,
+    ) -> Result<Option<LinePosition>, TutError> {
         let offset = viewport.map_or(self.document.source_start(), |viewport| {
             viewport.first_visible_start
         });
         let mut reader = self.document.reader(&mut self.document_cache);
         Ok(reader.line_position(offset)?)
+    }
+
+    pub(super) const fn has_background_work(&self) -> bool {
+        !self.document.line_index_complete()
+    }
+
+    pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
+        let covered = self.document.line_index_covers(self.anchor);
+        let complete = self.document.line_index_complete();
+        let advanced = self.document.advance_line_index(&mut self.document_cache)?;
+        if !advanced {
+            return Ok(false);
+        }
+        Ok((!covered && self.document.line_index_covers(self.anchor))
+            || (!complete && self.document.line_index_complete()))
     }
 
     fn progress_for(&self, viewport: Option<Viewport>) -> u8 {
@@ -771,7 +789,7 @@ mod tests {
             );
         }
         let state = app.render_state().unwrap();
-        assert_eq!((state.current_line, state.total_lines), (1, 3));
+        assert_eq!((state.current_line, state.total_lines), (Some(1), Some(3)));
 
         commit(&mut app, "cat");
         assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(6));
@@ -801,6 +819,36 @@ mod tests {
                 .iter()
                 .any(|span| span.highlight == Highlight::Current)
         }));
+    }
+
+    #[test]
+    fn file_line_index_advances_in_bounded_background_steps() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large-book.txt");
+        let mut text = "line\n".repeat(30_000);
+        text.push_str("end");
+        fs::write(&path, text).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+
+        let initial = app.render_state().unwrap();
+        assert_eq!((initial.current_line, initial.total_lines), (Some(1), None));
+        assert!(app.has_background_work());
+
+        let mut advances = 0;
+        let mut redraws = 0;
+        while app.has_background_work() {
+            redraws += usize::from(app.advance_background().unwrap());
+            advances += 1;
+        }
+
+        assert_eq!(advances, 3);
+        assert_eq!(redraws, 1);
+        let complete = app.render_state().unwrap();
+        assert_eq!(
+            (complete.current_line, complete.total_lines),
+            (Some(1), Some(30_001))
+        );
     }
 
     #[test]

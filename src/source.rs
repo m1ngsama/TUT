@@ -112,6 +112,7 @@ impl<'a> SourceText<'a> {
         self.text.len()
     }
 
+    #[cfg(test)]
     pub(super) fn relative_offset(self, offset: SourceOffset) -> Option<usize> {
         if offset < self.start || offset > self.end {
             return None;
