@@ -25,7 +25,6 @@ pub enum LoadError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutError {
-    Allocation,
     NonIncreasingRowStart {
         previous: u64,
         next: u64,
@@ -130,9 +129,6 @@ impl TutError {
             Self::Load(error) => load_message(error),
             Self::NotATerminal => {
                 "interactive reading requires terminal stdin and stdout".to_owned()
-            }
-            Self::Layout(LayoutError::Allocation) => {
-                "could not allocate the visual-row index".to_owned()
             }
             Self::Layout(LayoutError::NonIncreasingRowStart { previous, next }) => {
                 format!("visual-row starts are not strictly increasing: {previous} then {next}")

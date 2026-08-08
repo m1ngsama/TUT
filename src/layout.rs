@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, num::NonZeroU16};
+use std::num::NonZeroU16;
 
 #[cfg(test)]
 use std::ops::Range;
@@ -294,7 +294,6 @@ pub(super) struct ViewportLayout {
     height: BodyHeight,
     source_start: SourceOffset,
     source_end: SourceOffset,
-    max_top: SourceOffset,
 }
 
 impl ViewportLayout {
@@ -335,10 +334,6 @@ impl ViewportLayout {
         Ok(start..boundary.end)
     }
 
-    pub(super) const fn max_top(&self) -> SourceOffset {
-        self.max_top
-    }
-
     pub(super) fn resolve_top(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -347,11 +342,10 @@ impl ViewportLayout {
     ) -> Result<SourceOffset, TutError> {
         self.require_matching_source(reader)?;
         if follow_end {
-            return Ok(self.max_top);
+            return self.last_viewport_start(reader);
         }
-        Ok(self
-            .row_start_at_or_before(reader, anchor)?
-            .min(self.max_top))
+        let top = self.row_start_at_or_before(reader, anchor)?;
+        self.clamp_to_last_viewport(reader, top)
     }
 
     pub(super) fn move_row_start(
@@ -362,14 +356,9 @@ impl ViewportLayout {
         amount: usize,
     ) -> Result<SourceOffset, TutError> {
         let mut current = self.row_start_at_or_before(reader, start)?;
-        if downward {
-            current = current.min(self.max_top);
-        }
         for _ in 0..amount {
             let next = if downward {
-                self.next_row_start(reader, current)?
-                    .unwrap_or(current)
-                    .min(self.max_top)
+                self.next_row_start(reader, current)?.unwrap_or(current)
             } else {
                 previous_row_start(reader, current, self.width)?
             };
@@ -378,7 +367,7 @@ impl ViewportLayout {
             }
             current = next;
         }
-        Ok(current.min(self.max_top))
+        self.clamp_to_last_viewport(reader, current)
     }
 
     pub(super) fn visible_extent(
@@ -387,7 +376,7 @@ impl ViewportLayout {
         top: SourceOffset,
     ) -> Result<(usize, SourceOffset), TutError> {
         self.require_matching_source(reader)?;
-        if top < self.source_start || top > self.max_top {
+        if top < self.source_start || top > self.source_end {
             return Err(LayoutError::NonIncreasingRowStart {
                 previous: self.source_start.get(),
                 next: top.get(),
@@ -408,6 +397,32 @@ impl ViewportLayout {
             start = next;
         }
         Ok((visible_rows, visible_end))
+    }
+
+    pub(super) fn is_last_viewport(
+        &self,
+        reader: &mut DocumentReader<'_>,
+        top: SourceOffset,
+    ) -> Result<bool, TutError> {
+        self.require_matching_source(reader)?;
+        let mut start = top;
+        for _ in 0..usize::from(self.height.get()) {
+            let boundary = self.row_boundary(reader, start)?;
+            let Some(next) = boundary.next else {
+                return Ok(true);
+            };
+            start = next;
+        }
+        Ok(false)
+    }
+
+    pub(super) fn last_viewport_start(
+        &self,
+        reader: &mut DocumentReader<'_>,
+    ) -> Result<SourceOffset, TutError> {
+        self.require_matching_source(reader)?;
+        let last_row = self.row_start_at_or_before(reader, self.source_end)?;
+        self.clamp_to_last_viewport(reader, last_row)
     }
 
     pub(super) fn next_row_start(
@@ -436,6 +451,23 @@ impl ViewportLayout {
         visual_row_boundary(reader, start, self.width)
     }
 
+    fn clamp_to_last_viewport(
+        &self,
+        reader: &mut DocumentReader<'_>,
+        top: SourceOffset,
+    ) -> Result<SourceOffset, TutError> {
+        let (visible_rows, _) = self.visible_extent(reader, top)?;
+        let mut top = top;
+        for _ in visible_rows..usize::from(self.height.get()) {
+            let previous = previous_row_start(reader, top, self.width)?;
+            if previous == top {
+                break;
+            }
+            top = previous;
+        }
+        Ok(top)
+    }
+
     fn require_matching_source(&self, reader: &DocumentReader<'_>) -> Result<(), TutError> {
         if reader.source_start() == self.source_start && reader.source_end() == self.source_end {
             Ok(())
@@ -459,29 +491,26 @@ struct VisualRowBoundary {
 
 pub(super) fn rebuild_viewport_layout(
     slot: &mut Option<ViewportLayout>,
-    reader: &mut DocumentReader<'_>,
+    reader: &DocumentReader<'_>,
     width: ContentWidth,
     height: BodyHeight,
-) -> Result<(), TutError> {
-    let max_top = last_viewport_start(reader, width, height)?;
+) {
     *slot = Some(ViewportLayout {
         width,
         height,
         source_start: reader.source_start(),
         source_end: reader.source_end(),
-        max_top,
     });
-    Ok(())
 }
 
 pub(super) fn ensure_viewport_layout(
     slot: &mut Option<ViewportLayout>,
-    reader: &mut DocumentReader<'_>,
+    reader: &DocumentReader<'_>,
     width: Option<ContentWidth>,
     height: Option<BodyHeight>,
-) -> Result<bool, TutError> {
+) -> bool {
     let (Some(width), Some(height)) = (width, height) else {
-        return Ok(false);
+        return false;
     };
     if slot.as_ref().is_some_and(|layout| {
         layout.width == width
@@ -489,10 +518,10 @@ pub(super) fn ensure_viewport_layout(
             && layout.source_start == reader.source_start()
             && layout.source_end == reader.source_end()
     }) {
-        return Ok(false);
+        return false;
     }
-    rebuild_viewport_layout(slot, reader, width, height)?;
-    Ok(true)
+    rebuild_viewport_layout(slot, reader, width, height);
+    true
 }
 
 pub(super) fn progress_percent(
@@ -589,41 +618,6 @@ fn row_start_at_or_before(
     }
 }
 
-fn last_viewport_start(
-    reader: &mut DocumentReader<'_>,
-    width: ContentWidth,
-    height: BodyHeight,
-) -> Result<SourceOffset, TutError> {
-    let capacity = usize::from(height.get());
-    let mut trailing = VecDeque::new();
-    trailing
-        .try_reserve_exact(capacity)
-        .map_err(|_| LayoutError::Allocation)?;
-    let mut start = reader.source_start();
-
-    loop {
-        if trailing.len() == capacity {
-            let _ = trailing.pop_front();
-        }
-        trailing.push_back(start);
-        let Some(next) = visual_row_boundary(reader, start, width)?.next else {
-            break;
-        };
-        if next <= start {
-            return Err(LayoutError::NonIncreasingRowStart {
-                previous: start.get(),
-                next: next.get(),
-            }
-            .into());
-        }
-        start = next;
-    }
-
-    Ok(*trailing
-        .front()
-        .expect("nonzero viewport height retains a row"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -650,14 +644,13 @@ mod tests {
 
         fn layout(&mut self, width: u16, height: u16) -> ViewportLayout {
             let mut slot = None;
-            let mut reader = self.document.reader(&mut self.cache);
+            let reader = self.document.reader(&mut self.cache);
             rebuild_viewport_layout(
                 &mut slot,
-                &mut reader,
+                &reader,
                 ContentWidth::new(width).unwrap(),
                 BodyHeight::new(height).unwrap(),
-            )
-            .unwrap();
+            );
             slot.unwrap()
         }
     }
@@ -747,7 +740,10 @@ mod tests {
     fn viewport_resolution_and_progress_are_clamped() {
         let (mut fixture, layout) = case("abcdefgh", 2, 2);
         let mut reader = fixture.document.reader(&mut fixture.cache);
-        assert_eq!(layout.max_top(), SourceOffset::new(4));
+        assert_eq!(
+            layout.last_viewport_start(&mut reader).unwrap(),
+            SourceOffset::new(4)
+        );
         assert_eq!(
             layout
                 .resolve_top(&mut reader, SourceOffset::new(7), false)
@@ -936,6 +932,36 @@ mod tests {
                     assert_eq!(
                         layout.row_start_at_or_before(&mut reader, offset).unwrap(),
                         expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn last_viewport_matches_forward_row_partitioning() {
+        let samples = [
+            "",
+            "\n",
+            "\n\n",
+            "a\n",
+            "one two three four",
+            "a\rb\r\nc\n",
+            "e\u{301}🙂\u{200b}\ttext",
+        ];
+
+        for text in samples {
+            for width in 1..=8 {
+                for height in 1..=8 {
+                    let (mut fixture, layout) = case(text, width, height);
+                    let starts = row_starts(&mut fixture, &layout);
+                    let expected = starts[starts.len().saturating_sub(usize::from(height))];
+                    let mut reader = fixture.document.reader(&mut fixture.cache);
+
+                    assert_eq!(
+                        layout.last_viewport_start(&mut reader).unwrap(),
+                        expected,
+                        "text={text:?}, width={width}, height={height}"
                     );
                 }
             }

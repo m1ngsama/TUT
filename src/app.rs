@@ -335,7 +335,7 @@ impl App {
             Action::HalfPageDown if reading => self.move_rows(true, self.half_page_amount())?,
             Action::HalfPageUp if reading => self.move_rows(false, self.half_page_amount())?,
             Action::DocumentStart if reading => self.document_start(),
-            Action::DocumentEnd if reading => self.document_end(),
+            Action::DocumentEnd if reading => self.document_end()?,
             Action::BeginSearch if reading => self.begin_search(),
             Action::SearchInsert(character) if editing => self.insert_search(character),
             Action::SearchBackspace if editing => self.backspace_search(),
@@ -380,10 +380,10 @@ impl App {
         let mut reader = self.document.reader(&mut self.document_cache);
         let rebuilt = ensure_viewport_layout(
             &mut self.layout,
-            &mut reader,
+            &reader,
             geometry.content_width(),
             geometry.body_height(),
-        )?;
+        );
         let layout = self.layout.as_ref().expect("usable geometry has a layout");
         self.anchor = layout.resolve_top(&mut reader, self.anchor, self.follow_end)?;
 
@@ -396,15 +396,11 @@ impl App {
         let old_follow_end = self.follow_end;
         let mut reader = self.document.reader(&mut self.document_cache);
         let target = layout.move_row_start(&mut reader, self.anchor, downward, amount)?;
+        let reached_end =
+            downward && target != old_anchor && layout.is_last_viewport(&mut reader, target)?;
 
         self.anchor = target;
-        if downward {
-            if target != old_anchor && target == layout.max_top() {
-                self.follow_end = true;
-            }
-        } else {
-            self.follow_end = false;
-        }
+        self.follow_end = downward && (old_follow_end || reached_end);
 
         Ok(old_anchor != self.anchor || old_follow_end != self.follow_end)
     }
@@ -417,13 +413,14 @@ impl App {
         changed
     }
 
-    fn document_end(&mut self) -> bool {
+    fn document_end(&mut self) -> Result<bool, TutError> {
         let layout = self.layout.as_ref().expect("usable geometry");
-        let anchor = layout.max_top();
+        let mut reader = self.document.reader(&mut self.document_cache);
+        let anchor = layout.last_viewport_start(&mut reader)?;
         let changed = self.anchor != anchor || !self.follow_end;
         self.anchor = anchor;
         self.follow_end = true;
-        changed
+        Ok(changed)
     }
 
     fn begin_search(&mut self) -> bool {
@@ -679,6 +676,8 @@ mod tests {
         app.update(Action::DocumentEnd).unwrap();
         assert!(app.follow_end);
         assert_eq!(app.progress_percent().unwrap(), 100);
+        app.update(Action::LineDown).unwrap();
+        assert!(app.follow_end);
         app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
         assert!(app.follow_end);
         assert_eq!(
@@ -820,10 +819,11 @@ mod tests {
         let mut app = reader("a\nb\nc\nd\nneedle", 16, 6);
         commit(&mut app, "needle");
 
-        assert_eq!(
-            app.anchor,
-            app.layout.as_ref().expect("usable layout").max_top()
-        );
+        assert_eq!(app.anchor, {
+            let layout = app.layout.as_ref().expect("usable layout");
+            let mut reader = app.document.reader(&mut app.document_cache);
+            layout.last_viewport_start(&mut reader).unwrap()
+        });
         assert_eq!(app.progress_percent().unwrap(), 100);
     }
 }
