@@ -40,6 +40,9 @@ pub enum LayoutError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchError {
     Allocation,
+    CoordinateOverflow,
+    NonIncreasingCursor { at: u64 },
+    QueryTooLong { limit: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +145,16 @@ impl TutError {
                 "layout source range {expected_start}..{expected_end} does not match {actual_start}..{actual_end}"
             ),
             Self::Search(SearchError::Allocation) => {
-                "could not allocate the search index".to_owned()
+                "could not allocate search working memory".to_owned()
+            }
+            Self::Search(SearchError::CoordinateOverflow) => {
+                "search source coordinates overflowed".to_owned()
+            }
+            Self::Search(SearchError::NonIncreasingCursor { at }) => {
+                format!("search did not advance from byte {at}")
+            }
+            Self::Search(SearchError::QueryTooLong { limit }) => {
+                format!("search query exceeds the {limit}-byte limit")
             }
             Self::Io { operation, source } => format!("failed to {operation}: {source}"),
             Self::Allocation(context) => format!("could not allocate {context}"),

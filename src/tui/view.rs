@@ -172,12 +172,19 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
         SearchStatus::None => (None, ""),
         SearchStatus::Committed {
             query,
-            no_matches: false,
-        } => (Some(sanitize_text(query)), ""),
+            searching: true,
+            ..
+        } => (Some(sanitize_text(query)), " — searching"),
         SearchStatus::Committed {
             query,
             no_matches: true,
+            searching: false,
         } => (Some(sanitize_text(query)), " — no matches"),
+        SearchStatus::Committed {
+            query,
+            no_matches: false,
+            searching: false,
+        } => (Some(sanitize_text(query)), ""),
         SearchStatus::Draft {
             draft,
             limit_hit: false,
@@ -350,6 +357,7 @@ mod tests {
             app.update(Action::SearchInsert(character)).unwrap();
         }
         app.update(Action::SearchCommit).unwrap();
+        app.advance_background().unwrap();
         let buffer = draw(&mut app, 20, 4);
         let first = buffer.cell((0, 1)).unwrap();
         assert_eq!(first.symbol(), "ｶﾞ");
@@ -371,6 +379,8 @@ mod tests {
             app.update(Action::SearchInsert(character)).unwrap();
         }
         app.update(Action::SearchCommit).unwrap();
+        assert!(row_text(&draw(&mut app, 48, 4), 2).ends_with("— searching"));
+        app.advance_background().unwrap();
         assert!(row_text(&draw(&mut app, 48, 4), 2).ends_with("— no matches"));
     }
 

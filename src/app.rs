@@ -1,4 +1,4 @@
-use std::{iter::Peekable, ops::Range};
+use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -11,13 +11,13 @@ use crate::{
         REPLACEMENT_CHARACTER, ViewportLayout, ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
-    search::{IntersectingMatches, MatchIndex, SearchRange},
+    search::{MAX_SEARCH_QUERY_BYTES, SearchIndex, SearchNavigation, SearchRange, SearchReplay},
     source::SourceOffset,
 };
 
 pub(super) const MIN_TERMINAL_COLUMNS: u16 = 16;
 pub(super) const MIN_TERMINAL_ROWS: u16 = 4;
-pub(super) const SEARCH_DRAFT_LIMIT_BYTES: usize = 4096;
+pub(super) const SEARCH_DRAFT_LIMIT_BYTES: usize = MAX_SEARCH_QUERY_BYTES;
 const CHROME_ROWS: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,8 +96,15 @@ pub(super) struct Viewport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SearchStatus<'a> {
     None,
-    Committed { query: &'a str, no_matches: bool },
-    Draft { draft: &'a str, limit_hit: bool },
+    Committed {
+        query: &'a str,
+        no_matches: bool,
+        searching: bool,
+    },
+    Draft {
+        draft: &'a str,
+        limit_hit: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,14 +214,18 @@ pub(super) struct RenderState<'a> {
 pub(super) struct App {
     document: Document,
     document_cache: DocumentCache,
+    search_cache: DocumentCache,
     layout: Option<ViewportLayout>,
     anchor: SourceOffset,
     follow_end: bool,
     geometry: Geometry,
     mode: Mode,
     committed_query: String,
-    match_index: Option<MatchIndex>,
+    search_index: Option<SearchIndex>,
     current_match: Option<SearchRange>,
+    navigation: Option<SearchNavigation>,
+    pending_navigation: i64,
+    search_turn: bool,
 }
 
 #[cfg(test)]
@@ -228,14 +239,18 @@ impl App {
         Self {
             document,
             document_cache: DocumentCache::default(),
+            search_cache: DocumentCache::default(),
             layout: None,
             anchor,
             follow_end: false,
             geometry: Geometry::new(0, 0),
             mode: Mode::Reading,
             committed_query: String::new(),
-            match_index: None,
+            search_index: None,
             current_match: None,
+            navigation: None,
+            pending_navigation: 0,
+            search_turn: true,
         }
     }
 
@@ -256,7 +271,16 @@ impl App {
             Mode::Reading if self.committed_query.is_empty() => SearchStatus::None,
             Mode::Reading => SearchStatus::Committed {
                 query: &self.committed_query,
-                no_matches: self.current_match.is_none(),
+                no_matches: self
+                    .search_index
+                    .as_ref()
+                    .is_some_and(|index| index.is_complete() && !index.has_matches()),
+                searching: self
+                    .search_index
+                    .as_ref()
+                    .is_some_and(|index| !index.is_complete())
+                    || self.navigation.is_some()
+                    || self.pending_navigation != 0,
             },
         }
     }
@@ -307,11 +331,38 @@ impl App {
         Ok(reader.line_position(offset)?)
     }
 
-    pub(super) const fn has_background_work(&self) -> bool {
+    pub(super) fn has_background_work(&self) -> bool {
         !self.document.line_index_complete()
+            || (matches!(self.mode, Mode::Reading)
+                && (self
+                    .search_index
+                    .as_ref()
+                    .is_some_and(|index| !index.is_complete())
+                    || self.navigation.is_some()
+                    || self.pending_navigation != 0))
     }
 
     pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
+        let search_pending = matches!(self.mode, Mode::Reading)
+            && (self
+                .search_index
+                .as_ref()
+                .is_some_and(|index| !index.is_complete())
+                || self.navigation.is_some()
+                || self.pending_navigation != 0);
+        let line_pending = !self.document.line_index_complete();
+        if search_pending && (!line_pending || self.search_turn) {
+            self.search_turn = false;
+            return self.advance_search();
+        }
+        if line_pending {
+            self.search_turn = true;
+            return self.advance_line_index();
+        }
+        Ok(false)
+    }
+
+    fn advance_line_index(&mut self) -> Result<bool, TutError> {
         let covered = self.document.line_index_covers(self.anchor);
         let complete = self.document.line_index_complete();
         let advanced = self.document.advance_line_index(&mut self.document_cache)?;
@@ -320,6 +371,47 @@ impl App {
         }
         Ok((!covered && self.document.line_index_covers(self.anchor))
             || (!complete && self.document.line_index_complete()))
+    }
+
+    fn advance_search(&mut self) -> Result<bool, TutError> {
+        let Some(index) = self.search_index.as_mut() else {
+            return Ok(false);
+        };
+        let advance = if !index.is_complete() {
+            let mut reader = self.document.reader(&mut self.search_cache);
+            index.advance(&mut reader, &self.committed_query)?
+        } else {
+            if self.navigation.is_none() {
+                if self.pending_navigation == 0 {
+                    return Ok(false);
+                }
+                let Some(current) = self.current_match else {
+                    let changed = self.pending_navigation != 0;
+                    self.pending_navigation = 0;
+                    return Ok(changed);
+                };
+                let forward = self.pending_navigation > 0;
+                self.pending_navigation -= if forward { 1 } else { -1 };
+                self.navigation = index.navigation(current, forward);
+            }
+            let Some(navigation) = self.navigation.as_mut() else {
+                let changed = self.pending_navigation != 0;
+                self.pending_navigation = 0;
+                return Ok(changed);
+            };
+            let mut reader = self.document.reader(&mut self.search_cache);
+            navigation.advance(&mut reader, &self.committed_query)?
+        };
+        let mut changed = advance.completed();
+        if advance.completed() && self.navigation.is_some() {
+            self.navigation = None;
+        }
+        if let Some(selected) = advance.selected() {
+            changed |= self.current_match != Some(selected);
+            self.current_match = Some(selected);
+            changed |= self.jump_to_match(selected)?;
+        }
+        Ok(changed)
     }
 
     fn progress_for(&self, viewport: Option<Viewport>) -> u8 {
@@ -359,8 +451,9 @@ impl App {
             Action::SearchBackspace if editing => self.backspace_search(),
             Action::SearchCommit if editing => self.commit_search()?,
             Action::SearchCancel if editing => self.cancel_search(),
-            Action::NextMatch if reading => self.select_match(true)?,
-            Action::PreviousMatch if reading => self.select_match(false)?,
+            Action::SearchCancel if reading => self.cancel_committed_search(),
+            Action::NextMatch if reading => self.select_match(true),
+            Action::PreviousMatch if reading => self.select_match(false),
             _ => false,
         };
 
@@ -481,6 +574,18 @@ impl App {
         true
     }
 
+    fn cancel_committed_search(&mut self) -> bool {
+        if self.committed_query.is_empty() {
+            return false;
+        }
+        self.committed_query.clear();
+        self.search_index = None;
+        self.current_match = None;
+        self.navigation = None;
+        self.pending_navigation = 0;
+        true
+    }
+
     fn commit_search(&mut self) -> Result<bool, TutError> {
         let Mode::SearchInput { draft, .. } = std::mem::replace(&mut self.mode, Mode::Reading)
         else {
@@ -489,8 +594,10 @@ impl App {
 
         if draft.is_empty() {
             self.committed_query.clear();
-            self.match_index = None;
+            self.search_index = None;
             self.current_match = None;
+            self.navigation = None;
+            self.pending_navigation = 0;
             return Ok(true);
         }
 
@@ -499,34 +606,31 @@ impl App {
             .map_or(self.document.source_start(), |viewport| {
                 viewport.first_visible_start
             });
-        let mut reader = self.document.reader(&mut self.document_cache);
-        let index =
-            MatchIndex::build(&mut reader, &draft)?.expect("nonempty query creates an index");
-        let selected = index.first_intersecting_or_wrap(first_visible);
+        let reader = self.document.reader(&mut self.search_cache);
+        let index = SearchIndex::new(&reader, &draft, first_visible)?
+            .expect("nonempty queries create search indexes");
         self.committed_query = draft;
-        self.match_index = Some(index);
-        self.current_match = selected;
-        if let Some(selected) = selected {
-            let _ = self.jump_to_match(selected)?;
-        }
+        self.search_index = Some(index);
+        self.current_match = None;
+        self.navigation = None;
+        self.pending_navigation = 0;
+        self.search_turn = true;
         Ok(true)
     }
 
-    fn select_match(&mut self, forward: bool) -> Result<bool, TutError> {
-        let (Some(index), Some(current)) = (self.match_index.as_ref(), self.current_match) else {
-            return Ok(false);
+    fn select_match(&mut self, forward: bool) -> bool {
+        let Some(index) = self.search_index.as_ref() else {
+            return false;
         };
-        let selected = if forward {
-            index.next_after(current)
+        if index.is_complete() && self.current_match.is_none() {
+            return false;
+        }
+        self.pending_navigation = if forward {
+            self.pending_navigation.saturating_add(1)
         } else {
-            index.previous_before(current)
+            self.pending_navigation.saturating_sub(1)
         };
-        let Some(selected) = selected else {
-            return Ok(false);
-        };
-        let changed = self.current_match != Some(selected);
-        self.current_match = Some(selected);
-        Ok(self.jump_to_match(selected)? || changed)
+        true
     }
 
     fn jump_to_match(&mut self, selected: SearchRange) -> Result<bool, TutError> {
@@ -556,15 +660,23 @@ impl App {
         let layout = self.layout.as_ref().expect("viewport has a layout");
         let visible = viewport.first_visible_start..viewport.visible_end;
         let mut matches =
-            MatchCursor::for_viewport(self.match_index.as_ref(), self.current_match, visible);
+            MatchCursor::for_viewport(self.search_index.as_ref(), self.current_match, visible);
         let mut rows = Vec::new();
         rows.try_reserve_exact(viewport.visible_rows)
             .map_err(|_| TutError::Allocation("visible rows"))?;
 
         let mut start = viewport.first_visible_start;
         let mut reader = self.document.reader(&mut self.document_cache);
+        let mut search_reader = self.document.reader(&mut self.search_cache);
         for row_number in 0..viewport.visible_rows {
-            let (row, next) = build_render_row(layout, &mut reader, start, &mut matches)?;
+            let (row, next) = build_render_row(
+                layout,
+                &mut reader,
+                &mut search_reader,
+                &self.committed_query,
+                start,
+                &mut matches,
+            )?;
             rows.push(row);
             if row_number + 1 < viewport.visible_rows {
                 start = next.expect("non-final visible rows have successors");
@@ -577,13 +689,15 @@ impl App {
 fn build_render_row(
     layout: &ViewportLayout,
     reader: &mut DocumentReader<'_>,
+    search_reader: &mut DocumentReader<'_>,
+    query: &str,
     start: SourceOffset,
-    matches: &mut MatchCursor<'_>,
+    matches: &mut MatchCursor,
 ) -> Result<(RenderRow, Option<SourceOffset>), TutError> {
     let mut text = String::new();
     let mut spans = Vec::new();
     let next = layout.visit_projected_row(reader, start, |atom| {
-        let highlight = matches.role_for(atom.source());
+        let highlight = matches.role_for(search_reader, query, atom.source())?;
         if spans.len() == spans.capacity() {
             spans
                 .try_reserve(1)
@@ -596,26 +710,31 @@ fn build_render_row(
     Ok((RenderRow { text, spans }, next))
 }
 
-struct MatchCursor<'a> {
-    pending: Option<Peekable<IntersectingMatches<'a>>>,
+struct MatchCursor {
+    pending: Option<SearchReplay>,
     spanning: Option<SearchRange>,
     current: Option<SearchRange>,
 }
 
-impl<'a> MatchCursor<'a> {
+impl MatchCursor {
     fn for_viewport(
-        match_index: Option<&'a MatchIndex>,
+        search_index: Option<&SearchIndex>,
         current: Option<SearchRange>,
         visible: Range<SourceOffset>,
     ) -> Self {
         Self {
-            pending: match_index.map(|index| index.intersecting(visible).peekable()),
+            pending: search_index.and_then(|index| index.replay(visible)),
             spanning: None,
             current,
         }
     }
 
-    fn role_for(&mut self, atom: GraphemeRange) -> Highlight {
+    fn role_for(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        query: &str,
+        atom: GraphemeRange,
+    ) -> Result<Highlight, TutError> {
         let mut role = Highlight::None;
         if let Some(active) = self.spanning.take() {
             if intersects(active, atom) {
@@ -623,18 +742,20 @@ impl<'a> MatchCursor<'a> {
             }
             if active.end() > atom.end() {
                 self.spanning = Some(active);
-                return role;
+                return Ok(role);
             }
         }
 
         let Some(pending) = &mut self.pending else {
-            return role;
+            return Ok(role);
         };
-        while pending
-            .peek()
-            .is_some_and(|range| range.start() < atom.end())
-        {
-            let range = pending.next().expect("peeked match exists");
+        while let Some(next) = pending.peek(reader, query)? {
+            if next.start() >= atom.end() {
+                break;
+            }
+            let range = pending
+                .next(reader, query)?
+                .expect("peeked search match exists");
             if intersects(range, atom) {
                 role = promote(role, range, self.current);
             }
@@ -643,7 +764,7 @@ impl<'a> MatchCursor<'a> {
                 break;
             }
         }
-        role
+        Ok(role)
     }
 }
 
@@ -676,12 +797,23 @@ mod tests {
         app
     }
 
-    fn commit(app: &mut App, query: &str) {
+    fn submit(app: &mut App, query: &str) {
         app.update(Action::BeginSearch).unwrap();
         for character in query.chars() {
             app.update(Action::SearchInsert(character)).unwrap();
         }
         app.update(Action::SearchCommit).unwrap();
+    }
+
+    fn commit(app: &mut App, query: &str) {
+        submit(app, query);
+        while app
+            .search_index
+            .as_ref()
+            .is_some_and(|index| !index.is_complete())
+        {
+            app.advance_background().unwrap();
+        }
     }
 
     #[test]
@@ -721,8 +853,14 @@ mod tests {
         commit(&mut app, "alpha");
         let first = app.current_match.unwrap();
         app.update(Action::NextMatch).unwrap();
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
         assert_ne!(app.current_match, Some(first));
         app.update(Action::PreviousMatch).unwrap();
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
         assert_eq!(app.current_match, Some(first));
 
         app.update(Action::BeginSearch).unwrap();
@@ -752,6 +890,117 @@ mod tests {
                 limit_hit: true
             } if draft.len() == SEARCH_DRAFT_LIMIT_BYTES
         ));
+    }
+
+    #[test]
+    fn committed_search_is_incremental_and_cancelable() {
+        let mut text = "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2);
+        text.push_str("needle");
+        let mut app = reader(&text, 16, 4);
+
+        submit(&mut app, "needle");
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Committed {
+                no_matches: false,
+                searching: true,
+                ..
+            }
+        ));
+        assert_eq!(app.current_match, None);
+        assert!(app.has_background_work());
+
+        app.advance_background().unwrap();
+        assert_eq!(app.current_match, None);
+        assert_eq!(app.update(Action::SearchCancel).unwrap(), Outcome::Changed);
+        assert_eq!(app.search_status(), SearchStatus::None);
+        assert!(!app.has_background_work());
+    }
+
+    #[test]
+    fn editing_a_new_query_pauses_the_committed_search() {
+        let mut text = "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2);
+        text.push_str("needle");
+        let mut app = reader(&text, 16, 4);
+        submit(&mut app, "needle");
+        let anchor = app.anchor;
+
+        app.update(Action::BeginSearch).unwrap();
+        assert!(!app.has_background_work());
+        assert!(!app.advance_background().unwrap());
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.current_match, None);
+
+        app.update(Action::SearchCancel).unwrap();
+        assert!(app.has_background_work());
+    }
+
+    #[test]
+    fn early_search_results_are_selected_before_scanning_finishes() {
+        let mut text = "needle".to_owned();
+        text.push_str(&"x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2));
+        let mut app = reader(&text, 16, 4);
+
+        submit(&mut app, "needle");
+        app.advance_background().unwrap();
+
+        assert_eq!(
+            app.current_match.unwrap().start(),
+            app.document.source_start()
+        );
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Committed {
+                searching: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn match_navigation_waits_for_incremental_search_without_losing_the_request() {
+        let mut text = "cat".to_owned();
+        text.push_str(&"x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2));
+        text.push_str("cat");
+        let mut app = reader(&text, 16, 4);
+        submit(&mut app, "cat");
+        app.advance_background().unwrap();
+        let first = app.current_match.unwrap();
+
+        app.update(Action::NextMatch).unwrap();
+        assert_eq!(app.current_match, Some(first));
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Committed {
+                searching: true,
+                ..
+            }
+        ));
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+
+        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
+    }
+
+    #[test]
+    fn a_new_query_replaces_pending_search_state() {
+        let mut text = "alpha".to_owned();
+        text.push_str(&"x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2));
+        text.push_str("beta");
+        let mut app = reader(&text, 16, 4);
+
+        submit(&mut app, "alpha");
+        app.advance_background().unwrap();
+        assert!(app.current_match.is_some());
+        submit(&mut app, "beta");
+        assert_eq!(app.current_match, None);
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+
+        assert_eq!(app.committed_query, "beta");
+        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
     }
 
     #[test]

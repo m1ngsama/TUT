@@ -1,10 +1,15 @@
-use std::{num::NonZeroUsize, ops::Range};
+use std::{mem::size_of, num::NonZeroUsize, ops::Range};
 
 use crate::{
     document::{DocumentReader, SOURCE_WINDOW_BYTES},
     error::{SearchError, TutError},
     source::SourceOffset,
 };
+
+const SEARCH_INDEX_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = SOURCE_WINDOW_BYTES as u64;
+const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
+pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SearchRange {
@@ -30,253 +35,490 @@ impl SearchRange {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct MatchIndex {
-    bits: Vec<u8>,
-    source_start: SourceOffset,
-    source_end: SourceOffset,
-    source_len: usize,
-    query_len: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchCheckpoint {
+    scan_at: SourceOffset,
+    previous_match: Option<SearchRange>,
 }
 
-impl MatchIndex {
-    pub(super) fn build(
-        reader: &mut DocumentReader<'_>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchIndexLimits {
+    initial_interval_bytes: u64,
+    max_checkpoints: usize,
+}
+
+impl SearchIndexLimits {
+    const DEFAULT: Self = Self {
+        initial_interval_bytes: INITIAL_CHECKPOINT_INTERVAL_BYTES,
+        max_checkpoints: SEARCH_INDEX_MEMORY_BUDGET_BYTES / size_of::<SearchCheckpoint>(),
+    };
+
+    #[cfg(test)]
+    const fn new(initial_interval_bytes: u64, max_checkpoints: usize) -> Option<Self> {
+        if initial_interval_bytes == 0 || max_checkpoints < 2 {
+            None
+        } else {
+            Some(Self {
+                initial_interval_bytes,
+                max_checkpoints,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SearchAdvance {
+    selected: Option<SearchRange>,
+    completed: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct SearchNavigation {
+    cursor: SourceOffset,
+    source_end: SourceOffset,
+    direction: NavigationDirection,
+}
+
+#[derive(Debug)]
+enum NavigationDirection {
+    Forward {
+        after: SourceOffset,
+        wrap: Option<SearchRange>,
+    },
+    Backward {
+        before: SourceOffset,
+        previous: Option<SearchRange>,
+        wrap: Option<SearchRange>,
+    },
+}
+
+impl SearchAdvance {
+    pub(super) const fn selected(self) -> Option<SearchRange> {
+        self.selected
+    }
+
+    pub(super) const fn completed(self) -> bool {
+        self.completed
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct SearchIndex {
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+    scanned_to: SourceOffset,
+    query_len: usize,
+    checkpoints: Vec<SearchCheckpoint>,
+    checkpoint_interval_bytes: u64,
+    max_checkpoints: usize,
+    first_match: Option<SearchRange>,
+    last_match: Option<SearchRange>,
+    selection_anchor: SourceOffset,
+    initial_selection: Option<SearchRange>,
+    selection_delivered: bool,
+    complete: bool,
+}
+
+impl SearchIndex {
+    pub(super) fn new(
+        reader: &DocumentReader<'_>,
         needle: &str,
+        selection_anchor: SourceOffset,
     ) -> Result<Option<Self>, TutError> {
         if needle.is_empty() {
             return Ok(None);
         }
+        if needle.len() > MAX_SEARCH_QUERY_BYTES {
+            return Err(SearchError::QueryTooLong {
+                limit: MAX_SEARCH_QUERY_BYTES,
+            }
+            .into());
+        }
+        Self::with_limits(reader, needle, selection_anchor, SearchIndexLimits::DEFAULT).map(Some)
+    }
 
+    fn with_limits(
+        reader: &DocumentReader<'_>,
+        needle: &str,
+        selection_anchor: SourceOffset,
+        limits: SearchIndexLimits,
+    ) -> Result<Self, TutError> {
         let source_start = reader.source_start();
         let source_end = reader.source_end();
-        let source_len = usize::try_from(source_end.get() - source_start.get())
-            .expect("document spans fit the process address space");
-        let query_len = needle.len();
-        let storage = required_storage_bytes(source_len);
-        let mut bits = Vec::new();
-        bits.try_reserve_exact(storage)
+        let selection_anchor = selection_anchor.clamp(source_start, source_end);
+        let mut checkpoints = Vec::new();
+        checkpoints
+            .try_reserve_exact(INITIAL_CHECKPOINT_RESERVATION.min(limits.max_checkpoints))
             .map_err(|_| SearchError::Allocation)?;
-        bits.resize(storage, 0);
+        checkpoints.push(SearchCheckpoint {
+            scan_at: source_start,
+            previous_match: None,
+        });
 
-        let mut index = Self {
-            bits,
+        Ok(Self {
             source_start,
             source_end,
-            source_len,
-            query_len,
+            scanned_to: source_start,
+            query_len: needle.len(),
+            checkpoints,
+            checkpoint_interval_bytes: limits.initial_interval_bytes,
+            max_checkpoints: limits.max_checkpoints,
+            first_match: None,
+            last_match: None,
+            selection_anchor,
+            initial_selection: None,
+            selection_delivered: false,
+            complete: source_start == source_end,
+        })
+    }
+
+    pub(super) const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(super) const fn has_matches(&self) -> bool {
+        self.first_match.is_some()
+    }
+
+    pub(super) fn advance(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+    ) -> Result<SearchAdvance, TutError> {
+        debug_assert_eq!(needle.len(), self.query_len);
+        if self.complete {
+            return Ok(SearchAdvance {
+                selected: None,
+                completed: false,
+            });
+        }
+
+        let mut first_match = self.first_match;
+        let mut last_match = self.last_match;
+        let mut initial_selection = self.initial_selection;
+        let next = scan_window(reader, needle, self.scanned_to, self.source_end, |range| {
+            first_match.get_or_insert(range);
+            last_match = Some(range);
+            if initial_selection.is_none() && range.end() > self.selection_anchor {
+                initial_selection = Some(range);
+            }
+            Ok(())
+        })?;
+        self.first_match = first_match;
+        self.last_match = last_match;
+        self.initial_selection = initial_selection;
+        self.scanned_to = next;
+        self.record_checkpoint()?;
+
+        let completed = next == self.source_end;
+        if completed {
+            self.complete = true;
+            if self.initial_selection.is_none() {
+                self.initial_selection = self.first_match;
+            }
+        }
+        let selected = if self.selection_delivered {
+            None
+        } else {
+            self.initial_selection
         };
-        let target_bytes = SOURCE_WINDOW_BYTES
-            .checked_add(query_len.saturating_sub(1))
-            .and_then(NonZeroUsize::new)
-            .ok_or(SearchError::Allocation)?;
-        let mut cursor = source_start;
+        self.selection_delivered |= selected.is_some();
 
-        while cursor < source_end {
-            let next = {
-                let window = reader.window(cursor, target_bytes)?;
-                let text = window.as_str();
-                let safe_relative = if window.end() == source_end {
-                    text.len()
-                } else {
-                    let mut boundary = SOURCE_WINDOW_BYTES.min(text.len());
-                    while boundary < text.len() && !text.is_char_boundary(boundary) {
-                        boundary += 1;
-                    }
-                    boundary
-                };
-                let window_relative = usize::try_from(cursor.get() - source_start.get())
-                    .expect("document spans fit the process address space");
-                let mut search_from = 0;
-                let mut last_match_end = 0;
-
-                while search_from < text.len() {
-                    let Some(relative) = text[search_from..].find(needle) else {
-                        break;
-                    };
-                    let start = search_from + relative;
-                    if start >= safe_relative {
-                        break;
-                    }
-                    index.set_start(window_relative + start);
-                    last_match_end = start + query_len;
-                    search_from = last_match_end;
-                }
-
-                cursor
-                    .checked_add(safe_relative.max(last_match_end))
-                    .expect("bounded search windows fit source coordinates")
-            };
-            debug_assert!(next > cursor);
-            cursor = next;
-        }
-
-        Ok(Some(index))
+        Ok(SearchAdvance {
+            selected,
+            completed,
+        })
     }
 
-    pub(super) fn first_intersecting_or_wrap(
+    pub(super) fn navigation(
         &self,
-        visible_start: SourceOffset,
-    ) -> Option<SearchRange> {
-        let visible = self.relative_clamped(visible_start);
-        let earliest = visible.saturating_sub(self.query_len.saturating_sub(1));
-        self.next_start_at_or_after(earliest)
-            .map(|start| self.range_at(start))
-            .filter(|range| range.end() > visible_start)
-            .or_else(|| {
-                self.next_start_at_or_after(0)
-                    .map(|start| self.range_at(start))
-            })
+        current: SearchRange,
+        forward: bool,
+    ) -> Option<SearchNavigation> {
+        if !self.complete {
+            return None;
+        }
+        if forward {
+            let insertion = self.checkpoints.partition_point(|checkpoint| {
+                checkpoint
+                    .previous_match
+                    .is_none_or(|range| range.start() < current.end())
+            });
+            let checkpoint = self.checkpoints[insertion.saturating_sub(1)];
+            return Some(SearchNavigation {
+                cursor: checkpoint.scan_at,
+                source_end: self.source_end,
+                direction: NavigationDirection::Forward {
+                    after: current.end(),
+                    wrap: self.first_match,
+                },
+            });
+        }
+
+        let checkpoint = self.checkpoint_at_or_before(current.start());
+        Some(SearchNavigation {
+            cursor: checkpoint.scan_at,
+            source_end: self.source_end,
+            direction: NavigationDirection::Backward {
+                before: current.start(),
+                previous: checkpoint
+                    .previous_match
+                    .filter(|range| range.start() < current.start()),
+                wrap: self.last_match,
+            },
+        })
     }
 
-    pub(super) fn next_after(&self, current: SearchRange) -> Option<SearchRange> {
-        self.next_start_at_or_after(self.relative_clamped(current.end()))
-            .or_else(|| self.next_start_at_or_after(0))
-            .map(|start| self.range_at(start))
-    }
-
-    pub(super) fn previous_before(&self, current: SearchRange) -> Option<SearchRange> {
-        self.previous_start_before(self.relative_clamped(current.start()))
-            .or_else(|| self.previous_start_before(self.source_len))
-            .map(|start| self.range_at(start))
-    }
-
-    pub(super) fn intersecting(&self, visible: Range<SourceOffset>) -> IntersectingMatches<'_> {
-        let earliest = self
-            .relative_clamped(visible.start)
-            .saturating_sub(self.query_len.saturating_sub(1));
-        let before = self.relative_clamped(visible.end);
-        IntersectingMatches {
-            index: self,
+    pub(super) fn replay(&self, visible: Range<SourceOffset>) -> Option<SearchReplay> {
+        if visible.start >= visible.end || visible.start >= self.scanned_to {
+            return None;
+        }
+        let earliest = visible
+            .start
+            .checked_sub(self.query_len.saturating_sub(1))
+            .unwrap_or(self.source_start)
+            .max(self.source_start);
+        let checkpoint = self.checkpoint_at_or_before(earliest);
+        Some(SearchReplay {
             visible,
-            next: self.next_start_at_or_after_before(earliest, before),
-        }
+            cursor: checkpoint.scan_at,
+            stop: self.scanned_to,
+            pending: Vec::new(),
+            pending_index: 0,
+            complete: false,
+        })
     }
 
-    fn range_at(&self, start: usize) -> SearchRange {
-        let start = self
-            .source_start
-            .checked_add(start)
-            .expect("indexed match starts inside the source span");
-        let end = start
-            .checked_add(self.query_len)
-            .expect("indexed match ends inside the source span");
-        SearchRange::new(start, end).expect("indexed queries are nonempty")
+    fn record_checkpoint(&mut self) -> Result<(), TutError> {
+        let last = self
+            .checkpoints
+            .last()
+            .expect("search indexes retain their source-start checkpoint");
+        if self.scanned_to.get() - last.scan_at.get() < self.checkpoint_interval_bytes {
+            return Ok(());
+        }
+        while self.checkpoints.len() >= self.max_checkpoints {
+            self.compact()?;
+            let last = self
+                .checkpoints
+                .last()
+                .expect("search indexes retain their source-start checkpoint");
+            if self.scanned_to.get() - last.scan_at.get() < self.checkpoint_interval_bytes {
+                return Ok(());
+            }
+        }
+        self.reserve_checkpoint()?;
+        self.checkpoints.push(SearchCheckpoint {
+            scan_at: self.scanned_to,
+            previous_match: self.last_match,
+        });
+        Ok(())
     }
 
-    fn relative_clamped(&self, offset: SourceOffset) -> usize {
-        if offset <= self.source_start {
-            return 0;
-        }
-        if offset >= self.source_end {
-            return self.source_len;
-        }
-        usize::try_from(offset.get() - self.source_start.get())
-            .expect("document source offsets fit usize")
+    fn compact(&mut self) -> Result<(), TutError> {
+        self.checkpoint_interval_bytes = self
+            .checkpoint_interval_bytes
+            .checked_mul(2)
+            .ok_or(SearchError::CoordinateOverflow)?;
+        let mut index = 0;
+        self.checkpoints.retain(|_| {
+            let keep = index % 2 == 0;
+            index += 1;
+            keep
+        });
+        Ok(())
     }
 
-    fn set_start(&mut self, offset: usize) {
-        self.bits[offset / 8] |= 1_u8 << (offset % 8);
+    fn reserve_checkpoint(&mut self) -> Result<(), TutError> {
+        if self.checkpoints.len() < self.checkpoints.capacity() {
+            return Ok(());
+        }
+        let remaining = self.max_checkpoints - self.checkpoints.len();
+        let additional = self.checkpoints.capacity().max(1).min(remaining);
+        self.checkpoints
+            .try_reserve_exact(additional)
+            .map_err(|_| SearchError::Allocation)?;
+        Ok(())
     }
 
-    fn next_start_at_or_after_before(&self, from: usize, before: usize) -> Option<usize> {
-        let before = before.min(self.source_len);
-        if from >= before {
-            return None;
-        }
-
-        let mut byte_index = from / 8;
-        let last_byte_index = (before - 1) / 8;
-        let mut byte = self.bits[byte_index] & (u8::MAX << (from % 8));
-
-        loop {
-            if byte_index == last_byte_index {
-                let last_bit = (before - 1) % 8;
-                byte &= u8::MAX >> (7 - last_bit);
-            }
-            if byte != 0 {
-                return Some(byte_index * 8 + byte.trailing_zeros() as usize);
-            }
-            if byte_index == last_byte_index {
-                return None;
-            }
-            byte_index += 1;
-            byte = self.bits[byte_index];
-        }
+    fn checkpoint_at_or_before(&self, offset: SourceOffset) -> SearchCheckpoint {
+        let insertion = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.scan_at <= offset);
+        self.checkpoints[insertion.saturating_sub(1)]
     }
+}
 
-    fn next_start_at_or_after(&self, from: usize) -> Option<usize> {
-        if from >= self.source_len {
-            return None;
-        }
-        let mut byte_index = from / 8;
-        let mut byte = self.bits[byte_index] & (u8::MAX << (from % 8));
-
-        loop {
-            if byte != 0 {
-                let offset = byte_index * 8 + byte.trailing_zeros() as usize;
-                return (offset < self.source_len).then_some(offset);
+impl SearchNavigation {
+    pub(super) fn advance(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+    ) -> Result<SearchAdvance, TutError> {
+        match &mut self.direction {
+            NavigationDirection::Forward { after, wrap } => {
+                if self.cursor >= self.source_end {
+                    return Ok(SearchAdvance {
+                        selected: *wrap,
+                        completed: true,
+                    });
+                }
+                let mut selected = None;
+                self.cursor = scan_window(reader, needle, self.cursor, self.source_end, |range| {
+                    if selected.is_none() && range.start() >= *after {
+                        selected = Some(range);
+                    }
+                    Ok(())
+                })?;
+                let completed = selected.is_some() || self.cursor == self.source_end;
+                Ok(SearchAdvance {
+                    selected: if completed {
+                        selected.or(*wrap)
+                    } else {
+                        selected
+                    },
+                    completed,
+                })
             }
-            byte_index += 1;
-            byte = *self.bits.get(byte_index)?;
-        }
-    }
-
-    fn previous_start_before(&self, before: usize) -> Option<usize> {
-        if before == 0 || self.source_len == 0 {
-            return None;
-        }
-
-        let last = before.min(self.source_len) - 1;
-        let mut byte_index = last / 8;
-        let last_bit = last % 8;
-        let mut byte = self.bits[byte_index] & (u8::MAX >> (7 - last_bit));
-
-        loop {
-            if byte != 0 {
-                return Some(byte_index * 8 + byte.ilog2() as usize);
+            NavigationDirection::Backward {
+                before,
+                previous,
+                wrap,
+            } => {
+                if self.cursor >= *before {
+                    return Ok(SearchAdvance {
+                        selected: (*previous).or(*wrap),
+                        completed: true,
+                    });
+                }
+                self.cursor = scan_window(reader, needle, self.cursor, self.source_end, |range| {
+                    if range.start() < *before {
+                        *previous = Some(range);
+                    }
+                    Ok(())
+                })?;
+                let completed = self.cursor >= *before;
+                Ok(SearchAdvance {
+                    selected: completed.then_some((*previous).or(*wrap)).flatten(),
+                    completed,
+                })
             }
-            if byte_index == 0 {
-                return None;
-            }
-            byte_index -= 1;
-            byte = self.bits[byte_index];
         }
     }
 }
 
-pub(super) struct IntersectingMatches<'a> {
-    index: &'a MatchIndex,
+pub(super) struct SearchReplay {
     visible: Range<SourceOffset>,
-    next: Option<usize>,
+    cursor: SourceOffset,
+    stop: SourceOffset,
+    pending: Vec<SearchRange>,
+    pending_index: usize,
+    complete: bool,
 }
 
-impl Iterator for IntersectingMatches<'_> {
-    type Item = SearchRange;
+impl SearchReplay {
+    pub(super) fn peek(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+    ) -> Result<Option<SearchRange>, TutError> {
+        self.refill(reader, needle)?;
+        Ok(self.pending.get(self.pending_index).copied())
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let start = self.next?;
-            let range = self.index.range_at(start);
-            if range.start() >= self.visible.end {
-                self.next = None;
-                return None;
+    pub(super) fn next(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+    ) -> Result<Option<SearchRange>, TutError> {
+        self.refill(reader, needle)?;
+        let next = self.pending.get(self.pending_index).copied();
+        self.pending_index += usize::from(next.is_some());
+        Ok(next)
+    }
+
+    fn refill(&mut self, reader: &mut DocumentReader<'_>, needle: &str) -> Result<(), TutError> {
+        while self.pending_index == self.pending.len() && !self.complete {
+            self.pending.clear();
+            self.pending_index = 0;
+            if self.cursor >= self.stop || self.cursor >= self.visible.end {
+                self.complete = true;
+                break;
             }
 
-            self.next = self.index.next_start_at_or_after_before(
-                start + self.index.query_len,
-                self.index.relative_clamped(self.visible.end),
-            );
-            if range.end() <= self.visible.start {
-                continue;
-            }
-            return Some(range);
+            self.cursor = scan_window(reader, needle, self.cursor, reader.source_end(), |range| {
+                if range.start() < self.stop
+                    && range.start() < self.visible.end
+                    && range.end() > self.visible.start
+                {
+                    if self.pending.len() == self.pending.capacity() {
+                        self.pending
+                            .try_reserve(1)
+                            .map_err(|_| SearchError::Allocation)?;
+                    }
+                    self.pending.push(range);
+                }
+                Ok(())
+            })?;
         }
+        Ok(())
     }
 }
 
-const fn required_storage_bytes(source_len: usize) -> usize {
-    source_len.div_ceil(8)
+fn scan_window(
+    reader: &mut DocumentReader<'_>,
+    needle: &str,
+    cursor: SourceOffset,
+    source_end: SourceOffset,
+    mut visit: impl FnMut(SearchRange) -> Result<(), TutError>,
+) -> Result<SourceOffset, TutError> {
+    let target_bytes = SOURCE_WINDOW_BYTES
+        .checked_add(needle.len().saturating_sub(1))
+        .and_then(NonZeroUsize::new)
+        .ok_or(SearchError::Allocation)?;
+    let window = reader.window(cursor, target_bytes)?;
+    let text = window.as_str();
+    let safe_relative = if window.end() == source_end {
+        text.len()
+    } else {
+        let mut boundary = SOURCE_WINDOW_BYTES.min(text.len());
+        while boundary < text.len() && !text.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        boundary
+    };
+    let mut search_from = 0;
+    let mut last_match_end = 0;
+
+    while search_from < text.len() {
+        let Some(relative) = text[search_from..].find(needle) else {
+            break;
+        };
+        let start = search_from + relative;
+        if start >= safe_relative {
+            break;
+        }
+        let absolute_start = cursor
+            .checked_add(start)
+            .ok_or(SearchError::CoordinateOverflow)?;
+        let absolute_end = absolute_start
+            .checked_add(needle.len())
+            .ok_or(SearchError::CoordinateOverflow)?;
+        visit(
+            SearchRange::new(absolute_start, absolute_end)
+                .expect("nonempty queries produce nonempty ranges"),
+        )?;
+        last_match_end = start + needle.len();
+        search_from = last_match_end;
+    }
+
+    let next = cursor
+        .checked_add(safe_relative.max(last_match_end))
+        .ok_or(SearchError::CoordinateOverflow)?;
+    if next <= cursor || next > source_end {
+        return Err(SearchError::NonIncreasingCursor { at: cursor.get() }.into());
+    }
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -286,25 +528,70 @@ mod tests {
     use super::*;
     use crate::document::{Document, DocumentCache};
 
-    fn build_at(text: &str, start: SourceOffset, needle: &str) -> Option<MatchIndex> {
+    fn complete_at(
+        text: &str,
+        start: SourceOffset,
+        needle: &str,
+        anchor: SourceOffset,
+    ) -> (Document, SearchIndex) {
         let document = Document::from_text_at(Path::new("search.txt"), text.to_owned(), start);
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
-        MatchIndex::build(&mut reader, needle).unwrap()
+        let mut index = SearchIndex::new(&reader, needle, anchor).unwrap().unwrap();
+        while !index.is_complete() {
+            index.advance(&mut reader, needle).unwrap();
+        }
+        (document, index)
     }
 
-    fn build(text: &str, needle: &str) -> Option<MatchIndex> {
-        build_at(text, SourceOffset::ZERO, needle)
+    fn complete(text: &str, needle: &str) -> (Document, SearchIndex) {
+        complete_at(text, SourceOffset::ZERO, needle, SourceOffset::ZERO)
+    }
+
+    fn matches(
+        document: &Document,
+        index: &SearchIndex,
+        needle: &str,
+        visible: Range<SourceOffset>,
+    ) -> Vec<SearchRange> {
+        let mut replay = index.replay(visible).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut matches = Vec::new();
+        while let Some(range) = replay.next(&mut reader, needle).unwrap() {
+            matches.push(range);
+        }
+        matches
+    }
+
+    fn navigate(
+        document: &Document,
+        index: &SearchIndex,
+        needle: &str,
+        current: SearchRange,
+        forward: bool,
+    ) -> Option<SearchRange> {
+        let mut navigation = index.navigation(current, forward).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        loop {
+            let advance = navigation.advance(&mut reader, needle).unwrap();
+            if advance.completed() {
+                return advance.selected();
+            }
+        }
     }
 
     #[test]
     fn builds_a_global_nonoverlapping_index() {
-        let index = build("aaaaaa", "aa").unwrap();
-        let matches: Vec<_> = index
-            .intersecting(SourceOffset::ZERO..SourceOffset::new(6))
-            .collect();
+        let (document, index) = complete("aaaaaa", "aa");
         assert_eq!(
-            matches,
+            matches(
+                &document,
+                &index,
+                "aa",
+                SourceOffset::ZERO..SourceOffset::new(6)
+            ),
             vec![
                 SearchRange::new(SourceOffset::new(0), SourceOffset::new(2)).unwrap(),
                 SearchRange::new(SourceOffset::new(2), SourceOffset::new(4)).unwrap(),
@@ -315,83 +602,257 @@ mod tests {
 
     #[test]
     fn navigation_wraps_in_both_directions() {
-        let index = build("cat cat", "cat").unwrap();
-        let first = index
-            .first_intersecting_or_wrap(SourceOffset::ZERO)
-            .unwrap();
-        let second = index.next_after(first).unwrap();
+        let (document, index) = complete("cat cat", "cat");
+        let first = index.first_match.unwrap();
+        let second = navigate(&document, &index, "cat", first, true).unwrap();
         assert_eq!(second.start(), SourceOffset::new(4));
-        assert_eq!(index.next_after(second), Some(first));
-        assert_eq!(index.previous_before(first), Some(second));
+        assert_eq!(
+            navigate(&document, &index, "cat", second, true),
+            Some(first)
+        );
+        assert_eq!(
+            navigate(&document, &index, "cat", first, false),
+            Some(second)
+        );
     }
 
     #[test]
     fn empty_queries_have_no_index_and_multibyte_queries_use_byte_ranges() {
-        assert!(build("text", "").is_none());
-        let index = build("é-é", "é").unwrap();
-        let first = index
-            .first_intersecting_or_wrap(SourceOffset::ZERO)
-            .unwrap();
+        let document = Document::from_text(Path::new("search.txt"), "text".to_owned());
+        let mut cache = DocumentCache::default();
+        let reader = document.reader(&mut cache);
+        assert!(
+            SearchIndex::new(&reader, "", SourceOffset::ZERO)
+                .unwrap()
+                .is_none()
+        );
+
+        let (document, index) = complete("é-é", "é");
+        let first = index.first_match.unwrap();
         assert_eq!(first.end().get() - first.start().get(), 2);
         assert_eq!(
-            index.next_after(first).unwrap().start(),
+            navigate(&document, &index, "é", first, true)
+                .unwrap()
+                .start(),
             SourceOffset::new(3)
         );
     }
 
     #[test]
-    fn viewport_selection_includes_matches_crossing_its_start() {
-        let index = build("abcd--abcd", "abcd").unwrap();
-        assert_eq!(
-            index
-                .first_intersecting_or_wrap(SourceOffset::new(3))
-                .unwrap()
-                .start(),
-            SourceOffset::ZERO
+    fn search_layer_rejects_queries_beyond_its_memory_bound() {
+        let document = Document::from_text(Path::new("search.txt"), "text".to_owned());
+        let mut cache = DocumentCache::default();
+        let reader = document.reader(&mut cache);
+        let query = "q".repeat(MAX_SEARCH_QUERY_BYTES + 1);
+
+        assert!(matches!(
+            SearchIndex::new(&reader, &query, SourceOffset::ZERO),
+            Err(TutError::Search(SearchError::QueryTooLong {
+                limit: MAX_SEARCH_QUERY_BYTES
+            }))
+        ));
+    }
+
+    #[test]
+    fn initial_selection_includes_matches_crossing_the_anchor() {
+        let (_, index) = complete_at(
+            "abcd--abcd",
+            SourceOffset::ZERO,
+            "abcd",
+            SourceOffset::new(3),
+        );
+        assert_eq!(index.initial_selection.unwrap().start(), SourceOffset::ZERO);
+
+        let (_, index) = complete_at(
+            "abcd--abcd",
+            SourceOffset::ZERO,
+            "abcd",
+            SourceOffset::new(4),
         );
         assert_eq!(
-            index
-                .first_intersecting_or_wrap(SourceOffset::new(4))
-                .unwrap()
-                .start(),
+            index.initial_selection.unwrap().start(),
             SourceOffset::new(6)
         );
-        let visible: Vec<_> = index
-            .intersecting(SourceOffset::new(3)..SourceOffset::new(7))
-            .collect();
+    }
+
+    #[test]
+    fn viewport_replay_includes_matches_crossing_its_start() {
+        let (document, index) = complete("abcd--abcd", "abcd");
+        let visible = matches(
+            &document,
+            &index,
+            "abcd",
+            SourceOffset::new(3)..SourceOffset::new(7),
+        );
         assert_eq!(visible.len(), 2);
     }
 
     #[test]
     fn matches_keep_absolute_offsets_above_u32() {
         let start = SourceOffset::new(u64::from(u32::MAX) + 23);
-        let index = build_at("cat cat", start, "cat").unwrap();
-        let first = index.first_intersecting_or_wrap(start).unwrap();
-        let second = index.next_after(first).unwrap();
+        let (document, index) = complete_at("cat cat", start, "cat", start);
+        let first = index.first_match.unwrap();
+        let second = navigate(&document, &index, "cat", first, true).unwrap();
 
         assert_eq!(first.start(), start);
         assert_eq!(first.end(), start.checked_add(3).unwrap());
         assert_eq!(second.start(), start.checked_add(4).unwrap());
-        assert_eq!(index.previous_before(first), Some(second));
+        assert_eq!(
+            navigate(&document, &index, "cat", first, false),
+            Some(second)
+        );
     }
 
     #[test]
     fn matches_cross_source_window_boundaries() {
         let mut text = "x".repeat(SOURCE_WINDOW_BYTES - 2);
         text.push_str("needle tail needle");
-        let index = build(&text, "needle").unwrap();
-        let first = index
-            .first_intersecting_or_wrap(SourceOffset::ZERO)
-            .unwrap();
-        let second = index.next_after(first).unwrap();
+        let (document, index) = complete(&text, "needle");
+        let found = matches(
+            &document,
+            &index,
+            "needle",
+            SourceOffset::ZERO..SourceOffset::from_usize(text.len()),
+        );
 
         assert_eq!(
-            first.start(),
+            found[0].start(),
             SourceOffset::from_usize(SOURCE_WINDOW_BYTES - 2)
         );
         assert_eq!(
-            second.start(),
-            first.end().checked_add(" tail ".len()).unwrap()
+            found[1].start(),
+            found[0].end().checked_add(" tail ".len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn maximum_length_queries_cross_source_windows() {
+        let needle = "q".repeat(MAX_SEARCH_QUERY_BYTES);
+        let mut text = "x".repeat(SOURCE_WINDOW_BYTES - 3);
+        text.push_str(&needle);
+        text.push('z');
+        let (document, index) = complete(&text, &needle);
+        let found = matches(
+            &document,
+            &index,
+            &needle,
+            SourceOffset::ZERO..SourceOffset::from_usize(text.len()),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].start(),
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES - 3)
+        );
+    }
+
+    #[test]
+    fn matches_at_and_overlapping_the_safe_boundary_are_found_once() {
+        let mut exact = "x".repeat(SOURCE_WINDOW_BYTES);
+        exact.push_str("needle");
+        let (document, index) = complete(&exact, "needle");
+        let found = matches(
+            &document,
+            &index,
+            "needle",
+            SourceOffset::ZERO..SourceOffset::from_usize(exact.len()),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].start(),
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES)
+        );
+
+        let mut crossing = "x".repeat(SOURCE_WINDOW_BYTES - 1);
+        crossing.push_str("aaaaa");
+        let (document, index) = complete(&crossing, "aaa");
+        let found = matches(
+            &document,
+            &index,
+            "aaa",
+            SourceOffset::ZERO..SourceOffset::from_usize(crossing.len()),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].start(),
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES - 1)
+        );
+    }
+
+    #[test]
+    fn partial_replay_never_reads_beyond_the_committed_frontier() {
+        let mut text = "cat".to_owned();
+        text.push_str(&"x".repeat(SOURCE_WINDOW_BYTES * 2));
+        text.push_str("cat");
+        let source_end = SourceOffset::from_usize(text.len());
+        let document = Document::from_text(Path::new("search.txt"), text);
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut index = SearchIndex::new(&reader, "cat", SourceOffset::ZERO)
+            .unwrap()
+            .unwrap();
+        index.advance(&mut reader, "cat").unwrap();
+
+        assert_eq!(
+            matches(&document, &index, "cat", SourceOffset::ZERO..source_end),
+            vec![SearchRange::new(SourceOffset::ZERO, SourceOffset::new(3)).unwrap()]
+        );
+    }
+
+    #[test]
+    fn each_advance_scans_one_bounded_source_window() {
+        let text = "x".repeat(SOURCE_WINDOW_BYTES * 2 + 17);
+        let document = Document::from_text(Path::new("search.txt"), text);
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut index = SearchIndex::new(&reader, "absent", SourceOffset::ZERO)
+            .unwrap()
+            .unwrap();
+
+        let first = index.advance(&mut reader, "absent").unwrap();
+        assert!(!first.completed());
+        assert_eq!(
+            index.scanned_to,
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES)
+        );
+        let second = index.advance(&mut reader, "absent").unwrap();
+        assert!(!second.completed());
+        assert_eq!(
+            index.scanned_to,
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2)
+        );
+        assert!(index.advance(&mut reader, "absent").unwrap().completed());
+    }
+
+    #[test]
+    fn checkpoint_memory_compacts_without_changing_navigation() {
+        let mut text = String::new();
+        for _ in 0..16 {
+            text.push_str(&"x".repeat(SOURCE_WINDOW_BYTES));
+            text.push_str("cat");
+        }
+        let document = Document::from_text(Path::new("search.txt"), text);
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let limits = SearchIndexLimits::new(1, 4).unwrap();
+        let mut index =
+            SearchIndex::with_limits(&reader, "cat", SourceOffset::ZERO, limits).unwrap();
+        while !index.is_complete() {
+            index.advance(&mut reader, "cat").unwrap();
+        }
+
+        assert!(index.checkpoints.len() <= 4);
+        assert!(index.checkpoint_interval_bytes > 1);
+        let found = matches(
+            &document,
+            &index,
+            "cat",
+            document.source_start()..document.source_end(),
+        );
+        assert_eq!(found.len(), 16);
+        let first = index.first_match.unwrap();
+        assert_eq!(
+            navigate(&document, &index, "cat", first, false).unwrap(),
+            index.last_match.unwrap()
         );
     }
 }
