@@ -8,15 +8,20 @@ fn tut() -> Command {
 
 #[test]
 fn help_and_version_bypass_terminal_checks() {
-    let help = tut().arg("--help").output().unwrap();
-    assert!(help.status.success());
-    assert_eq!(help.stdout, tut::HELP.as_bytes());
-    assert!(help.stderr.is_empty());
-
-    let version = tut().arg("--version").output().unwrap();
-    assert!(version.status.success());
-    assert_eq!(version.stdout, tut::VERSION_OUTPUT.as_bytes());
-    assert!(version.stderr.is_empty());
+    for (arguments, expected) in [
+        (vec!["--help"], tut::HELP),
+        (vec!["book.txt", "--unknown", "--help", "extra"], tut::HELP),
+        (vec!["--version"], tut::VERSION_OUTPUT),
+        (
+            vec!["--unknown", "book.txt", "--version", "extra"],
+            tut::VERSION_OUTPUT,
+        ),
+    ] {
+        let output = tut().args(arguments).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, expected.as_bytes());
+        assert!(output.stderr.is_empty());
+    }
 }
 
 #[test]
