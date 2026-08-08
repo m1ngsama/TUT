@@ -15,7 +15,7 @@ use crate::{
     source::{BackwardWindowRequest, SourceOffset, SourceText, WindowRequest},
 };
 
-pub const MAX_FILE_BYTES: usize = 33_554_432;
+pub const MAX_FILE_BYTES: u64 = 33_554_432;
 pub(super) const SOURCE_WINDOW_BYTES: usize = 64 * 1024;
 const UTF8_BOM_BYTES: usize = 3;
 const UTF8_BOUNDARY_SLOP_BYTES: usize = 3;
@@ -811,7 +811,7 @@ impl FileFingerprint {
 }
 
 impl FileStore {
-    fn open(path: PathBuf, limit: usize) -> Result<Self, LoadError> {
+    fn open(path: PathBuf, limit: u64) -> Result<Self, LoadError> {
         let descriptor = rustix::fs::open(
             &path,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -830,29 +830,26 @@ impl FileStore {
         if !metadata.is_file() {
             return Err(LoadError::NotRegular(path));
         }
-        if metadata.len() > limit as u64 {
+        if metadata.len() > limit {
             return Err(LoadError::TooLarge { path, limit });
         }
 
-        let source_len = usize::try_from(metadata.len()).map_err(|_| LoadError::TooLarge {
-            path: path.clone(),
-            limit,
-        })?;
+        let source_len = metadata.len();
         let mut store = Self {
             file,
             path,
             source_start: SourceOffset::ZERO,
-            source_end: SourceOffset::from_usize(source_len),
+            source_end: SourceOffset::new(source_len),
             fingerprint: FileFingerprint::from_metadata(&metadata),
         };
-        store.source_start = SourceOffset::from_usize(store.content_start(source_len)?);
+        store.source_start = SourceOffset::new(store.content_start(source_len)?);
         Ok(store)
     }
 
     #[cfg(test)]
-    fn build_line_index(&self, limit: usize) -> Result<LineIndex, LoadError> {
+    fn build_line_index(&self, limit: u64) -> Result<LineIndex, LoadError> {
         let source_len = self.bounded_len(limit)?;
-        if SourceOffset::from_usize(source_len) != self.source_end {
+        if SourceOffset::new(source_len) != self.source_end {
             return Err(self.changed());
         }
         self.require_unchanged()?;
@@ -940,9 +937,13 @@ impl FileStore {
             window_start -= 1;
         }
         if let Err(error) = std::str::from_utf8(&output[window_start..]) {
-            let offset = usize::try_from(read_start.get()).expect("bounded file offsets fit usize")
-                + window_start
-                + error.valid_up_to();
+            let relative = window_start
+                .checked_add(error.valid_up_to())
+                .ok_or_else(|| self.invalid_window("UTF-8 error coordinates overflow"))?;
+            let offset = read_start
+                .checked_add(relative)
+                .ok_or_else(|| self.invalid_window("UTF-8 error coordinates overflow"))?
+                .get();
             return Err(LoadError::InvalidUtf8 {
                 path: self.path.clone(),
                 offset,
@@ -986,31 +987,28 @@ impl FileStore {
     }
 
     #[cfg(test)]
-    fn bounded_len(&self, limit: usize) -> Result<usize, LoadError> {
+    fn bounded_len(&self, limit: u64) -> Result<u64, LoadError> {
         let metadata = self.file.metadata().map_err(|source| LoadError::Read {
             path: self.path.clone(),
             source,
         })?;
-        if metadata.len() > limit as u64 {
+        if metadata.len() > limit {
             return Err(LoadError::TooLarge {
                 path: self.path.clone(),
                 limit,
             });
         }
-        usize::try_from(metadata.len()).map_err(|_| LoadError::TooLarge {
-            path: self.path.clone(),
-            limit,
-        })
+        Ok(metadata.len())
     }
 
-    fn content_start(&self, source_len: usize) -> Result<usize, LoadError> {
-        if source_len < UTF8_BOM_BYTES {
+    fn content_start(&self, source_len: u64) -> Result<u64, LoadError> {
+        if source_len < UTF8_BOM_BYTES as u64 {
             return Ok(0);
         }
         let mut prefix = [0_u8; UTF8_BOM_BYTES];
         self.read_exact_at(&mut prefix, SourceOffset::ZERO)?;
         Ok(if prefix == [0xef, 0xbb, 0xbf] {
-            UTF8_BOM_BYTES
+            UTF8_BOM_BYTES as u64
         } else {
             0
         })
@@ -1025,8 +1023,15 @@ impl FileStore {
         if request.start() >= source_end {
             return Err(self.invalid_window("file window starts outside the source"));
         }
-        let remaining = usize::try_from(source_end.get() - request.start().get())
-            .map_err(|_| self.invalid_window("file window length exceeds address space"))?;
+        let remaining_bytes = source_end.get() - request.start().get();
+        let maximum_window = request
+            .target_bytes()
+            .saturating_add(UTF8_BOUNDARY_SLOP_BYTES);
+        let remaining = usize::try_from(
+            remaining_bytes
+                .min(u64::try_from(maximum_window).expect("window targets fit source coordinates")),
+        )
+        .expect("bounded file windows fit the process address space");
         let target_len = request.target_bytes().min(remaining);
         let read_len = target_len
             .saturating_add(UTF8_BOUNDARY_SLOP_BYTES)
@@ -1049,15 +1054,18 @@ impl FileStore {
             }
             Err(error)
                 if error.error_len().is_none()
-                    && read_len < remaining
+                    && u64::try_from(read_len).expect("file window lengths fit u64")
+                        < remaining_bytes
                     && error.valid_up_to() >= target_len =>
             {
                 error.valid_up_to()
             }
             Err(error) => {
-                let offset = usize::try_from(request.start().get())
-                    .expect("bounded file offsets fit usize")
-                    + error.valid_up_to();
+                let offset = request
+                    .start()
+                    .checked_add(error.valid_up_to())
+                    .ok_or_else(|| self.invalid_window("UTF-8 error coordinates overflow"))?
+                    .get();
                 return Err(LoadError::InvalidUtf8 {
                     path: self.path.clone(),
                     offset,
@@ -1216,7 +1224,8 @@ mod tests {
         assert!(!document.line_index_complete());
         assert!(matches!(
             document.advance_line_index(&mut cache),
-            Err(LoadError::InvalidUtf8 { offset, .. }) if offset == invalid_offset
+            Err(LoadError::InvalidUtf8 { offset, .. })
+                if offset == u64::try_from(invalid_offset).unwrap()
         ));
     }
 
@@ -1329,7 +1338,7 @@ mod tests {
         assert!(matches!(
             load_indexed(path),
             Err(LoadError::InvalidUtf8 { offset, .. })
-                if offset == SOURCE_WINDOW_BYTES - 1
+                if offset == u64::try_from(SOURCE_WINDOW_BYTES - 1).unwrap()
         ));
     }
 
@@ -1356,7 +1365,7 @@ mod tests {
         assert!(matches!(
             load_indexed(path),
             Err(LoadError::InvalidUtf8 { offset, .. })
-                if offset == SOURCE_WINDOW_BYTES - 1
+                if offset == u64::try_from(SOURCE_WINDOW_BYTES - 1).unwrap()
         ));
     }
 

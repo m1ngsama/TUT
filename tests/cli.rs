@@ -385,7 +385,7 @@ mod pty {
         let oversize = directory.path().join("oversize.txt");
         File::create(&oversize)
             .unwrap()
-            .set_len((tut::MAX_FILE_BYTES + 1) as u64)
+            .set_len(tut::MAX_FILE_BYTES + 1)
             .unwrap();
         let missing = directory.path().join("missing.txt");
 
@@ -407,7 +407,7 @@ mod pty {
     fn deferred_validation_errors_restore_the_terminal() {
         let file = NamedTempFile::new().unwrap();
         let invalid_offset = tut::MAX_FILE_BYTES.min(2 * 64 * 1024) + 10;
-        let mut bytes = vec![b'a'; invalid_offset];
+        let mut bytes = vec![b'a'; usize::try_from(invalid_offset).unwrap()];
         bytes.push(0xff);
         std::fs::write(file.path(), bytes).unwrap();
 

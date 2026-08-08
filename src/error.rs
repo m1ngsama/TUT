@@ -17,8 +17,8 @@ pub enum InvocationError {
 pub enum LoadError {
     Open { path: PathBuf, source: io::Error },
     NotRegular(PathBuf),
-    TooLarge { path: PathBuf, limit: usize },
-    InvalidUtf8 { path: PathBuf, offset: usize },
+    TooLarge { path: PathBuf, limit: u64 },
+    InvalidUtf8 { path: PathBuf, offset: u64 },
     Allocation(&'static str),
     Read { path: PathBuf, source: io::Error },
 }

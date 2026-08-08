@@ -18,6 +18,7 @@ impl SourceOffset {
         self.0
     }
 
+    #[cfg(test)]
     pub(super) fn from_usize(value: usize) -> Self {
         Self::new(u64::try_from(value).expect("usize fits in source coordinates"))
     }
