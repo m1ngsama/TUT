@@ -26,6 +26,11 @@ impl SourceOffset {
         let bytes = u64::try_from(bytes).ok()?;
         self.0.checked_add(bytes).map(Self::new)
     }
+
+    pub(super) fn checked_sub(self, bytes: usize) -> Option<Self> {
+        let bytes = u64::try_from(bytes).ok()?;
+        self.0.checked_sub(bytes).map(Self::new)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +49,26 @@ impl WindowRequest {
 
     pub(super) const fn start(self) -> SourceOffset {
         self.start
+    }
+
+    pub(super) const fn target_bytes(self) -> usize {
+        self.target_bytes.get()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BackwardWindowRequest {
+    end: SourceOffset,
+    target_bytes: NonZeroUsize,
+}
+
+impl BackwardWindowRequest {
+    pub(super) const fn new(end: SourceOffset, target_bytes: NonZeroUsize) -> Self {
+        Self { end, target_bytes }
+    }
+
+    pub(super) const fn end(self) -> SourceOffset {
+        self.end
     }
 
     pub(super) const fn target_bytes(self) -> usize {
@@ -116,6 +141,21 @@ impl<'a> SourceText<'a> {
         }
         Self::with_start(self.text.get(start..end)?, request.start())
     }
+
+    #[cfg(test)]
+    pub(super) fn window_ending_at(self, request: BackwardWindowRequest) -> Option<Self> {
+        let end = self.relative_offset(request.end())?;
+        if end == 0 || !self.text.is_char_boundary(end) {
+            return None;
+        }
+
+        let mut start = end.saturating_sub(request.target_bytes());
+        while start > 0 && !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let source_start = self.start.checked_add(start)?;
+        Self::with_start(self.text.get(start..end)?, source_start)
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +203,36 @@ mod tests {
         assert!(
             source
                 .window(WindowRequest::new(start.checked_add(2).unwrap(), one))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn backward_windows_extend_to_utf8_boundaries() {
+        let start = SourceOffset::new(u64::from(u32::MAX) + 9);
+        let source = SourceText::with_start("a🙂éz", start).unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let end = start.checked_add("a🙂é".len()).unwrap();
+
+        let third = source
+            .window_ending_at(BackwardWindowRequest::new(end, one))
+            .unwrap();
+        let second = source
+            .window_ending_at(BackwardWindowRequest::new(third.start(), one))
+            .unwrap();
+        let first = source
+            .window_ending_at(BackwardWindowRequest::new(second.start(), one))
+            .unwrap();
+
+        assert_eq!(third.as_str(), "é");
+        assert_eq!(second.as_str(), "🙂");
+        assert_eq!(first.as_str(), "a");
+        assert!(
+            source
+                .window_ending_at(BackwardWindowRequest::new(
+                    start.checked_add(2).unwrap(),
+                    one
+                ))
                 .is_none()
         );
     }

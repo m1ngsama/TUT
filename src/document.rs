@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     error::{LoadError, sanitize_os},
     line_index::{LineIndex, LineIndexError, LinePosition, LineScan},
-    source::{SourceOffset, SourceText, WindowRequest},
+    source::{BackwardWindowRequest, SourceOffset, SourceText, WindowRequest},
 };
 
 pub const MAX_FILE_BYTES: usize = 33_554_432;
@@ -157,6 +157,17 @@ impl<'document> DocumentReader<'document> {
         )
     }
 
+    pub(super) fn window_ending_at(
+        &mut self,
+        end: SourceOffset,
+        target_bytes: NonZeroUsize,
+    ) -> Result<SourceText<'_>, LoadError> {
+        self.document.store.copy_window_ending_at(
+            BackwardWindowRequest::new(end, target_bytes),
+            &mut self.cache.chunk,
+        )
+    }
+
     pub(super) fn source_start(&self) -> SourceOffset {
         self.document.source_start()
     }
@@ -190,31 +201,8 @@ impl<'document> DocumentReader<'document> {
         if offset == self.source_start() {
             return Ok(None);
         }
-
-        let available = usize::try_from(offset.get() - self.source_start().get())
-            .unwrap_or(usize::MAX)
-            .min(4);
-        let start = SourceOffset::new(offset.get() - available as u64);
-        self.document
-            .store
-            .copy_bytes(start, available, &mut self.cache.chunk)?;
-        let Some(relative) = self
-            .cache
-            .chunk
-            .iter()
-            .rposition(|byte| byte & 0b1100_0000 != 0b1000_0000)
-        else {
-            return Err(self.protocol_error("invalid UTF-8 before character offset"));
-        };
-        let scalar = std::str::from_utf8(&self.cache.chunk[relative..])
-            .map_err(|_| self.protocol_error("invalid UTF-8 before character offset"))?;
-        if scalar.chars().count() != 1 {
-            return Err(self.protocol_error("invalid character boundary"));
-        }
-        start
-            .checked_add(relative)
-            .map(Some)
-            .ok_or_else(|| self.protocol_error("character coordinates overflow"))
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        Ok(Some(self.window_ending_at(offset, one)?.start()))
     }
 
     fn scan_lines(&mut self, offset: SourceOffset) -> Result<(LineScan, ScannedLines), LoadError> {
@@ -527,6 +515,18 @@ impl DocumentStore {
         }
     }
 
+    fn copy_window_ending_at<'a>(
+        &self,
+        request: BackwardWindowRequest,
+        output: &'a mut Vec<u8>,
+    ) -> Result<SourceText<'a>, LoadError> {
+        match self {
+            Self::File(store) => store.copy_window_ending_at(request, output),
+            #[cfg(test)]
+            Self::InMemory(store) => store.copy_window_ending_at(request, output),
+        }
+    }
+
     fn copy_bytes(
         &self,
         start: SourceOffset,
@@ -586,6 +586,18 @@ impl InMemoryStore {
             .source()
             .window(request)
             .expect("document readers request valid forward windows");
+        copy_source(source, output)
+    }
+
+    fn copy_window_ending_at<'a>(
+        &self,
+        request: BackwardWindowRequest,
+        output: &'a mut Vec<u8>,
+    ) -> Result<SourceText<'a>, LoadError> {
+        let source = self
+            .source()
+            .window_ending_at(request)
+            .expect("document readers request valid backward windows");
         copy_source(source, output)
     }
 
@@ -797,6 +809,62 @@ impl FileStore {
             return Err(self.invalid_window("file window starts before document content"));
         }
         let window = self.window(request, self.source_end, output)?;
+        self.require_unchanged()?;
+        Ok(window)
+    }
+
+    fn copy_window_ending_at<'a>(
+        &self,
+        request: BackwardWindowRequest,
+        output: &'a mut Vec<u8>,
+    ) -> Result<SourceText<'a>, LoadError> {
+        self.require_unchanged()?;
+        if request.end() <= self.source_start || request.end() > self.source_end {
+            return Err(self.invalid_window("backward file window ends outside the source"));
+        }
+
+        let available =
+            usize::try_from(request.end().get() - self.source_start.get()).unwrap_or(usize::MAX);
+        let target_len = request.target_bytes().min(available);
+        let read_len = target_len
+            .saturating_add(UTF8_BOUNDARY_SLOP_BYTES)
+            .min(available);
+        let read_start = request
+            .end()
+            .checked_sub(read_len)
+            .ok_or_else(|| self.invalid_window("backward file window coordinates overflow"))?;
+
+        output.clear();
+        output
+            .try_reserve_exact(read_len)
+            .map_err(|_| LoadError::Allocation("backward file window"))?;
+        output.resize(read_len, 0);
+        self.read_exact_at(output, read_start)?;
+
+        let mut window_start = read_len - target_len;
+        while window_start > 0 && output[window_start] & 0b1100_0000 == 0b1000_0000 {
+            window_start -= 1;
+        }
+        if let Err(error) = std::str::from_utf8(&output[window_start..]) {
+            let offset = usize::try_from(read_start.get()).expect("bounded file offsets fit usize")
+                + window_start
+                + error.valid_up_to();
+            return Err(LoadError::InvalidUtf8 {
+                path: self.path.clone(),
+                offset,
+            });
+        }
+
+        let window_len = read_len - window_start;
+        output.copy_within(window_start.., 0);
+        output.truncate(window_len);
+        let text = std::str::from_utf8(output).expect("backward file windows retain valid UTF-8");
+        let source_start = request
+            .end()
+            .checked_sub(window_len)
+            .ok_or_else(|| self.invalid_window("backward file window coordinates overflow"))?;
+        let window = SourceText::with_start(text, source_start)
+            .ok_or_else(|| self.invalid_window("backward file window coordinates overflow"))?;
         self.require_unchanged()?;
         Ok(window)
     }
@@ -1085,6 +1153,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second.as_str(), "a");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn backward_file_windows_extend_to_utf8_boundaries_with_exact_storage() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("backward-unicode.txt");
+        fs::write(&path, "\u{feff}a🙂éz").unwrap();
+        let store = FileStore::open(path, 16).unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let mut cache = Vec::new();
+        let end = store.source_start.checked_add("a🙂é".len()).unwrap();
+
+        let third = store
+            .copy_window_ending_at(BackwardWindowRequest::new(end, one), &mut cache)
+            .unwrap();
+        assert_eq!(third.as_str(), "é");
+        assert_eq!(third.end(), end);
+        let second_end = third.start();
+        assert_eq!(cache.len(), "é".len());
+
+        let second = store
+            .copy_window_ending_at(BackwardWindowRequest::new(second_end, one), &mut cache)
+            .unwrap();
+        assert_eq!(second.as_str(), "🙂");
+        assert_eq!(second.end(), second_end);
+        let first_end = second.start();
+        assert_eq!(cache.len(), "🙂".len());
+
+        let first = store
+            .copy_window_ending_at(BackwardWindowRequest::new(first_end, one), &mut cache)
+            .unwrap();
+        assert_eq!(first.as_str(), "a");
+        assert_eq!(first.start(), store.source_start);
         assert_eq!(cache.len(), 1);
     }
 
