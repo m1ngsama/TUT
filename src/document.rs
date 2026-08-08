@@ -876,22 +876,20 @@ impl FileStore {
         cache.resize(read_len, 0);
         self.read_exact_at(cache, request.start())?;
 
-        let (text, window_len) = match std::str::from_utf8(cache) {
+        let window_len = match std::str::from_utf8(cache) {
             Ok(text) => {
                 let mut window_len = target_len;
                 while window_len < text.len() && !text.is_char_boundary(window_len) {
                     window_len += 1;
                 }
-                (text, window_len)
+                window_len
             }
             Err(error)
                 if error.error_len().is_none()
                     && read_len < remaining
                     && error.valid_up_to() >= target_len =>
             {
-                let valid = std::str::from_utf8(&cache[..error.valid_up_to()])
-                    .expect("UTF-8 errors identify a valid prefix");
-                (valid, valid.len())
+                error.valid_up_to()
             }
             Err(error) => {
                 let offset = usize::try_from(request.start().get())
@@ -904,7 +902,9 @@ impl FileStore {
             }
         };
 
-        SourceText::with_start(&text[..window_len], request.start())
+        cache.truncate(window_len);
+        let text = std::str::from_utf8(cache).expect("file windows retain validated UTF-8");
+        SourceText::with_start(text, request.start())
             .ok_or_else(|| self.invalid_window("file window coordinates overflow"))
     }
 
@@ -1060,9 +1060,9 @@ mod tests {
     fn file_windows_extend_to_utf8_boundaries_with_bounded_slop() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("unicode.txt");
-        fs::write(&path, "🙂z").unwrap();
+        fs::write(&path, "🙂abc").unwrap();
         let store = FileStore::open(path, 16).unwrap();
-        let end = SourceOffset::new(5);
+        let end = SourceOffset::new(7);
         let target = NonZeroUsize::new(1).unwrap();
         let mut cache = Vec::new();
 
@@ -1084,7 +1084,7 @@ mod tests {
                 &mut cache,
             )
             .unwrap();
-        assert_eq!(second.as_str(), "z");
+        assert_eq!(second.as_str(), "a");
         assert_eq!(cache.len(), 1);
     }
 
@@ -1212,34 +1212,40 @@ mod tests {
     #[test]
     fn incremental_graphemes_match_contiguous_segmentation_at_every_small_window_size() {
         let text = "\u{feff}a\r\ne\u{301}🇷🇸🇮🇴👩\u{200d}🔬क्\u{200d}ष\u{200b}z";
-        let document = Document::from_text(Path::new("unicode.txt"), text.to_owned());
-        let source = document.source();
-        let expected: Vec<_> = source
-            .as_str()
+        let memory = Document::from_text(Path::new("memory.txt"), text.to_owned());
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, text).unwrap();
+        let file = load(path).unwrap();
+        let expected: Vec<_> = text[UTF8_BOM_BYTES..]
             .grapheme_indices(true)
             .map(|(relative, grapheme)| {
                 (
-                    source.start().checked_add(relative).unwrap(),
+                    SourceOffset::new(UTF8_BOM_BYTES as u64)
+                        .checked_add(relative)
+                        .unwrap(),
                     grapheme.to_owned(),
                 )
             })
             .collect();
 
-        for window_bytes in 1..=8 {
-            let mut cache = DocumentCache::with_window_bytes(window_bytes);
-            let mut reader = document.reader(&mut cache);
-            let mut graphemes = reader.graphemes(source.start()).unwrap();
-            let mut actual = Vec::new();
-            while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
-                actual.push((
-                    grapheme.start(),
-                    grapheme
-                        .text()
-                        .expect("test graphemes fit the limit")
-                        .to_owned(),
-                ));
+        for (backend, document) in [("memory", &memory), ("file", &file)] {
+            for window_bytes in 1..=8 {
+                let mut cache = DocumentCache::with_window_bytes(window_bytes);
+                let mut reader = document.reader(&mut cache);
+                let mut graphemes = reader.graphemes(reader.source_start()).unwrap();
+                let mut actual = Vec::new();
+                while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+                    actual.push((
+                        grapheme.start(),
+                        grapheme
+                            .text()
+                            .expect("test graphemes fit the limit")
+                            .to_owned(),
+                    ));
+                }
+                assert_eq!(actual, expected, "{backend} window size {window_bytes}");
             }
-            assert_eq!(actual, expected, "window size {window_bytes}");
         }
     }
 
