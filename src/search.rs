@@ -250,8 +250,12 @@ impl SearchSession {
         {
             return Ok(());
         }
+        let storage = self.highlights.take().map_or_else(
+            SearchHighlightStorage::default,
+            SearchHighlights::into_storage,
+        );
         self.highlights = if self.index.is_complete() && self.index.has_matches() {
-            self.index.display_highlights(visible, targets)?
+            self.index.display_highlights(visible, targets, storage)?
         } else {
             None
         };
@@ -576,33 +580,39 @@ impl SearchIndex {
 
     #[cfg(test)]
     fn highlights(&self, visible: Range<SourceOffset>) -> Option<SearchHighlights> {
-        self.make_highlights(visible, Vec::new(), HighlightMode::Exact)
+        self.make_highlights(
+            visible,
+            SearchHighlightStorage::default(),
+            HighlightMode::Exact,
+        )
     }
 
     fn display_highlights(
         &self,
         visible: Range<SourceOffset>,
         targets: impl IntoIterator<Item = SearchRange>,
+        mut storage: SearchHighlightStorage,
     ) -> Result<Option<SearchHighlights>, TutError> {
         if !self.highlightable(&visible) {
             return Ok(None);
         }
-        let mut ranges = Vec::new();
+        storage.ranges.clear();
         for target in targets {
             debug_assert!(target.start() < visible.end && target.end() > visible.start);
             debug_assert!(
-                ranges
+                storage
+                    .ranges
                     .last()
                     .is_none_or(|last: &SearchRange| { last.end() <= target.start() })
             );
-            if !reserve_display_target(&mut ranges)? {
+            if !reserve_display_target(&mut storage)? {
                 return Ok(None);
             }
-            ranges.push(target);
+            storage.ranges.push(target);
         }
         Ok(self.make_highlights(
             visible,
-            ranges,
+            storage,
             HighlightMode::Display { read: 0, write: 0 },
         ))
     }
@@ -617,7 +627,7 @@ impl SearchIndex {
     fn make_highlights(
         &self,
         visible: Range<SourceOffset>,
-        ranges: Vec<SearchRange>,
+        storage: SearchHighlightStorage,
         mode: HighlightMode,
     ) -> Option<SearchHighlights> {
         if !self.highlightable(&visible) {
@@ -636,7 +646,7 @@ impl SearchIndex {
             needed_from: earliest,
             previous: checkpoint.previous_match,
             source_end: self.source_end,
-            ranges,
+            storage,
             mode,
             complete: false,
         };
@@ -1009,9 +1019,16 @@ struct SearchHighlights {
     needed_from: SourceOffset,
     previous: Option<SearchRange>,
     source_end: SourceOffset,
-    ranges: Vec<SearchRange>,
+    storage: SearchHighlightStorage,
     mode: HighlightMode,
     complete: bool,
+}
+
+#[derive(Debug, Default)]
+struct SearchHighlightStorage {
+    ranges: Vec<SearchRange>,
+    #[cfg(test)]
+    reserve_attempts: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1025,6 +1042,10 @@ enum HighlightMode {
 }
 
 impl SearchHighlights {
+    fn into_storage(self) -> SearchHighlightStorage {
+        self.storage
+    }
+
     const fn is_complete(&self) -> bool {
         self.complete
     }
@@ -1034,7 +1055,11 @@ impl SearchHighlights {
     }
 
     fn ranges(&self) -> &[SearchRange] {
-        if self.complete { &self.ranges } else { &[] }
+        if self.complete {
+            &self.storage.ranges
+        } else {
+            &[]
+        }
     }
 
     fn advance(
@@ -1105,19 +1130,19 @@ impl SearchHighlights {
 
     #[cfg(test)]
     fn push_exact(&mut self, range: SearchRange) -> Result<(), TutError> {
-        if let Some(last) = self.ranges.last_mut()
+        if let Some(last) = self.storage.ranges.last_mut()
             && last.end() == range.start()
         {
             last.end = range.end();
             return Ok(());
         }
-        reserve_highlight_range(&mut self.ranges)?;
-        self.ranges.push(range);
+        reserve_highlight_range(&mut self.storage)?;
+        self.storage.ranges.push(range);
         Ok(())
     }
 
     fn push_display(&mut self, range: SearchRange, mut read: usize, mut write: usize) {
-        while let Some(target) = self.ranges.get(read).copied() {
+        while let Some(target) = self.storage.ranges.get(read).copied() {
             if target.end() <= range.start() {
                 read += 1;
                 continue;
@@ -1126,10 +1151,10 @@ impl SearchHighlights {
                 break;
             }
             read += 1;
-            if write > 0 && self.ranges[write - 1].end() == target.start() {
-                self.ranges[write - 1].end = target.end();
+            if write > 0 && self.storage.ranges[write - 1].end() == target.start() {
+                self.storage.ranges[write - 1].end = target.end();
             } else {
-                self.ranges[write] = target;
+                self.storage.ranges[write] = target;
                 write += 1;
             }
         }
@@ -1140,26 +1165,31 @@ impl SearchHighlights {
         match self.mode {
             #[cfg(test)]
             HighlightMode::Exact => {}
-            HighlightMode::Display { write, .. } => self.ranges.truncate(write),
+            HighlightMode::Display { write, .. } => self.storage.ranges.truncate(write),
         }
         self.complete = true;
     }
 }
 
 #[cfg(test)]
-fn reserve_highlight_range(ranges: &mut Vec<SearchRange>) -> Result<(), TutError> {
-    if reserve_display_target(ranges)? {
+fn reserve_highlight_range(storage: &mut SearchHighlightStorage) -> Result<(), TutError> {
+    if reserve_display_target(storage)? {
         return Ok(());
     }
     Err(SearchError::Allocation.into())
 }
 
-fn reserve_display_target(ranges: &mut Vec<SearchRange>) -> Result<bool, TutError> {
+fn reserve_display_target(storage: &mut SearchHighlightStorage) -> Result<bool, TutError> {
+    let ranges = &mut storage.ranges;
     let max_ranges = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>();
     if ranges.len() >= max_ranges {
         return Ok(false);
     }
     if ranges.len() == ranges.capacity() {
+        #[cfg(test)]
+        {
+            storage.reserve_attempts = storage.reserve_attempts.saturating_add(1);
+        }
         let remaining = max_ranges - ranges.len();
         let additional = ranges.capacity().max(256).min(remaining);
         ranges
@@ -1669,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_highlights_reuse_one_window_across_contiguous_viewports() {
+    fn cached_highlights_reuse_one_window_and_target_storage_across_contiguous_viewports() {
         const ROW_BYTES: usize = 160;
         const VIEWPORTS: usize = SOURCE_WINDOW_BYTES / ROW_BYTES;
 
@@ -1693,6 +1723,8 @@ mod tests {
         settle_session(&document, &mut cache, &mut session);
         cache.reset_metrics();
 
+        let mut target_allocation = None;
+        let mut target_capacity = None;
         for row in 0..VIEWPORTS {
             let start = SourceOffset::from_usize(row * ROW_BYTES);
             let end = start.checked_add(ROW_BYTES).unwrap();
@@ -1701,6 +1733,23 @@ mod tests {
             session
                 .prepare_highlights(visible.clone(), [target])
                 .unwrap();
+            let pending = session.highlights.as_ref().unwrap();
+            assert!(!pending.is_complete());
+            let allocation = pending.storage.ranges.as_ptr();
+            let capacity = pending.storage.ranges.capacity();
+            assert_eq!(pending.storage.reserve_attempts, 1);
+            assert_eq!(*target_allocation.get_or_insert(allocation), allocation);
+            assert_eq!(*target_capacity.get_or_insert(capacity), capacity);
+
+            session
+                .prepare_highlights(visible.clone(), std::iter::once_with(|| unreachable!()))
+                .unwrap();
+            let unchanged = session.highlights.as_ref().unwrap();
+            assert_eq!(unchanged.storage.ranges.as_ptr(), allocation);
+            assert_eq!(unchanged.storage.ranges.capacity(), capacity);
+            assert_eq!(unchanged.storage.reserve_attempts, 1);
+            assert!(!unchanged.is_complete());
+
             settle_session(&document, &mut cache, &mut session);
             let expected = if row % 7 == 0 { &[target][..] } else { &[] };
             assert_eq!(session.highlight_ranges(&visible), expected);
@@ -1889,7 +1938,11 @@ mod tests {
         let target = SearchRange::new(SourceOffset::ZERO, source_end).unwrap();
         let (document, index) = complete(&text, "a");
         let mut highlights = index
-            .display_highlights(SourceOffset::ZERO..source_end, [target])
+            .display_highlights(
+                SourceOffset::ZERO..source_end,
+                [target],
+                SearchHighlightStorage::default(),
+            )
             .unwrap()
             .unwrap();
         let mut cache = DocumentCache::default();
@@ -1909,6 +1962,16 @@ mod tests {
         let text = "x".repeat(target_count);
         let source_end = SourceOffset::from_usize(text.len());
         let (_, index) = complete(&text, "z");
+        let seed = SearchRange::new(SourceOffset::ZERO, SourceOffset::new(1)).unwrap();
+        let storage = index
+            .display_highlights(
+                SourceOffset::ZERO..source_end,
+                [seed],
+                SearchHighlightStorage::default(),
+            )
+            .unwrap()
+            .unwrap()
+            .into_storage();
         let targets = (0..target_count).map(|start| {
             SearchRange::new(
                 SourceOffset::from_usize(start),
@@ -1919,7 +1982,7 @@ mod tests {
 
         assert!(
             index
-                .display_highlights(SourceOffset::ZERO..source_end, targets)
+                .display_highlights(SourceOffset::ZERO..source_end, targets, storage,)
                 .unwrap()
                 .is_none()
         );
