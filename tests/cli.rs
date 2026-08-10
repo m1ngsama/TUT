@@ -138,6 +138,7 @@ fn diagnostics_escape_control_bytes_in_arguments() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod pty {
     use std::{
+        ffi::CString,
         fs::File,
         io::{self, Read, Write},
         os::unix::process::{CommandExt, ExitStatusExt},
@@ -182,6 +183,7 @@ mod pty {
         output: Vec<u8>,
         stderr_output: Vec<u8>,
         reaped: bool,
+        command_master: Option<File>,
         _input: Option<ChildStdin>,
     }
 
@@ -210,6 +212,49 @@ mod pty {
             Self::spawn_inner(TestInput::OpenStandardInput, None, None)
         }
 
+        fn spawn_open_standard_input_without_controlling_terminal() -> io::Result<Self> {
+            Self::spawn_inner_with_controlling_terminal(
+                TestInput::OpenStandardInput,
+                None,
+                None,
+                false,
+            )
+        }
+
+        fn spawn_standard_input_with_separate_stdout(bytes: &[u8]) -> io::Result<Self> {
+            let (command_master, _command_slave, controlling_name, initial) = open_test_pty()?;
+            let probe = command_master.try_clone()?;
+            let (master, stdout, _stdout_name, _stdout_initial) = open_test_pty()?;
+
+            let mut command = tut();
+            command
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::piped());
+            // The child setup uses only async-signal-safe descriptor and session operations.
+            unsafe {
+                command.pre_exec(move || {
+                    setsid().map_err(io::Error::from)?;
+                    let controlling =
+                        fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
+                            .map_err(io::Error::from)?;
+                    ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
+                    termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
+                    drop(controlling);
+                    Ok(())
+                });
+            }
+            Self::finish_spawn(
+                command.spawn()?,
+                TestInput::StandardInput(bytes),
+                master,
+                probe,
+                initial,
+                Some(command_master),
+            )
+        }
+
         fn spawn_unreadable_standard_input() -> io::Result<Self> {
             Self::spawn_inner(TestInput::UnreadableStandardInput, None, None)
         }
@@ -219,33 +264,18 @@ mod pty {
             cli_log: Option<&Path>,
             environment_log: Option<&Path>,
         ) -> io::Result<Self> {
-            let master_fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
-            grantpt(&master_fd)?;
-            unlockpt(&master_fd)?;
-            let slave_name = ptsname(&master_fd, Vec::new())?;
-            let slave_fd = fs::open(
-                slave_name.as_c_str(),
-                OFlags::RDWR | OFlags::NOCTTY,
-                Mode::empty(),
-            )?;
-            termios::tcsetwinsize(
-                &slave_fd,
-                Winsize {
-                    ws_row: 24,
-                    ws_col: 80,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                },
-            )?;
-            let initial = termios::tcgetattr(&slave_fd)?;
-            let terminal_input = File::from(slave_fd);
-            let stdout = terminal_input.try_clone()?;
+            Self::spawn_inner_with_controlling_terminal(input, cli_log, environment_log, true)
+        }
 
-            let flags = fs::fcntl_getfl(&master_fd)?;
-            fs::fcntl_setfl(&master_fd, flags | OFlags::NONBLOCK)?;
-            let master = File::from(master_fd);
+        fn spawn_inner_with_controlling_terminal(
+            input: TestInput<'_>,
+            cli_log: Option<&Path>,
+            environment_log: Option<&Path>,
+            acquire_controlling_terminal: bool,
+        ) -> io::Result<Self> {
+            let (master, terminal_input, controlling_name, initial) = open_test_pty()?;
+            let stdout = terminal_input.try_clone()?;
             let probe = master.try_clone()?;
-            let controlling_name = slave_name;
 
             let mut command = tut();
             if let Some(path) = environment_log {
@@ -271,16 +301,28 @@ mod pty {
             unsafe {
                 command.pre_exec(move || {
                     setsid().map_err(io::Error::from)?;
-                    let controlling =
-                        fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
-                            .map_err(io::Error::from)?;
-                    ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
-                    termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
-                    drop(controlling);
+                    if acquire_controlling_terminal {
+                        let controlling =
+                            fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
+                                .map_err(io::Error::from)?;
+                        ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
+                        termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
+                        drop(controlling);
+                    }
                     Ok(())
                 });
             }
-            let mut child = command.spawn()?;
+            Self::finish_spawn(command.spawn()?, input, master, probe, initial, None)
+        }
+
+        fn finish_spawn(
+            mut child: Child,
+            input: TestInput<'_>,
+            master: File,
+            probe: File,
+            initial: Termios,
+            command_master: Option<File>,
+        ) -> io::Result<Self> {
             let mut input_pipe = child.stdin.take();
             let retained_input = match input {
                 TestInput::StandardInput(bytes) => {
@@ -303,8 +345,16 @@ mod pty {
                 output: Vec::new(),
                 stderr_output: Vec::new(),
                 reaped: false,
+                command_master,
                 _input: retained_input,
             })
+        }
+
+        fn write_command(&mut self, bytes: &[u8]) -> io::Result<()> {
+            match &mut self.command_master {
+                Some(master) => master.write_all(bytes),
+                None => self.master.write_all(bytes),
+            }
         }
 
         fn pump(&mut self) -> io::Result<()> {
@@ -349,9 +399,10 @@ mod pty {
                 if self.child.try_wait()?.is_some() {
                     self.reaped = true;
                     self.read_stderr()?;
-                    return Err(io::Error::other(
-                        "child exited before expected terminal output",
-                    ));
+                    return Err(io::Error::other(format!(
+                        "child exited before expected terminal output: {}",
+                        String::from_utf8_lossy(&self.stderr_output)
+                    )));
                 }
                 if Instant::now() >= deadline {
                     self.terminate_and_reap();
@@ -436,7 +487,14 @@ mod pty {
             assert_eq!(after.input_modes, self.initial.input_modes);
             assert_eq!(after.output_modes, self.initial.output_modes);
             assert_eq!(after.control_modes, self.initial.control_modes);
-            assert_eq!(after.local_modes, self.initial.local_modes);
+            let mut after_local_modes = after.local_modes;
+            let mut initial_local_modes = self.initial.local_modes;
+            // PENDIN and FLUSHO report transient line-discipline state rather than saved
+            // terminal configuration, so the kernel may change them while settings restore.
+            let state_modes = termios::LocalModes::PENDIN | termios::LocalModes::FLUSHO;
+            after_local_modes.remove(state_modes);
+            initial_local_modes.remove(state_modes);
+            assert_eq!(after_local_modes, initial_local_modes);
             assert_eq!(after.input_speed(), self.initial.input_speed());
             assert_eq!(after.output_speed(), self.initial.output_speed());
             for index in [
@@ -481,6 +539,36 @@ mod pty {
         fn drop(&mut self) {
             self.terminate_and_reap();
         }
+    }
+
+    fn open_test_pty() -> io::Result<(File, File, CString, Termios)> {
+        let master_fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+        grantpt(&master_fd)?;
+        unlockpt(&master_fd)?;
+        let slave_name = ptsname(&master_fd, Vec::new())?;
+        let slave_fd = fs::open(
+            slave_name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )?;
+        termios::tcsetwinsize(
+            &slave_fd,
+            Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )?;
+        let initial = termios::tcgetattr(&slave_fd)?;
+        let flags = fs::fcntl_getfl(&master_fd)?;
+        fs::fcntl_setfl(&master_fd, flags | OFlags::NONBLOCK)?;
+        Ok((
+            File::from(master_fd),
+            File::from(slave_fd),
+            slave_name,
+            initial,
+        ))
     }
 
     #[test]
@@ -631,6 +719,56 @@ mod pty {
             "session_start input=stdin source_bytes={source_bytes}\n"
         )));
         assert!(log.ends_with(" terminal_sessions=1 suspensions=0\n"));
+    }
+
+    #[test]
+    fn piped_standard_input_uses_the_controlling_pty_not_the_stdout_pty() {
+        let mut text = String::new();
+        for line in 0..60 {
+            match line {
+                0 => text.push_str("CONTROL_PTY_START_SENTINEL\n"),
+                59 => text.push_str("CONTROL_PTY_END_SENTINEL\n"),
+                _ => text.push_str("ordinary piped line\n"),
+            }
+        }
+
+        let mut pty = PtyChild::spawn_standard_input_with_separate_stdout(text.as_bytes()).unwrap();
+        pty.wait_for(b"CONTROL_PTY_START_SENTINEL").unwrap();
+
+        pty.master.write_all(b"q").unwrap();
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            pty.child.try_wait().unwrap().is_none(),
+            "input written to the stdout PTY must not quit the child"
+        );
+
+        pty.write_command(b"G").unwrap();
+        pty.wait_for(b"CONTROL_PTY_END_SENTINEL").unwrap();
+        pty.write_command(b"q").unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn missing_controlling_terminal_fails_before_reading_standard_input() {
+        let mut pty = PtyChild::spawn_open_standard_input_without_controlling_terminal().unwrap();
+        let status = pty.wait().unwrap();
+
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(
+            pty.stderr_output,
+            b"tut: interactive reading requires terminal input and output\n"
+        );
+        for sequence in [ENTER_ALT, HIDE_CURSOR] {
+            assert!(
+                !pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
     }
 
     #[test]
