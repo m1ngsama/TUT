@@ -14,6 +14,42 @@ const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = SOURCE_WINDOW_BYTES as u64;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
 const MATCH_BLOCK_START_LIMIT: usize = SOURCE_WINDOW_BYTES + MAX_SEARCH_QUERY_BYTES;
+const DISPLAY_HIGHLIGHT_MERGE_BUDGET: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SearchHighlightKey {
+    columns: u16,
+    rows: u16,
+    anchor: SourceOffset,
+    visible_end: SourceOffset,
+    target_count: usize,
+}
+
+impl SearchHighlightKey {
+    pub(super) const fn new(
+        columns: u16,
+        rows: u16,
+        anchor: SourceOffset,
+        visible_end: SourceOffset,
+        target_count: usize,
+    ) -> Self {
+        Self {
+            columns,
+            rows,
+            anchor,
+            visible_end,
+            target_count,
+        }
+    }
+
+    const fn visible(self) -> Range<SourceOffset> {
+        self.anchor..self.visible_end
+    }
+
+    const fn target_count(self) -> usize {
+        self.target_count
+    }
+}
 
 #[derive(Debug)]
 struct SearchQuery(String);
@@ -251,54 +287,88 @@ impl SearchSession {
     }
 
     pub(super) const fn has_work(&self) -> bool {
-        self.is_searching()
-            || matches!(
-                &self.highlights,
-                SearchHighlightState::Ready(highlights) if !highlights.is_complete()
-            )
+        self.is_searching() || matches!(&self.highlights, SearchHighlightState::Pending(_))
     }
 
-    pub(super) fn highlight_ranges(&self, visible: &Range<SourceOffset>) -> &[SearchRange] {
+    pub(super) fn highlight_ranges(&self, key: SearchHighlightKey) -> &[SearchRange] {
         self.highlights
             .ready()
-            .filter(|highlights| highlights.covers(visible))
-            .map_or(&[], SearchHighlights::ranges)
+            .filter(|highlights| highlights.covers(key))
+            .map_or(&[], PublishedSearchHighlights::ranges)
     }
 
-    pub(super) fn prepare_highlights(
-        &mut self,
-        visible: Range<SourceOffset>,
-        targets: impl IntoIterator<Item = SearchRange>,
-    ) -> Result<(), TutError> {
-        if self.highlights.covers(&visible) {
-            return Ok(());
+    pub(super) fn prepare_highlights(&mut self, key: SearchHighlightKey) {
+        if self.highlights.covers(key) {
+            return;
         }
-        let storage = self.highlights.take_storage();
+        let mut storage = self.highlights.take_storage();
+        storage.ranges.clear();
         if !self.index.is_complete() || !self.index.has_matches() {
             self.highlights = SearchHighlightState::Absent(storage);
-            return Ok(());
+            return;
         }
-        self.highlights = match self
-            .index
-            .display_highlights(visible.clone(), targets, storage)?
-        {
-            DisplayHighlightPreparation::Unavailable(storage) => {
-                SearchHighlightState::Absent(storage)
-            }
-            DisplayHighlightPreparation::Ready(highlights) => {
-                SearchHighlightState::Ready(highlights)
-            }
-            DisplayHighlightPreparation::Disabled(storage) => {
-                SearchHighlightState::Disabled { visible, storage }
-            }
-        };
-        Ok(())
+        if key.target_count() > MAX_DISPLAY_HIGHLIGHT_RANGES {
+            self.highlights = SearchHighlightState::Disabled { key, storage };
+            return;
+        }
+        if !self.index.highlightable(&key.visible()) {
+            self.highlights = SearchHighlightState::Absent(storage);
+            return;
+        }
+        self.highlights =
+            SearchHighlightState::Pending(self.index.display_highlight_job(key, storage));
     }
 
     pub(super) fn invalidate_highlights(&mut self) {
         let mut storage = self.highlights.take_storage();
         storage.ranges.clear();
         self.highlights = SearchHighlightState::Absent(storage);
+    }
+
+    fn cancel_pending_highlights(&mut self) {
+        if matches!(self.highlights, SearchHighlightState::Pending(_)) {
+            self.invalidate_highlights();
+        }
+    }
+
+    pub(super) fn advance_highlights(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        key: SearchHighlightKey,
+        mut target_at: impl FnMut(usize) -> SearchRange,
+    ) -> Result<bool, TutError> {
+        let state = std::mem::take(&mut self.highlights);
+        let SearchHighlightState::Pending(mut job) = state else {
+            self.highlights = state;
+            return Ok(false);
+        };
+        if job.key != key {
+            let mut storage = job.into_storage();
+            storage.ranges.clear();
+            self.highlights = SearchHighlightState::Absent(storage);
+            return Ok(false);
+        }
+        match job.advance(
+            reader,
+            self.query.as_str(),
+            &mut self.match_block,
+            &mut target_at,
+        ) {
+            Ok(false) => {
+                self.highlights = SearchHighlightState::Pending(job);
+                Ok(false)
+            }
+            Ok(true) => {
+                self.highlights = SearchHighlightState::Ready(job.publish());
+                Ok(true)
+            }
+            Err(error) => {
+                let mut storage = job.into_storage();
+                storage.ranges.clear();
+                self.highlights = SearchHighlightState::Absent(storage);
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn cancel_motion(&mut self) -> bool {
@@ -327,6 +397,7 @@ impl SearchSession {
         if self.current_match.is_none() {
             self.jump_pending = true;
         }
+        self.cancel_pending_highlights();
         self.pending_navigation = if forward {
             self.pending_navigation.saturating_add(1)
         } else {
@@ -347,18 +418,8 @@ impl SearchSession {
         } else {
             if self.navigation.is_none() {
                 if self.pending_navigation == 0 {
-                    let Some(highlights) = self.highlights.ready_mut() else {
-                        return Ok(SearchStep {
-                            changed: false,
-                            jump: None,
-                        });
-                    };
                     return Ok(SearchStep {
-                        changed: highlights.advance(
-                            reader,
-                            self.query.as_str(),
-                            &mut self.match_block,
-                        )?,
+                        changed: false,
                         jump: None,
                     });
                 }
@@ -431,9 +492,9 @@ impl SearchSession {
         matches!(
             &self.highlights,
             SearchHighlightState::Disabled {
-                visible: disabled,
+                key,
                 ..
-            } if disabled == visible
+            } if key.visible() == *visible
         )
     }
 
@@ -442,7 +503,39 @@ impl SearchSession {
         match &self.highlights {
             SearchHighlightState::Absent(storage)
             | SearchHighlightState::Disabled { storage, .. } => storage.reserve_attempts,
+            SearchHighlightState::Pending(job) => job.storage.reserve_attempts,
             SearchHighlightState::Ready(highlights) => highlights.storage.reserve_attempts,
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_highlight_progress(
+        &self,
+    ) -> Option<(DisplayHighlightPhase, usize, usize, Option<usize>)> {
+        let SearchHighlightState::Pending(job) = &self.highlights else {
+            return None;
+        };
+        Some((
+            job.phase,
+            job.target_index,
+            job.match_index,
+            job.pending_target,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_highlight_cursors(&self) -> Option<(usize, usize, Option<usize>)> {
+        self.pending_highlight_progress()
+            .map(|(_, target, found, pending)| (target, found, pending))
+    }
+
+    #[cfg(test)]
+    fn pending_highlight_ranges(&self) -> &[SearchRange] {
+        match &self.highlights {
+            SearchHighlightState::Pending(job) => &job.storage.ranges,
+            SearchHighlightState::Absent(_)
+            | SearchHighlightState::Ready(_)
+            | SearchHighlightState::Disabled { .. } => &[],
         }
     }
 }
@@ -646,6 +739,42 @@ impl SearchIndex {
         )
     }
 
+    fn display_highlight_job(
+        &self,
+        key: SearchHighlightKey,
+        storage: SearchHighlightStorage,
+    ) -> DisplayHighlightJob {
+        let visible = key.visible();
+        debug_assert!(self.highlightable(&visible));
+        let earliest = visible
+            .start
+            .checked_sub(self.query_len.saturating_sub(1))
+            .unwrap_or(self.source_start)
+            .max(self.source_start);
+        let checkpoint = self.checkpoint_at_or_before(earliest);
+        DisplayHighlightJob {
+            key,
+            document_id: self.document_id,
+            cursor: checkpoint.scan_at,
+            needed_from: earliest,
+            previous: checkpoint.previous_match,
+            source_end: self.source_end,
+            target_index: 0,
+            match_index: 0,
+            match_end: 0,
+            pending_target: None,
+            storage,
+            phase: if key.target_count() == 0 || checkpoint.scan_at >= self.source_end {
+                DisplayHighlightPhase::Validate
+            } else {
+                DisplayHighlightPhase::NeedBlock
+            },
+            #[cfg(test)]
+            last_step: DisplayHighlightStepMetrics::default(),
+        }
+    }
+
+    #[cfg(test)]
     fn display_highlights(
         &self,
         visible: Range<SourceOffset>,
@@ -653,7 +782,7 @@ impl SearchIndex {
         mut storage: SearchHighlightStorage,
     ) -> Result<DisplayHighlightPreparation, TutError> {
         if !self.highlightable(&visible) {
-            return Ok(DisplayHighlightPreparation::Unavailable(storage));
+            return Ok(DisplayHighlightPreparation::Unavailable);
         }
         storage.ranges.clear();
         let mut targets = targets.into_iter();
@@ -701,6 +830,7 @@ impl SearchIndex {
         Some(self.new_highlights(visible, storage, mode))
     }
 
+    #[cfg(test)]
     fn new_highlights(
         &self,
         visible: Range<SourceOffset>,
@@ -923,7 +1053,13 @@ impl MatchBlock {
         SearchRange::new(start, end).expect("nonempty queries produce nonempty ranges")
     }
 
+    #[cfg(test)]
     fn overlapping(&self, visible: &Range<SourceOffset>) -> impl Iterator<Item = SearchRange> + '_ {
+        let (first, last) = self.overlapping_indices(visible);
+        (first..last).map(|index| self.range(index))
+    }
+
+    fn overlapping_indices(&self, visible: &Range<SourceOffset>) -> (usize, usize) {
         debug_assert_ne!(self.query_len, 0);
         let overlap = u64::try_from(self.query_len - 1).expect("query lengths fit u64");
         let earliest = visible.start.get().saturating_sub(overlap);
@@ -936,7 +1072,7 @@ impl MatchBlock {
             .starts()
             .partition_point(|start| u64::from(*start) < upper);
 
-        (first..last).map(|index| self.range(index))
+        (first, last)
     }
 
     fn locate(&mut self, range: SearchRange) -> Option<usize> {
@@ -1164,9 +1300,10 @@ impl SearchNavigation {
 #[derive(Debug)]
 enum SearchHighlightState {
     Absent(SearchHighlightStorage),
-    Ready(SearchHighlights),
+    Pending(DisplayHighlightJob),
+    Ready(PublishedSearchHighlights),
     Disabled {
-        visible: Range<SourceOffset>,
+        key: SearchHighlightKey,
         storage: SearchHighlightStorage,
     },
 }
@@ -1178,45 +1315,302 @@ impl Default for SearchHighlightState {
 }
 
 impl SearchHighlightState {
-    fn covers(&self, visible: &Range<SourceOffset>) -> bool {
+    fn covers(&self, key: SearchHighlightKey) -> bool {
         match self {
             Self::Absent(_) => false,
-            Self::Ready(highlights) => highlights.covers(visible),
-            Self::Disabled {
-                visible: disabled, ..
-            } => disabled == visible,
+            Self::Pending(job) => job.key == key,
+            Self::Ready(highlights) => highlights.covers(key),
+            Self::Disabled { key: disabled, .. } => *disabled == key,
         }
     }
 
-    const fn ready(&self) -> Option<&SearchHighlights> {
+    const fn ready(&self) -> Option<&PublishedSearchHighlights> {
         match self {
             Self::Ready(highlights) => Some(highlights),
-            Self::Absent(_) | Self::Disabled { .. } => None,
-        }
-    }
-
-    const fn ready_mut(&mut self) -> Option<&mut SearchHighlights> {
-        match self {
-            Self::Ready(highlights) => Some(highlights),
-            Self::Absent(_) | Self::Disabled { .. } => None,
+            Self::Absent(_) | Self::Pending(_) | Self::Disabled { .. } => None,
         }
     }
 
     fn take_storage(&mut self) -> SearchHighlightStorage {
         match std::mem::take(self) {
             Self::Absent(storage) | Self::Disabled { storage, .. } => storage,
+            Self::Pending(job) => job.into_storage(),
             Self::Ready(highlights) => highlights.into_storage(),
         }
     }
 }
 
 #[derive(Debug)]
+struct PublishedSearchHighlights {
+    key: SearchHighlightKey,
+    storage: SearchHighlightStorage,
+}
+
+impl PublishedSearchHighlights {
+    fn into_storage(self) -> SearchHighlightStorage {
+        self.storage
+    }
+
+    fn covers(&self, key: SearchHighlightKey) -> bool {
+        self.key == key
+    }
+
+    fn ranges(&self) -> &[SearchRange] {
+        &self.storage.ranges
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayHighlightPhase {
+    NeedBlock,
+    Merge,
+    Grow,
+    Validate,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DisplayHighlightStepMetrics {
+    phase: Option<DisplayHighlightPhase>,
+    comparisons: usize,
+    output_attempts: usize,
+}
+
+#[derive(Debug)]
+struct DisplayHighlightJob {
+    key: SearchHighlightKey,
+    document_id: DocumentId,
+    cursor: SourceOffset,
+    needed_from: SourceOffset,
+    previous: Option<SearchRange>,
+    source_end: SourceOffset,
+    target_index: usize,
+    match_index: usize,
+    match_end: usize,
+    pending_target: Option<usize>,
+    storage: SearchHighlightStorage,
+    phase: DisplayHighlightPhase,
+    #[cfg(test)]
+    last_step: DisplayHighlightStepMetrics,
+}
+
+impl DisplayHighlightJob {
+    fn into_storage(self) -> SearchHighlightStorage {
+        self.storage
+    }
+
+    fn publish(self) -> PublishedSearchHighlights {
+        debug_assert_eq!(self.phase, DisplayHighlightPhase::Validate);
+        PublishedSearchHighlights {
+            key: self.key,
+            storage: self.storage,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+        cached: &mut MatchBlockCache,
+        target_at: &mut impl FnMut(usize) -> SearchRange,
+    ) -> Result<bool, TutError> {
+        if reader.document_id() != self.document_id {
+            return Err(SearchError::SourceMismatch.into());
+        }
+        #[cfg(test)]
+        {
+            self.last_step = DisplayHighlightStepMetrics {
+                phase: Some(self.phase),
+                ..DisplayHighlightStepMetrics::default()
+            };
+        }
+        match self.phase {
+            DisplayHighlightPhase::NeedBlock => self.need_block(reader, needle, cached)?,
+            DisplayHighlightPhase::Merge => self.merge(cached, target_at),
+            DisplayHighlightPhase::Grow => self.grow()?,
+            DisplayHighlightPhase::Validate => {
+                reader.validate()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn need_block(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+        cached: &mut MatchBlockCache,
+    ) -> Result<(), TutError> {
+        debug_assert_eq!(self.phase, DisplayHighlightPhase::NeedBlock);
+        if self.target_index >= self.key.target_count()
+            || self.cursor >= self.source_end
+            || self.cursor >= self.key.visible_end
+        {
+            self.phase = DisplayHighlightPhase::Validate;
+            return Ok(());
+        }
+        let reusable = cached.ready().is_some_and(|block| {
+            block.document_id == self.document_id
+                && block.query_len == needle.len()
+                && block.start <= self.needed_from
+                && self.needed_from < block.next
+        });
+        if reusable {
+            reader.validate()?;
+        } else {
+            cached.scan(
+                reader,
+                needle,
+                self.document_id,
+                self.source_end,
+                self.cursor,
+                self.previous,
+            )?;
+        }
+        let block = cached
+            .ready()
+            .expect("reused and successfully scanned match blocks are ready");
+        (self.match_index, self.match_end) = block.overlapping_indices(&self.key.visible());
+        self.phase = DisplayHighlightPhase::Merge;
+        Ok(())
+    }
+
+    fn merge(
+        &mut self,
+        cached: &MatchBlockCache,
+        target_at: &mut impl FnMut(usize) -> SearchRange,
+    ) {
+        debug_assert_eq!(self.phase, DisplayHighlightPhase::Merge);
+        let block = cached
+            .ready()
+            .expect("merge phases retain a ready match block");
+        let mut operations = 0;
+
+        if let Some(index) = self.pending_target {
+            let target = target_at(index);
+            debug_assert!(self.can_append(target));
+            self.append(target);
+            self.pending_target = None;
+            operations += 1;
+            #[cfg(test)]
+            {
+                self.last_step.output_attempts += 1;
+            }
+        }
+
+        while operations < DISPLAY_HIGHLIGHT_MERGE_BUDGET
+            && self.pending_target.is_none()
+            && self.target_index < self.key.target_count()
+            && self.match_index < self.match_end
+        {
+            let target_index = self.target_index;
+            let target = target_at(target_index);
+            let found = block.range(self.match_index);
+            operations += 1;
+            #[cfg(test)]
+            {
+                self.last_step.comparisons += 1;
+            }
+            if target.end() <= found.start() {
+                self.target_index += 1;
+                continue;
+            }
+            if target.start() >= found.end() {
+                self.match_index += 1;
+                continue;
+            }
+
+            self.target_index += 1;
+            let can_append = self.can_append(target);
+            if operations >= DISPLAY_HIGHLIGHT_MERGE_BUDGET {
+                self.pending_target = Some(target_index);
+                if !can_append {
+                    self.phase = DisplayHighlightPhase::Grow;
+                }
+                break;
+            }
+            if !can_append {
+                self.pending_target = Some(target_index);
+                self.phase = DisplayHighlightPhase::Grow;
+                break;
+            }
+            self.append(target);
+            operations += 1;
+            #[cfg(test)]
+            {
+                self.last_step.output_attempts += 1;
+            }
+        }
+
+        if self.pending_target.is_some() {
+            return;
+        }
+        if self.target_index >= self.key.target_count() {
+            self.phase = DisplayHighlightPhase::Validate;
+        } else if self.match_index >= self.match_end {
+            self.cursor = block.next;
+            self.needed_from = block.next;
+            self.previous = block.last_or_previous();
+            self.phase = if self.cursor >= self.source_end || self.cursor >= self.key.visible_end {
+                DisplayHighlightPhase::Validate
+            } else {
+                DisplayHighlightPhase::NeedBlock
+            };
+        }
+    }
+
+    fn can_append(&self, range: SearchRange) -> bool {
+        self.storage
+            .ranges
+            .last()
+            .is_some_and(|last| last.end() == range.start())
+            || self.storage.ranges.len() < self.storage.ranges.capacity()
+    }
+
+    fn append(&mut self, range: SearchRange) {
+        if let Some(last) = self.storage.ranges.last_mut()
+            && last.end() == range.start()
+        {
+            last.end = range.end();
+        } else {
+            debug_assert!(self.storage.ranges.len() < self.storage.ranges.capacity());
+            self.storage.ranges.push(range);
+        }
+    }
+
+    fn grow(&mut self) -> Result<(), TutError> {
+        debug_assert_eq!(self.phase, DisplayHighlightPhase::Grow);
+        let ranges = &mut self.storage.ranges;
+        debug_assert!(ranges.len() < MAX_DISPLAY_HIGHLIGHT_RANGES);
+        debug_assert_eq!(ranges.len(), ranges.capacity());
+        let remaining = MAX_DISPLAY_HIGHLIGHT_RANGES - ranges.len();
+        let additional = ranges.capacity().max(256).min(remaining);
+        #[cfg(test)]
+        {
+            self.storage.reserve_attempts = self.storage.reserve_attempts.saturating_add(1);
+            if self.storage.fail_reserve {
+                self.storage.fail_reserve = false;
+                return Err(SearchError::Allocation.into());
+            }
+        }
+        ranges
+            .try_reserve_exact(additional)
+            .map_err(|_| SearchError::Allocation)?;
+        self.phase = DisplayHighlightPhase::Merge;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
 enum DisplayHighlightPreparation {
-    Unavailable(SearchHighlightStorage),
+    Unavailable,
     Ready(SearchHighlights),
     Disabled(SearchHighlightStorage),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SearchHighlights {
     document_id: DocumentId,
@@ -1239,6 +1633,7 @@ struct SearchHighlightStorage {
     fail_reserve: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 enum HighlightMode {
     #[cfg(test)]
@@ -1249,6 +1644,7 @@ enum HighlightMode {
     },
 }
 
+#[cfg(test)]
 impl SearchHighlights {
     fn into_storage(self) -> SearchHighlightStorage {
         self.storage
@@ -1256,10 +1652,6 @@ impl SearchHighlights {
 
     const fn is_complete(&self) -> bool {
         self.complete
-    }
-
-    fn covers(&self, visible: &Range<SourceOffset>) -> bool {
-        self.visible == *visible
     }
 
     fn ranges(&self) -> &[SearchRange] {
@@ -1386,6 +1778,7 @@ fn reserve_highlight_range(storage: &mut SearchHighlightStorage) -> Result<(), T
     Err(SearchError::Allocation.into())
 }
 
+#[cfg(test)]
 fn reserve_display_target(storage: &mut SearchHighlightStorage) -> Result<bool, TutError> {
     let ranges = &mut storage.ranges;
     if ranges.len() >= MAX_DISPLAY_HIGHLIGHT_RANGES {
@@ -1467,11 +1860,12 @@ fn scan_window(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, fs, path::Path};
+    use std::{fs, path::Path};
 
     use super::*;
     use crate::document::{Document, DocumentCache, MAX_FILE_BYTES};
     use tempfile::tempdir;
+    use unicode_segmentation::UnicodeSegmentation;
 
     fn complete_at(
         text: &str,
@@ -1523,6 +1917,95 @@ mod tests {
             .unwrap();
         }
         matches
+    }
+
+    fn display_highlight_oracle(
+        document: &Document,
+        index: &SearchIndex,
+        needle: &str,
+        visible: Range<SourceOffset>,
+        targets: &[SearchRange],
+    ) -> Vec<SearchRange> {
+        let DisplayHighlightPreparation::Ready(mut highlights) = index
+            .display_highlights(
+                visible,
+                targets.iter().copied(),
+                SearchHighlightStorage::default(),
+            )
+            .unwrap()
+        else {
+            panic!("oracle targets should be highlightable");
+        };
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut block = MatchBlockCache::default();
+        while !highlights.is_complete() {
+            highlights.advance(&mut reader, needle, &mut block).unwrap();
+        }
+        highlights.ranges().to_vec()
+    }
+
+    fn stream_display_highlights(
+        document: &Document,
+        index: &SearchIndex,
+        needle: &str,
+        visible: Range<SourceOffset>,
+        targets: &[SearchRange],
+    ) -> (Vec<SearchRange>, usize) {
+        let key = display_key(visible, targets.len());
+        let mut job = index.display_highlight_job(key, SearchHighlightStorage::default());
+        let mut cache = DocumentCache::default();
+        let mut block = MatchBlockCache::default();
+        let mut visits = 0;
+        loop {
+            let phase = job.phase;
+            let before_target = job.target_index;
+            let before_match = job.match_index;
+            let before_reserves = job.storage.reserve_attempts;
+            cache.reset_metrics();
+            let complete = {
+                let mut reader = document.reader(&mut cache);
+                job.advance(&mut reader, needle, &mut block, &mut |index| {
+                    visits += 1;
+                    targets[index]
+                })
+                .unwrap()
+            };
+            let metrics = job.last_step;
+            assert_eq!(metrics.phase, Some(phase));
+            assert!(metrics.comparisons <= DISPLAY_HIGHLIGHT_MERGE_BUDGET);
+            assert!(metrics.output_attempts <= DISPLAY_HIGHLIGHT_MERGE_BUDGET);
+            assert!(
+                metrics.comparisons + metrics.output_attempts <= DISPLAY_HIGHLIGHT_MERGE_BUDGET
+            );
+            match phase {
+                DisplayHighlightPhase::NeedBlock => {
+                    assert_eq!((metrics.comparisons, metrics.output_attempts), (0, 0));
+                    assert!(cache.metrics().window_calls() <= 1);
+                    assert_eq!(job.storage.reserve_attempts, before_reserves);
+                }
+                DisplayHighlightPhase::Merge => {
+                    assert_eq!(cache.metrics().window_calls(), 0);
+                    assert_eq!(job.storage.reserve_attempts, before_reserves);
+                    assert_eq!(
+                        job.target_index - before_target + job.match_index - before_match,
+                        metrics.comparisons
+                    );
+                }
+                DisplayHighlightPhase::Grow => {
+                    assert_eq!((metrics.comparisons, metrics.output_attempts), (0, 0));
+                    assert_eq!(cache.metrics().window_calls(), 0);
+                    assert_eq!(job.storage.reserve_attempts, before_reserves + 1);
+                }
+                DisplayHighlightPhase::Validate => {
+                    assert_eq!((metrics.comparisons, metrics.output_attempts), (0, 0));
+                    assert_eq!(cache.metrics().window_calls(), 0);
+                }
+            }
+            if complete {
+                return (job.storage.ranges.clone(), visits);
+            }
+        }
     }
 
     fn navigate(
@@ -1595,6 +2078,51 @@ mod tests {
         .unwrap()
     }
 
+    fn grapheme_targets(text: &str) -> Vec<SearchRange> {
+        text.grapheme_indices(true)
+            .filter(|(_, grapheme)| !grapheme.contains(['\r', '\n']))
+            .map(|(start, grapheme)| {
+                SearchRange::new(
+                    SourceOffset::from_usize(start),
+                    SourceOffset::from_usize(start + grapheme.len()),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn display_key(visible: Range<SourceOffset>, target_count: usize) -> SearchHighlightKey {
+        SearchHighlightKey::new(80, 24, visible.start, visible.end, target_count)
+    }
+
+    fn settle_highlights(
+        document: &Document,
+        cache: &mut DocumentCache,
+        session: &mut SearchSession,
+        key: SearchHighlightKey,
+        mut target_at: impl FnMut(usize) -> SearchRange,
+    ) -> Result<(), TutError> {
+        while matches!(session.highlights, SearchHighlightState::Pending(_)) {
+            let mut reader = document.reader(cache);
+            session.advance_highlights(&mut reader, key, &mut target_at)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_and_settle_highlights(
+        document: &Document,
+        cache: &mut DocumentCache,
+        session: &mut SearchSession,
+        visible: Range<SourceOffset>,
+        target_count: usize,
+        target_at: impl FnMut(usize) -> SearchRange,
+    ) -> Result<SearchHighlightKey, TutError> {
+        let key = display_key(visible, target_count);
+        session.prepare_highlights(key);
+        settle_highlights(document, cache, session, key, target_at)?;
+        Ok(key)
+    }
+
     fn request_session_navigation(
         document: &Document,
         cache: &mut DocumentCache,
@@ -1626,9 +2154,16 @@ mod tests {
 
         let visible = document.source_start()..document.source_end();
         let target = SearchRange::new(visible.start, visible.end).unwrap();
-        cat.prepare_highlights(visible.clone(), [target]).unwrap();
-        settle_session(&document, &mut cache, &mut cat);
-        assert_eq!(cat.highlight_ranges(&visible), &[target]);
+        let key = prepare_and_settle_highlights(
+            &document,
+            &mut cache,
+            &mut cat,
+            visible.clone(),
+            1,
+            |_| target,
+        )
+        .unwrap();
+        assert_eq!(cat.highlight_ranges(key), &[target]);
 
         let mut dog = {
             let reader = document.reader(&mut cache);
@@ -1638,7 +2173,7 @@ mod tests {
         };
         assert_eq!(dog.query(), "dog");
         assert_eq!(dog.current_match(), None);
-        assert_eq!(dog.highlight_ranges(&visible), &[]);
+        assert_eq!(dog.highlight_ranges(display_key(visible, 1)), &[]);
         settle_session(&document, &mut cache, &mut dog);
         assert_eq!(dog.current_match().unwrap().start(), SourceOffset::new(4));
         assert!(request_session_navigation(
@@ -2107,29 +2642,23 @@ mod tests {
             let end = start.checked_add(ROW_BYTES).unwrap();
             let visible = start..end;
             let target = SearchRange::new(start, end).unwrap();
-            session
-                .prepare_highlights(visible.clone(), [target])
-                .unwrap();
-            let pending = session.highlights.ready().unwrap();
-            assert!(!pending.is_complete());
-            let allocation = pending.storage.ranges.as_ptr();
-            let capacity = pending.storage.ranges.capacity();
-            assert_eq!(pending.storage.reserve_attempts, 1);
+            let key = display_key(visible, 1);
+            session.prepare_highlights(key);
+            assert!(matches!(
+                session.highlights,
+                SearchHighlightState::Pending(_)
+            ));
+            assert!(session.highlight_ranges(key).is_empty());
+            session.prepare_highlights(key);
+            settle_highlights(&document, &mut cache, &mut session, key, |_| target).unwrap();
+            let ready = session.highlights.ready().unwrap();
+            let allocation = ready.storage.ranges.as_ptr();
+            let capacity = ready.storage.ranges.capacity();
+            assert_eq!(ready.storage.reserve_attempts, 1);
             assert_eq!(*target_allocation.get_or_insert(allocation), allocation);
             assert_eq!(*target_capacity.get_or_insert(capacity), capacity);
-
-            session
-                .prepare_highlights(visible.clone(), std::iter::once_with(|| unreachable!()))
-                .unwrap();
-            let unchanged = session.highlights.ready().unwrap();
-            assert_eq!(unchanged.storage.ranges.as_ptr(), allocation);
-            assert_eq!(unchanged.storage.ranges.capacity(), capacity);
-            assert_eq!(unchanged.storage.reserve_attempts, 1);
-            assert!(!unchanged.is_complete());
-
-            settle_session(&document, &mut cache, &mut session);
             let expected = if row % 7 == 0 { &[target][..] } else { &[] };
-            assert_eq!(session.highlight_ranges(&visible), expected);
+            assert_eq!(session.highlight_ranges(key), expected);
         }
 
         assert_eq!(VIEWPORTS, 409);
@@ -2227,8 +2756,11 @@ mod tests {
 
         let whole = document.source_start()..document.source_end();
         let whole_target = SearchRange::new(whole.start, whole.end).unwrap();
-        session.prepare_highlights(whole, [whole_target]).unwrap();
-        settle_session(&document, &mut cache, &mut session);
+        let whole_key =
+            prepare_and_settle_highlights(&document, &mut cache, &mut session, whole, 1, |_| {
+                whole_target
+            })
+            .unwrap();
         let allocation = session.match_block.ready().unwrap().storage.starts.as_ptr();
         cache.reset_metrics();
 
@@ -2247,14 +2779,16 @@ mod tests {
             session.match_block.ready().unwrap().storage.starts.as_ptr(),
             allocation
         );
+        assert_eq!(session.highlight_ranges(whole_key), &[whole_target]);
 
         let second = SourceOffset::new(4)..SourceOffset::new(7);
         let second_target = SearchRange::new(second.start, second.end).unwrap();
-        session
-            .prepare_highlights(second.clone(), [second_target])
+        let second_key =
+            prepare_and_settle_highlights(&document, &mut cache, &mut session, second, 1, |_| {
+                second_target
+            })
             .unwrap();
-        settle_session(&document, &mut cache, &mut session);
-        assert_eq!(session.highlight_ranges(&second), &[second_target]);
+        assert_eq!(session.highlight_ranges(second_key), &[second_target]);
         assert_eq!(
             session.match_block.ready().unwrap().storage.starts.as_ptr(),
             allocation
@@ -2304,11 +2838,16 @@ mod tests {
         let first_visible = SourceOffset::from_usize(first_start)
             ..SourceOffset::from_usize(first_start + "cat".len());
         let first_target = SearchRange::new(first_visible.start, first_visible.end).unwrap();
-        session
-            .prepare_highlights(first_visible.clone(), [first_target])
-            .unwrap();
-        settle_session(&document, &mut document_cache, &mut session);
-        assert_eq!(session.highlight_ranges(&first_visible), &[first_target]);
+        let first_key = prepare_and_settle_highlights(
+            &document,
+            &mut document_cache,
+            &mut session,
+            first_visible,
+            1,
+            |_| first_target,
+        )
+        .unwrap();
+        assert_eq!(session.highlight_ranges(first_key), &[first_target]);
         let first = session.match_block.ready().unwrap();
         let allocation = first.storage.starts.as_ptr();
         let capacity = first.storage.starts.capacity();
@@ -2337,11 +2876,16 @@ mod tests {
             ..SourceOffset::from_usize(second_start + "cat".len());
         let second_target = SearchRange::new(second_visible.start, second_visible.end).unwrap();
         document_cache.reset_metrics();
-        session
-            .prepare_highlights(second_visible.clone(), [second_target])
-            .unwrap();
-        settle_session(&document, &mut document_cache, &mut session);
-        assert_eq!(session.highlight_ranges(&second_visible), &[second_target]);
+        let second_key = prepare_and_settle_highlights(
+            &document,
+            &mut document_cache,
+            &mut session,
+            second_visible,
+            1,
+            |_| second_target,
+        )
+        .unwrap();
+        assert_eq!(session.highlight_ranges(second_key), &[second_target]);
         let highlighted = session.match_block.ready().unwrap();
         assert_eq!(highlighted.storage.starts.as_ptr(), allocation);
         assert_eq!(highlighted.storage.starts.capacity(), capacity);
@@ -2368,10 +2912,15 @@ mod tests {
 
         let first_visible = SourceOffset::ZERO..SourceOffset::new(3);
         let first_target = SearchRange::new(first_visible.start, first_visible.end).unwrap();
-        session
-            .prepare_highlights(first_visible, [first_target])
-            .unwrap();
-        settle_session(&document, &mut document_cache, &mut session);
+        prepare_and_settle_highlights(
+            &document,
+            &mut document_cache,
+            &mut session,
+            first_visible,
+            1,
+            |_| first_target,
+        )
+        .unwrap();
         let first = session.match_block.ready().unwrap();
         let allocation = first.storage.starts.as_ptr();
         let capacity = first.storage.starts.capacity();
@@ -2518,6 +3067,231 @@ mod tests {
     }
 
     #[test]
+    fn streamed_display_highlights_match_the_oracle_at_merge_boundaries() {
+        const COUNTS: [usize; 4] = [1, 1023, 1024, 1025];
+        const QUERIES: [&str; 7] = [
+            "A",
+            "猫",
+            "👩\u{200d}❤️\u{200d}💋\u{200d}👨",
+            "e\u{301}",
+            "\t",
+            "\0",
+            "needle",
+        ];
+        let pattern = "A猫👩\u{200d}❤️\u{200d}💋\u{200d}👨e\u{301}\t\0\r\nneedleneedle";
+
+        for query in QUERIES {
+            let text = format!("{query}{pattern}").repeat(180);
+            let targets = grapheme_targets(&text);
+            assert!(targets.len() >= 1025);
+            let (document, index) = complete(&text, query);
+            for count in COUNTS {
+                let selected = &targets[..count];
+                let visible = SourceOffset::ZERO..selected.last().unwrap().end();
+                let oracle =
+                    display_highlight_oracle(&document, &index, query, visible.clone(), selected);
+                let (streamed, _) =
+                    stream_display_highlights(&document, &index, query, visible, selected);
+                assert_eq!(streamed, oracle, "query {query:?}, target count {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_display_highlights_keep_cross_window_queries() {
+        let crossing = SOURCE_WINDOW_BYTES - 3;
+        let mut text = "x".repeat(crossing);
+        text.push_str("needle");
+        text.push_str(&"y".repeat(2048));
+        let (document, index) = complete(&text, "needle");
+        let visible = SourceOffset::from_usize(crossing - 8)
+            ..SourceOffset::from_usize(crossing + "needle".len() + 8);
+        let targets = (crossing - 8..crossing + "needle".len() + 8)
+            .map(display_target)
+            .collect::<Vec<_>>();
+        let oracle =
+            display_highlight_oracle(&document, &index, "needle", visible.clone(), &targets);
+        let (streamed, _) =
+            stream_display_highlights(&document, &index, "needle", visible, &targets);
+        assert_eq!(streamed, oracle);
+    }
+
+    #[test]
+    fn exact_cap_highlights_are_streamed_and_over_cap_is_constant_work() {
+        let text = "x\0".repeat(131_072);
+        let targets = (0..MAX_DISPLAY_HIGHLIGHT_RANGES)
+            .map(display_target)
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), MAX_DISPLAY_HIGHLIGHT_RANGES);
+        let (document, index) = complete(&text, "x");
+        let visible = document.source_start()..document.source_end();
+        let oracle = display_highlight_oracle(&document, &index, "x", visible.clone(), &targets);
+        let (streamed, visits) =
+            stream_display_highlights(&document, &index, "x", visible.clone(), &targets);
+        assert_eq!(streamed, oracle);
+        assert_eq!(streamed.len(), MAX_DISPLAY_HIGHLIGHT_RANGES / 2);
+        assert!(visits <= MAX_DISPLAY_HIGHLIGHT_RANGES * 2);
+
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let exact_key = display_key(visible.clone(), MAX_DISPLAY_HIGHLIGHT_RANGES);
+        session.prepare_highlights(exact_key);
+        assert_eq!(session.highlight_reserve_attempts(), 0);
+        assert_eq!(session.pending_highlight_ranges(), &[]);
+        assert_eq!(
+            session.pending_highlight_progress(),
+            Some((DisplayHighlightPhase::NeedBlock, 0, 0, None))
+        );
+        session.invalidate_highlights();
+
+        let over_key = display_key(visible, MAX_DISPLAY_HIGHLIGHT_RANGES + 1);
+        session.prepare_highlights(over_key);
+        assert!(matches!(
+            session.highlights,
+            SearchHighlightState::Disabled { .. }
+        ));
+        assert_eq!(session.highlight_reserve_attempts(), 0);
+    }
+
+    #[test]
+    fn pending_display_ranges_publish_only_after_validation() {
+        let document = Document::from_text(Path::new("atomic.txt"), "x x".to_owned());
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let visible = document.source_start()..document.source_end();
+        let targets = [display_target(0), display_target(1), display_target(2)];
+        let key = display_key(visible, targets.len());
+        session.prepare_highlights(key);
+
+        while let Some((phase, ..)) = session.pending_highlight_progress() {
+            assert!(session.highlight_ranges(key).is_empty());
+            let mut reader = document.reader(&mut cache);
+            let published = session
+                .advance_highlights(&mut reader, key, |index| targets[index])
+                .unwrap();
+            assert_eq!(published, phase == DisplayHighlightPhase::Validate);
+        }
+        assert_eq!(
+            session.highlight_ranges(key),
+            &[display_target(0), display_target(2)]
+        );
+    }
+
+    #[test]
+    fn display_key_changes_cancel_partial_work_and_reuse_storage() {
+        let document = Document::from_text(Path::new("key-change.txt"), "x x".to_owned());
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let visible = document.source_start()..document.source_end();
+        let targets = [display_target(0), display_target(1), display_target(2)];
+        let first = display_key(visible.clone(), targets.len());
+        session.prepare_highlights(first);
+        while session.highlight_reserve_attempts() == 0 {
+            let mut reader = document.reader(&mut cache);
+            session
+                .advance_highlights(&mut reader, first, |index| targets[index])
+                .unwrap();
+        }
+        let SearchHighlightState::Pending(job) = &session.highlights else {
+            panic!("the first key should remain pending");
+        };
+        let allocation = job.storage.ranges.as_ptr();
+        let capacity = job.storage.ranges.capacity();
+        assert_ne!(capacity, 0);
+
+        let replacement =
+            SearchHighlightKey::new(81, 24, visible.start, visible.end, targets.len());
+        session.prepare_highlights(replacement);
+        let SearchHighlightState::Pending(job) = &session.highlights else {
+            panic!("the replacement key should restart highlighting");
+        };
+        assert_eq!(job.storage.ranges.as_ptr(), allocation);
+        assert_eq!(job.storage.ranges.capacity(), capacity);
+        assert!(job.storage.ranges.is_empty());
+        assert_eq!((job.target_index, job.match_index), (0, 0));
+        assert_eq!(job.phase, DisplayHighlightPhase::NeedBlock);
+    }
+
+    #[test]
+    fn navigation_reclaims_an_unfinished_highlight_block_and_storage() {
+        let document = Document::from_text(Path::new("reclaim.txt"), "x x".to_owned());
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let visible = document.source_start()..document.source_end();
+        let targets = [display_target(0), display_target(1), display_target(2)];
+        let key = display_key(visible, targets.len());
+        session.prepare_highlights(key);
+        while session.highlight_reserve_attempts() == 0 {
+            let mut reader = document.reader(&mut cache);
+            session
+                .advance_highlights(&mut reader, key, |index| targets[index])
+                .unwrap();
+        }
+        let block_allocation = session.match_block.ready().unwrap().storage.starts.as_ptr();
+        let SearchHighlightState::Pending(job) = &session.highlights else {
+            panic!("highlighting should remain unfinished");
+        };
+        let range_allocation = job.storage.ranges.as_ptr();
+        let range_capacity = job.storage.ranges.capacity();
+
+        assert!(request_session_navigation(
+            &document,
+            &mut cache,
+            &mut session,
+            true
+        ));
+        settle_session(&document, &mut cache, &mut session);
+        assert_eq!(
+            session.match_block.ready().unwrap().storage.starts.as_ptr(),
+            block_allocation
+        );
+        session.prepare_highlights(key);
+        let SearchHighlightState::Pending(job) = &session.highlights else {
+            panic!("highlighting should restart after navigation");
+        };
+        assert_eq!(job.storage.ranges.as_ptr(), range_allocation);
+        assert_eq!(job.storage.ranges.capacity(), range_capacity);
+        assert!(job.storage.ranges.is_empty());
+    }
+
+    #[test]
+    fn file_mutation_drops_partial_ranges_at_the_final_barrier() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("highlight-mutation.txt");
+        fs::write(&path, "x x").unwrap();
+        let document = crate::document::load(path.clone()).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let visible = document.source_start()..document.source_end();
+        let targets = [display_target(0), display_target(1), display_target(2)];
+        let key = display_key(visible, targets.len());
+        session.prepare_highlights(key);
+        while !matches!(
+            session.pending_highlight_progress(),
+            Some((DisplayHighlightPhase::Validate, ..))
+        ) {
+            let mut reader = document.reader(&mut cache);
+            session
+                .advance_highlights(&mut reader, key, |index| targets[index])
+                .unwrap();
+        }
+        assert!(!session.pending_highlight_ranges().is_empty());
+        assert!(session.highlight_ranges(key).is_empty());
+        fs::write(path, "changed").unwrap();
+
+        let result = {
+            let mut reader = document.reader(&mut cache);
+            session.advance_highlights(&mut reader, key, |index| targets[index])
+        };
+        assert!(matches!(result, Err(TutError::Load(_))));
+        assert!(matches!(
+            session.highlights,
+            SearchHighlightState::Absent(_)
+        ));
+        assert!(session.highlight_ranges(key).is_empty());
+    }
+
+    #[test]
     fn display_highlights_use_visible_ranges_instead_of_dense_match_storage() {
         let match_count = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>() + 1;
         let text = "ab".repeat(match_count);
@@ -2583,34 +3357,21 @@ mod tests {
         let visible = document.source_start()..document.source_end();
         let mut cache = DocumentCache::default();
         let mut session = complete_session(&document, &mut cache, "x");
-        let visits = Cell::new(0);
-        let targets = (0..target_count)
-            .inspect(|_| visits.set(visits.get() + 1))
-            .map(display_target);
-
-        session
-            .prepare_highlights(visible.clone(), targets)
-            .unwrap();
-
-        assert_eq!(visits.get(), 0);
+        let key = display_key(visible.clone(), target_count);
+        session.prepare_highlights(key);
         let SearchHighlightState::Disabled {
-            visible: disabled,
+            key: disabled,
             storage,
         } = &session.highlights
         else {
             panic!("the overbudget viewport should be cached as disabled");
         };
-        assert_eq!(disabled, &visible);
+        assert_eq!(*disabled, key);
         assert!(storage.ranges.is_empty());
         assert_eq!(storage.ranges.capacity(), 0);
         assert_eq!(storage.reserve_attempts, 0);
-        session
-            .prepare_highlights(
-                visible.clone(),
-                std::iter::once_with(|| panic!("cached targets must not be visited")),
-            )
-            .unwrap();
-        assert!(session.highlight_ranges(&visible).is_empty());
+        session.prepare_highlights(key);
+        assert!(session.highlight_ranges(key).is_empty());
     }
 
     #[test]
@@ -2621,36 +3382,29 @@ mod tests {
         let small = SourceOffset::ZERO..SourceOffset::new(1);
         let mut cache = DocumentCache::default();
         let mut session = complete_session(&document, &mut cache, "x");
-        session
-            .prepare_highlights(whole.clone(), (0..target_count).map(display_target))
-            .unwrap();
+        let whole_key = display_key(whole, target_count);
+        session.prepare_highlights(whole_key);
 
-        let visits = Cell::new(0);
-        session
-            .prepare_highlights(
-                small.clone(),
-                std::iter::once(display_target(0)).inspect(|_| visits.set(visits.get() + 1)),
-            )
+        let small_key =
+            prepare_and_settle_highlights(&document, &mut cache, &mut session, small, 1, |_| {
+                display_target(0)
+            })
             .unwrap();
-        assert_eq!(visits.get(), 1);
+        assert_eq!(session.highlight_ranges(small_key), &[display_target(0)]);
         assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
 
-        session
-            .prepare_highlights(whole.clone(), (0..target_count).map(display_target))
-            .unwrap();
+        session.prepare_highlights(whole_key);
         assert!(matches!(
             session.highlights,
             SearchHighlightState::Disabled { .. }
         ));
         session.invalidate_highlights();
-        let visits = Cell::new(0);
-        session
-            .prepare_highlights(
-                whole,
-                std::iter::once(display_target(0)).inspect(|_| visits.set(visits.get() + 1)),
-            )
-            .unwrap();
-        assert_eq!(visits.get(), 1);
+        let retry_key = display_key(whole_key.visible(), 1);
+        session.prepare_highlights(retry_key);
+        settle_highlights(&document, &mut cache, &mut session, retry_key, |_| {
+            display_target(0)
+        })
+        .unwrap();
         assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
     }
 
@@ -2667,27 +3421,20 @@ mod tests {
                 .unwrap()
         };
         assert!(!session.index_complete());
-        session
-            .prepare_highlights(
-                visible.clone(),
-                std::iter::repeat_with(|| panic!("incomplete indexes must not visit targets"))
-                    .take(MAX_DISPLAY_HIGHLIGHT_RANGES + 1),
-            )
-            .unwrap();
+        let disabled_key = display_key(visible.clone(), MAX_DISPLAY_HIGHLIGHT_RANGES + 1);
+        session.prepare_highlights(disabled_key);
         assert!(matches!(
             session.highlights,
             SearchHighlightState::Absent(_)
         ));
 
         settle_session(&document, &mut cache, &mut session);
-        let visits = Cell::new(0);
-        session
-            .prepare_highlights(
-                visible,
-                std::iter::once(display_target(0)).inspect(|_| visits.set(visits.get() + 1)),
-            )
-            .unwrap();
-        assert_eq!(visits.get(), 1);
+        let ready_key = display_key(visible, 1);
+        session.prepare_highlights(ready_key);
+        settle_highlights(&document, &mut cache, &mut session, ready_key, |_| {
+            display_target(0)
+        })
+        .unwrap();
         assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
     }
 
@@ -2701,19 +3448,25 @@ mod tests {
             panic!("unprepared sessions should retain absent highlight storage");
         };
         storage.fail_reserve = true;
-
-        assert!(matches!(
-            session.prepare_highlights(visible.clone(), [display_target(0)]),
-            Err(TutError::Search(SearchError::Allocation))
-        ));
+        let key = display_key(visible, 1);
+        session.prepare_highlights(key);
+        let result = loop {
+            let mut reader = document.reader(&mut cache);
+            match session.advance_highlights(&mut reader, key, |_| display_target(0)) {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(result, TutError::Search(SearchError::Allocation)));
         assert!(matches!(
             session.highlights,
             SearchHighlightState::Absent(_)
         ));
-
-        session
-            .prepare_highlights(visible, [display_target(0)])
-            .unwrap();
+        session.prepare_highlights(key);
+        settle_highlights(&document, &mut cache, &mut session, key, |_| {
+            display_target(0)
+        })
+        .unwrap();
         assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
     }
 
