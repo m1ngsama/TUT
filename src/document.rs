@@ -67,6 +67,10 @@ impl Document {
         self.line_index.is_complete()
     }
 
+    pub(super) const fn completed_last_line_start(&self) -> Option<SourceOffset> {
+        self.line_index.completed_last_line_start()
+    }
+
     pub(super) fn line_index_covers(&self, offset: SourceOffset) -> bool {
         self.line_index.covers(offset)
     }
@@ -136,6 +140,9 @@ impl Document {
 pub(super) struct DocumentCache {
     chunk: Vec<u8>,
     grapheme: Vec<u8>,
+    grapheme_start: SourceOffset,
+    grapheme_end: SourceOffset,
+    grapheme_document: Option<usize>,
     window_bytes: NonZeroUsize,
 }
 
@@ -144,6 +151,9 @@ impl Default for DocumentCache {
         Self {
             chunk: Vec::new(),
             grapheme: Vec::new(),
+            grapheme_start: SourceOffset::ZERO,
+            grapheme_end: SourceOffset::ZERO,
+            grapheme_document: None,
             window_bytes: NonZeroUsize::new(SOURCE_WINDOW_BYTES)
                 .expect("source window size is nonzero"),
         }
@@ -170,8 +180,36 @@ impl<'document> DocumentReader<'document> {
         &'reader mut self,
         start: SourceOffset,
     ) -> Result<DocumentGraphemes<'reader, 'document>, LoadError> {
+        let document = std::ptr::from_ref(self.document).addr();
+        if self.cache.grapheme_document == Some(document)
+            && start >= self.cache.grapheme_start
+            && start <= self.cache.grapheme_end
+        {
+            let cursor = usize::try_from(start.get() - self.cache.grapheme_start.get())
+                .expect("grapheme caches fit the process address space");
+            let buffer = std::str::from_utf8(&self.cache.grapheme)
+                .expect("document caches contain validated UTF-8");
+            if !buffer.is_char_boundary(cursor) {
+                return Err(self.protocol_error("invalid grapheme cursor offset"));
+            }
+            debug_assert_eq!(
+                self.cache.grapheme_end.get() - self.cache.grapheme_start.get(),
+                self.cache.grapheme.len() as u64
+            );
+            let loaded_end = self.cache.grapheme_end;
+            return Ok(DocumentGraphemes {
+                reader: self,
+                cursor,
+                next_start: start,
+                loaded_end,
+            });
+        }
+
         self.require_char_boundary(start, "invalid grapheme cursor offset")?;
         self.cache.grapheme.clear();
+        self.cache.grapheme_start = start;
+        self.cache.grapheme_end = start;
+        self.cache.grapheme_document = Some(document);
         Ok(DocumentGraphemes {
             reader: self,
             cursor: 0,
@@ -476,6 +514,8 @@ impl DocumentGraphemes<'_, '_> {
         self.reader.cache.grapheme.clear();
         self.cursor = 0;
         self.loaded_end = self.next_start;
+        self.reader.cache.grapheme_start = self.next_start;
+        self.reader.cache.grapheme_end = self.next_start;
         self.append_window()
     }
 
@@ -486,6 +526,7 @@ impl DocumentGraphemes<'_, '_> {
         let remaining = self.reader.cache.grapheme.len() - self.cursor;
         self.reader.cache.grapheme.copy_within(self.cursor.., 0);
         self.reader.cache.grapheme.truncate(remaining);
+        self.reader.cache.grapheme_start = self.next_start;
         self.cursor = 0;
     }
 
@@ -513,6 +554,7 @@ impl DocumentGraphemes<'_, '_> {
             .grapheme
             .extend_from_slice(&self.reader.cache.chunk);
         self.loaded_end = end;
+        self.reader.cache.grapheme_end = end;
         Ok(())
     }
 
@@ -1629,6 +1671,35 @@ mod tests {
                 assert_eq!(actual, expected, "{backend} window size {window_bytes}");
             }
         }
+    }
+
+    #[test]
+    fn nearby_grapheme_cursors_reuse_the_loaded_window() {
+        let document = Document::from_text(Path::new("cache.txt"), "abcdefgh".to_owned());
+        let mut cache = DocumentCache::with_window_bytes(4);
+        let mut reader = document.reader(&mut cache);
+
+        {
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("a")
+            );
+        }
+        assert_eq!(reader.cache.grapheme.as_slice(), b"abcd");
+        assert_eq!(reader.cache.grapheme_start, SourceOffset::ZERO);
+        assert_eq!(reader.cache.grapheme_end, SourceOffset::new(4));
+
+        {
+            let mut graphemes = reader.graphemes(SourceOffset::new(1)).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("b")
+            );
+        }
+        assert_eq!(reader.cache.grapheme.as_slice(), b"abcd");
+        assert_eq!(reader.cache.grapheme_start, SourceOffset::ZERO);
+        assert_eq!(reader.cache.grapheme_end, SourceOffset::new(4));
     }
 
     #[test]

@@ -290,6 +290,14 @@ impl LineIndex {
         self.scanned_to
     }
 
+    pub(super) const fn completed_last_line_start(&self) -> Option<SourceOffset> {
+        if self.finished {
+            Some(self.last_line_start)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn covers(&self, offset: SourceOffset) -> bool {
         self.scan_from(offset).is_some()
     }

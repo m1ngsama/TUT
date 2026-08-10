@@ -338,12 +338,8 @@ impl ViewportLayout {
         &self,
         reader: &mut DocumentReader<'_>,
         anchor: SourceOffset,
-        follow_end: bool,
     ) -> Result<SourceOffset, TutError> {
         self.require_matching_source(reader)?;
-        if follow_end {
-            return self.last_viewport_start(reader);
-        }
         let top = self.row_start_at_or_before(reader, anchor)?;
         self.clamp_to_last_viewport(reader, top)
     }
@@ -416,6 +412,7 @@ impl ViewportLayout {
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(super) fn last_viewport_start(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -746,7 +743,7 @@ mod tests {
         );
         assert_eq!(
             layout
-                .resolve_top(&mut reader, SourceOffset::new(7), false)
+                .resolve_top(&mut reader, SourceOffset::new(7))
                 .unwrap(),
             SourceOffset::new(4)
         );
