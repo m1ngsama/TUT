@@ -334,6 +334,7 @@ impl ViewportLayout {
         (self.document_id, self.width)
     }
 
+    #[cfg(test)]
     pub(super) fn project_visible_rows<S>(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -343,15 +344,28 @@ impl ViewportLayout {
     where
         S: ProjectedRowSink,
     {
+        let scanner = self.start_visible_scan(reader, start, sink)?;
+        let extent = complete_projected_scan(reader, scanner)?;
+        Ok((extent.rows, extent.boundary.end))
+    }
+
+    pub(super) fn start_visible_scan<S>(
+        &self,
+        reader: &DocumentReader<'_>,
+        start: SourceOffset,
+        sink: S,
+    ) -> Result<ProjectedRowsScanner<S>, TutError>
+    where
+        S: ProjectedRowSink,
+    {
         self.require_visible_start(reader, start)?;
-        let extent = scan_projected_rows(
+        ProjectedRowsScanner::new(
             reader,
             start,
             self.width,
             NonZeroUsize::new(usize::from(self.height.get())).expect("body heights are nonzero"),
             sink,
-        )?;
-        Ok((extent.rows, extent.boundary.end))
+        )
     }
 
     #[cfg(test)]
@@ -953,6 +967,7 @@ fn visual_row_boundary(
     .boundary)
 }
 
+#[cfg(test)]
 fn scan_projected_rows<S>(
     reader: &mut DocumentReader<'_>,
     start: SourceOffset,
@@ -963,7 +978,18 @@ fn scan_projected_rows<S>(
 where
     S: ProjectedRowSink,
 {
-    let mut scanner = ProjectedRowsScanner::new(reader, start, width, row_limit, sink)?;
+    let scanner = ProjectedRowsScanner::new(reader, start, width, row_limit, sink)?;
+    complete_projected_scan(reader, scanner)
+}
+
+#[cfg(test)]
+fn complete_projected_scan<S>(
+    reader: &mut DocumentReader<'_>,
+    mut scanner: ProjectedRowsScanner<S>,
+) -> Result<ProjectedRowsExtent, TutError>
+where
+    S: ProjectedRowSink,
+{
     loop {
         let mut meter = ProjectedScanMeter::standard();
         match scanner.advance(reader, &mut meter)? {
@@ -1463,6 +1489,46 @@ mod tests {
     }
 
     #[test]
+    fn visible_scan_factory_matches_synchronous_projection() {
+        let start = SourceOffset::new(100);
+        let mut fixture = Fixture::at("a bc\t終\r\nnext", start);
+        let layout = fixture.layout(4, 3);
+        let mut expected_rows = CollectedRows::default();
+        let expected = {
+            let mut reader = fixture.document.reader(&mut fixture.cache);
+            layout
+                .project_visible_rows(&mut reader, start, &mut expected_rows)
+                .unwrap()
+        };
+
+        let mut scanner = {
+            let reader = fixture.document.reader(&mut fixture.cache);
+            layout
+                .start_visible_scan(&reader, start, CollectedRows::default())
+                .unwrap()
+        };
+        let (actual, actual_rows) = loop {
+            let mut meter = ProjectedScanMeter::with_limits(1, 1);
+            let advance = {
+                let mut reader = fixture.document.reader(&mut fixture.cache);
+                scanner.advance(&mut reader, &mut meter).unwrap()
+            };
+            match advance {
+                ProjectedScanAdvance::Pending(pending) => scanner = pending,
+                ProjectedScanAdvance::Complete { result, sink } => break (result, sink),
+            }
+        };
+
+        assert_eq!((actual.rows, actual.end), expected);
+        assert_eq!(actual_rows.owned_rows(), expected_rows.owned_rows());
+        assert_eq!(actual_rows.text_rows(), ["a ", "bc  ", "終"]);
+        assert_eq!(
+            actual.next,
+            Some(start.checked_add("a bc\t終\r\n".len()).unwrap())
+        );
+    }
+
+    #[test]
     fn single_pass_rows_match_the_row_oracle_across_unicode_and_endings() {
         let samples = [
             "",
@@ -1617,6 +1683,29 @@ mod tests {
         );
         assert_eq!(steps, [(1, cluster_end.get()), (1, 1)]);
         assert_eq!(rows.text_rows(), [format!("{REPLACEMENT_CHARACTER}z")]);
+    }
+
+    #[test]
+    fn standard_byte_budget_stops_after_the_exact_boundary_atom() {
+        let mut text = String::from('a');
+        text.extend(std::iter::repeat_n('\u{301}', 32_767));
+        assert_eq!(text.len() as u64, PROJECTED_SCAN_BYTE_BUDGET - 1);
+        text.push_str("bc");
+        let mut fixture = Fixture::new(&text);
+        let layout = fixture.layout(16, 1);
+        let (result, rows, steps) = project_incrementally(
+            &mut fixture,
+            &layout,
+            SourceOffset::ZERO,
+            1,
+            PROJECTED_SCAN_ATOM_BUDGET,
+            PROJECTED_SCAN_BYTE_BUDGET,
+        );
+
+        assert_eq!(result.end, fixture.document.source().end());
+        assert_eq!(result.next, None);
+        assert_eq!(steps, [(2, PROJECTED_SCAN_BYTE_BUDGET), (1, 1)]);
+        assert_eq!(rows.text_rows(), [format!("{REPLACEMENT_CHARACTER}bc")]);
     }
 
     #[test]

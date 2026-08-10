@@ -95,14 +95,15 @@ impl Timing {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct SessionMetrics {
-    terminal_sessions: u64,
-    suspensions: u64,
+    terminal_sessions: u32,
+    suspensions: u32,
     events: u64,
     draw: Timing,
     action: Timing,
     background: Timing,
     line_steps: u64,
     viewport_steps: u64,
+    render_steps: u64,
     search_steps: u64,
     background_max_kind: Option<BackgroundWork>,
 }
@@ -122,6 +123,9 @@ impl SessionMetrics {
                     }
                     BackgroundWork::Viewport => {
                         self.viewport_steps = self.viewport_steps.saturating_add(1);
+                    }
+                    BackgroundWork::Render => {
+                        self.render_steps = self.render_steps.saturating_add(1);
                     }
                     BackgroundWork::Search => {
                         self.search_steps = self.search_steps.saturating_add(1);
@@ -294,6 +298,7 @@ impl ActiveObserver {
         let action_max_us = metrics.action.max_us;
         let line_steps = metrics.line_steps;
         let viewport_steps = metrics.viewport_steps;
+        let render_steps = metrics.render_steps;
         let search_steps = metrics.search_steps;
         let background_us = metrics.background.total_us;
         let background_max_us = metrics.background.max_us;
@@ -301,7 +306,7 @@ impl ActiveObserver {
             .background_max_kind
             .map_or("none", background_work_name);
         self.write_event(format_args!(
-            "runtime_summary frames={frames} events={events} actions={actions} draw_us={draw_us} draw_max_us={draw_max_us} action_us={action_us} action_max_us={action_max_us} line_steps={line_steps} viewport_steps={viewport_steps} search_steps={search_steps} background_us={background_us} background_max_us={background_max_us} background_max_kind={background_max_kind}\n"
+            "runtime_summary frames={frames} events={events} actions={actions} draw_us={draw_us} draw_max_us={draw_max_us} action_us={action_us} action_max_us={action_max_us} line_steps={line_steps} viewport_steps={viewport_steps} render_steps={render_steps} search_steps={search_steps} background_us={background_us} background_max_us={background_max_us} background_max_kind={background_max_kind}\n"
         ))
     }
 
@@ -357,6 +362,7 @@ const fn background_work_name(work: BackgroundWork) -> &'static str {
     match work {
         BackgroundWork::LineIndex => "line",
         BackgroundWork::Viewport => "viewport",
+        BackgroundWork::Render => "render",
         BackgroundWork::Search => "search",
     }
 }
@@ -447,7 +453,7 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("schema version=1\nsession_start input=stdin source_bytes=42\n"));
         assert!(text.contains(
-            "runtime_summary frames=1 events=2 actions=1 draw_us=11 draw_max_us=11 action_us=7 action_max_us=7 line_steps=1 viewport_steps=0 search_steps=1 background_us=14 background_max_us=9 background_max_kind=search\n"
+            "runtime_summary frames=1 events=2 actions=1 draw_us=11 draw_max_us=11 action_us=7 action_max_us=7 line_steps=1 viewport_steps=0 render_steps=0 search_steps=1 background_us=14 background_max_us=9 background_max_kind=search\n"
         ));
         assert!(text.contains("session_summary outcome=normal elapsed_us="));
         assert!(text.ends_with(" terminal_sessions=2 suspensions=1\n"));
@@ -581,11 +587,17 @@ mod tests {
             RuntimeOperation::Background(BackgroundWork::Search),
             Duration::from_micros(5),
         );
+        metrics.render_steps = u64::MAX;
+        metrics.record(
+            RuntimeOperation::Background(BackgroundWork::Render),
+            Duration::from_micros(4),
+        );
         assert_eq!(metrics.events, u64::MAX);
         assert_eq!(metrics.draw.calls, u64::MAX);
         assert_eq!(metrics.draw.total_us, u64::MAX);
         assert_eq!(metrics.draw.max_us, 1);
         assert_eq!(metrics.line_steps, u64::MAX);
+        assert_eq!(metrics.render_steps, u64::MAX);
         assert_eq!(metrics.background_max_kind, Some(BackgroundWork::LineIndex));
     }
 
@@ -597,8 +609,8 @@ mod tests {
         observer.start(InputKind::Path, u64::MAX, None).unwrap();
         let metrics = observer.runtime_metrics().unwrap();
         *metrics = SessionMetrics {
-            terminal_sessions: u64::MAX,
-            suspensions: u64::MAX,
+            terminal_sessions: u32::MAX,
+            suspensions: u32::MAX,
             events: u64::MAX,
             draw: Timing {
                 calls: u64::MAX,
@@ -617,6 +629,7 @@ mod tests {
             },
             line_steps: u64::MAX,
             viewport_steps: u64::MAX,
+            render_steps: u64::MAX,
             search_steps: u64::MAX,
             background_max_kind: Some(BackgroundWork::Viewport),
         };
@@ -631,7 +644,7 @@ mod tests {
         );
         let runtime = lines.next().unwrap();
         assert!(runtime.starts_with("runtime_summary "));
-        assert_eq!(runtime.len() + 1, 434);
+        assert_eq!(runtime.len() + 1, 468);
         assert!(runtime.is_ascii());
         assert!(lines.next().unwrap().starts_with("session_summary "));
         assert_eq!(lines.next(), None);

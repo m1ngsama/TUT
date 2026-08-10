@@ -7,8 +7,9 @@ use crate::{
     error::TutError,
     layout::{
         BodyHeight, ContentWidth, DOTTED_CIRCLE, DisplayColumn, DisplayProjection, GraphemeRange,
-        MAX_RENDER_GRAPHEME_BYTES, ProjectedAtom, ProjectedRowSink, REPLACEMENT_CHARACTER,
-        ViewportLayout, ensure_viewport_layout, progress_percent,
+        MAX_RENDER_GRAPHEME_BYTES, ProjectedAtom, ProjectedRowSink, ProjectedRowsScanner,
+        ProjectedScanAdvance, ProjectedScanMeter, REPLACEMENT_CHARACTER, ViewportLayout,
+        ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
     locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator},
@@ -99,6 +100,7 @@ pub(super) enum Outcome {
 pub(super) enum BackgroundWork {
     LineIndex,
     Viewport,
+    Render,
     Search,
 }
 
@@ -479,6 +481,30 @@ struct RenderViewportCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    geometry: Geometry,
+    anchor: SourceOffset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderAttempt {
+    Reused,
+    Fresh,
+}
+
+struct RenderJob {
+    key: RenderKey,
+    attempt: RenderAttempt,
+    scanner: ProjectedRowsScanner<RenderRowsBuilder>,
+}
+
+enum RenderBody {
+    Empty,
+    Cached(RenderViewportCache),
+    Scanning(RenderJob),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinePositionCacheKey {
     offset: SourceOffset,
     covered: bool,
@@ -573,7 +599,9 @@ pub(super) struct App {
     viewport_request: Option<ViewportRequest>,
     locator: Option<ViewportLocator>,
     row_neighborhood: RowNeighborhood,
-    render_cache: Option<RenderViewportCache>,
+    render_body: RenderBody,
+    #[cfg(test)]
+    render_limit: usize,
     line_position_cache: Option<CachedLinePosition>,
     queued_rows: i64,
     search_turn: bool,
@@ -601,7 +629,9 @@ impl App {
             viewport_request: None,
             locator: None,
             row_neighborhood: RowNeighborhood::default(),
-            render_cache: None,
+            render_body: RenderBody::Empty,
+            #[cfg(test)]
+            render_limit: MAX_VISIBLE_RENDER_BYTES,
             line_position_cache: None,
             queued_rows: 0,
             search_turn: true,
@@ -659,8 +689,45 @@ impl App {
         Ok(self.progress_for(viewport))
     }
 
+    const fn render_key(&self) -> RenderKey {
+        RenderKey {
+            geometry: self.geometry,
+            anchor: self.anchor,
+        }
+    }
+
+    fn render_cache(&self) -> Option<&RenderViewportCache> {
+        match &self.render_body {
+            RenderBody::Cached(cache) => Some(cache),
+            RenderBody::Empty | RenderBody::Scanning(_) => None,
+        }
+    }
+
+    fn current_render_cache(&self) -> Option<&RenderViewportCache> {
+        let key = self.render_key();
+        self.render_cache()
+            .filter(|cache| cache.geometry == key.geometry && cache.anchor == key.anchor)
+    }
+
+    pub(super) fn frame_ready(&self) -> bool {
+        !self.geometry.is_usable() || self.current_render_cache().is_some()
+    }
+
+    fn cancel_render_scan(&mut self) -> bool {
+        if matches!(self.render_body, RenderBody::Scanning(_)) {
+            self.render_body = RenderBody::Empty;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
-        let viewport = self.build_render_viewport()?;
+        debug_assert!(self.frame_ready());
+        let viewport = self.current_render_cache().map(|cache| cache.viewport);
+        if viewport.is_some() {
+            self.document.validate()?;
+        }
         self.prepare_search_highlights(viewport)?;
         let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
@@ -673,8 +740,7 @@ impl App {
             (&[][..], None)
         };
         let rows = self
-            .render_cache
-            .as_ref()
+            .current_render_cache()
             .map_or(&EMPTY_RENDER_ROWS, |cached| &cached.rows);
         Ok(RenderState {
             filename: self.document.display_name(),
@@ -701,14 +767,20 @@ impl App {
             }
             return Ok(());
         }
+        let key = self.render_key();
+        let rows = match &self.render_body {
+            RenderBody::Cached(cache)
+                if cache.geometry == key.geometry && cache.anchor == key.anchor =>
+            {
+                &cache.rows
+            }
+            RenderBody::Empty | RenderBody::Cached(_) | RenderBody::Scanning(_) => {
+                unreachable!("visible viewport retains rendered rows")
+            }
+        };
         let Some(search) = &mut self.search else {
             return Ok(());
         };
-        let rows = &self
-            .render_cache
-            .as_ref()
-            .expect("visible viewport retains rendered rows")
-            .rows;
         let targets = rows.spans.iter().map(|span| {
             SearchRange::new(span.source.start(), span.source.end())
                 .expect("render spans retain nonempty source ranges")
@@ -741,9 +813,11 @@ impl App {
     }
 
     fn background_schedule(&self) -> Option<BackgroundSchedule> {
-        let viewport_pending = matches!(self.mode, Mode::Reading)
-            && self.geometry.is_usable()
-            && self.viewport_request.is_some();
+        let viewport_pending = self.geometry.is_usable()
+            && self.viewport_request.is_some_and(|request| {
+                matches!(self.mode, Mode::Reading)
+                    || matches!(request, ViewportRequest::Reflow { .. })
+            });
         if viewport_pending {
             let request = self
                 .viewport_request
@@ -754,6 +828,13 @@ impl App {
                 } else {
                     BackgroundWork::LineIndex
                 },
+                next_search_turn: None,
+            });
+        }
+
+        if self.geometry.is_usable() && !self.frame_ready() {
+            return Some(BackgroundSchedule {
+                work: BackgroundWork::Render,
                 next_search_turn: None,
             });
         }
@@ -829,6 +910,7 @@ impl App {
         match schedule.work {
             BackgroundWork::LineIndex => self.advance_line_index(),
             BackgroundWork::Viewport => self.advance_viewport_locator(),
+            BackgroundWork::Render => self.advance_render(),
             BackgroundWork::Search => self.advance_search(),
         }
     }
@@ -872,6 +954,7 @@ impl App {
         request: ViewportRequest,
         located: LocatedViewport,
     ) -> bool {
+        self.cancel_render_scan();
         let old_anchor = self.anchor;
         let old_follow_end = self.follow_end;
         self.viewport_request = None;
@@ -987,6 +1070,7 @@ impl App {
         if !geometry_changed {
             return false;
         }
+        self.render_body = RenderBody::Empty;
         if let Some(search) = &mut self.search {
             search.invalidate_highlights();
         }
@@ -1031,6 +1115,7 @@ impl App {
         if downward && self.follow_end && self.viewport_request.is_none() {
             return canceled_search;
         }
+        let canceled_render = self.cancel_render_scan();
 
         let amount = i64::try_from(amount).expect("viewport row counts fit in i64");
         let delta = if downward { amount } else { -amount };
@@ -1042,15 +1127,20 @@ impl App {
         let canceled_viewport = self.cancel_viewport_request();
         self.queued_rows = delta;
         let scheduled = self.start_queued_move();
-        canceled_search || canceled_viewport || scheduled
+        canceled_render || canceled_search || canceled_viewport || scheduled
     }
 
     fn document_start(&mut self) -> bool {
         let source_start = self.document.source_start();
+        let anchor_changed = self.anchor != source_start;
+        let canceled_render = anchor_changed && self.cancel_render_scan();
         let canceled_viewport = self.cancel_viewport_request();
         let canceled_search = self.cancel_search_motion();
-        let changed =
-            canceled_viewport || canceled_search || self.anchor != source_start || self.follow_end;
+        let changed = canceled_render
+            || canceled_viewport
+            || canceled_search
+            || anchor_changed
+            || self.follow_end;
         self.anchor = source_start;
         self.anchor_is_row_start = true;
         self.follow_end = false;
@@ -1065,6 +1155,7 @@ impl App {
         if self.follow_end && self.viewport_request.is_none() {
             return canceled_search;
         }
+        self.cancel_render_scan();
         self.cancel_viewport_request();
         self.viewport_request = Some(ViewportRequest::End);
         self.follow_end = false;
@@ -1096,6 +1187,7 @@ impl App {
         } else {
             FollowEndPolicy::Never
         };
+        self.cancel_render_scan();
         self.viewport_request = Some(ViewportRequest::Move {
             target: self.anchor,
             delta: if downward {
@@ -1213,7 +1305,8 @@ impl App {
         let request = ViewportRequest::Search {
             target: selected.start(),
         };
-        let changed = self.viewport_request != Some(request) || self.follow_end;
+        let changed =
+            self.cancel_render_scan() || self.viewport_request != Some(request) || self.follow_end;
         self.viewport_request = Some(request);
         self.locator = None;
         self.queued_rows = 0;
@@ -1221,51 +1314,123 @@ impl App {
         changed
     }
 
-    fn build_render_viewport(&mut self) -> Result<Option<Viewport>, TutError> {
-        let Some(row_capacity) = self.geometry.body_height().map(BodyHeight::get) else {
-            self.render_cache = None;
-            return Ok(None);
-        };
-        if let Some(cached) = self
-            .render_cache
-            .as_ref()
-            .filter(|cached| cached.geometry == self.geometry && cached.anchor == self.anchor)
-        {
-            self.document.validate()?;
-            return Ok(Some(cached.viewport));
+    fn advance_render(&mut self) -> Result<bool, TutError> {
+        let key = self.render_key();
+        if self.current_render_cache().is_some() {
+            return Ok(false);
         }
-        let reusable_rows = self
-            .render_cache
-            .take()
-            .filter(|cached| cached.geometry == self.geometry)
-            .map(|cached| cached.rows);
-        let row_capacity = usize::from(row_capacity);
-        let rendered = project_render_rows(
-            &self.document,
-            &mut self.document_cache,
-            self.layout.as_ref().expect("viewport has a layout"),
-            self.anchor,
-            row_capacity,
-            reusable_rows,
-        )?;
-        let RenderedViewportRows {
-            rows,
-            visible_rows,
-            visible_end,
-        } = rendered;
-        debug_assert_eq!(rows.len(), visible_rows);
-        let viewport = Viewport {
-            visible_rows,
-            first_visible_start: self.anchor,
-            visible_end,
+
+        let previous = std::mem::replace(&mut self.render_body, RenderBody::Empty);
+        let job = match previous {
+            RenderBody::Scanning(job) if job.key == key => job,
+            RenderBody::Cached(cache) if cache.geometry == key.geometry => {
+                match RenderRowsBuilder::reuse_with_limit(
+                    cache.rows,
+                    self.render_row_capacity(),
+                    self.render_limit(),
+                ) {
+                    Ok(rows) => self.new_render_job(key, RenderAttempt::Reused, rows)?,
+                    Err(error) if retryable_reused_render_error(&error) => {
+                        let fresh = self.new_fresh_render_job(key)?;
+                        self.render_body = RenderBody::Scanning(fresh);
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            RenderBody::Empty | RenderBody::Cached(_) | RenderBody::Scanning(_) => {
+                self.new_fresh_render_job(key)?
+            }
         };
-        self.render_cache = Some(RenderViewportCache {
-            geometry: self.geometry,
-            anchor: self.anchor,
-            viewport,
-            rows,
-        });
-        Ok(Some(viewport))
+
+        let RenderJob {
+            key,
+            attempt,
+            scanner,
+        } = job;
+        let advance = {
+            let mut reader = self.document.reader(&mut self.document_cache);
+            let mut meter = ProjectedScanMeter::standard();
+            scanner.advance(&mut reader, &mut meter)
+        };
+        match advance {
+            Ok(ProjectedScanAdvance::Pending(scanner)) => {
+                self.render_body = RenderBody::Scanning(RenderJob {
+                    key,
+                    attempt,
+                    scanner,
+                });
+                Ok(false)
+            }
+            Ok(ProjectedScanAdvance::Complete { result, sink }) => {
+                self.document.validate()?;
+                let rows = sink.finish();
+                debug_assert_eq!(rows.len(), result.rows);
+                let viewport = Viewport {
+                    visible_rows: result.rows,
+                    first_visible_start: key.anchor,
+                    visible_end: result.end,
+                };
+                self.render_body = RenderBody::Cached(RenderViewportCache {
+                    geometry: key.geometry,
+                    anchor: key.anchor,
+                    viewport,
+                    rows,
+                });
+                Ok(true)
+            }
+            Err(error)
+                if attempt == RenderAttempt::Reused && retryable_reused_render_error(&error) =>
+            {
+                let fresh = self.new_fresh_render_job(key)?;
+                self.render_body = RenderBody::Scanning(fresh);
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn render_row_capacity(&self) -> usize {
+        usize::from(
+            self.geometry
+                .body_height()
+                .expect("render work requires usable geometry")
+                .get(),
+        )
+    }
+
+    #[cfg(not(test))]
+    const fn render_limit(&self) -> usize {
+        MAX_VISIBLE_RENDER_BYTES
+    }
+
+    #[cfg(test)]
+    const fn render_limit(&self) -> usize {
+        self.render_limit
+    }
+
+    fn new_fresh_render_job(&mut self, key: RenderKey) -> Result<RenderJob, TutError> {
+        let rows = RenderRowsBuilder::with_limit(self.render_row_capacity(), self.render_limit())?;
+        self.new_render_job(key, RenderAttempt::Fresh, rows)
+    }
+
+    fn new_render_job(
+        &mut self,
+        key: RenderKey,
+        attempt: RenderAttempt,
+        rows: RenderRowsBuilder,
+    ) -> Result<RenderJob, TutError> {
+        let reader = self.document.reader(&mut self.document_cache);
+        let scanner = self
+            .layout
+            .as_ref()
+            .expect("render work retains a viewport layout")
+            .start_visible_scan(&reader, key.anchor, rows)?;
+        Ok(RenderJob {
+            key,
+            attempt,
+            scanner,
+        })
     }
 }
 
@@ -1335,31 +1500,14 @@ struct RenderRowsBuilder {
     reserve_attempts: RenderReserveAttempts,
 }
 
+#[cfg(test)]
 struct RenderedViewportRows {
     rows: RenderRows,
     visible_rows: usize,
     visible_end: SourceOffset,
 }
 
-fn project_render_rows(
-    document: &Document,
-    cache: &mut DocumentCache,
-    layout: &ViewportLayout,
-    anchor: SourceOffset,
-    row_capacity: usize,
-    reusable: Option<RenderRows>,
-) -> Result<RenderedViewportRows, TutError> {
-    project_render_rows_with_limit(
-        document,
-        cache,
-        layout,
-        anchor,
-        row_capacity,
-        reusable,
-        MAX_VISIBLE_RENDER_BYTES,
-    )
-}
-
+#[cfg(test)]
 fn project_render_rows_with_limit(
     document: &Document,
     cache: &mut DocumentCache,
@@ -1385,6 +1533,7 @@ fn project_render_rows_with_limit(
     }
 }
 
+#[cfg(test)]
 fn project_render_rows_once(
     document: &Document,
     cache: &mut DocumentCache,
@@ -1402,6 +1551,7 @@ fn project_render_rows_once(
     })
 }
 
+#[cfg(test)]
 fn retry_reused_render<T>(
     error: TutError,
     fresh: impl FnOnce() -> Result<T, TutError>,
@@ -1741,6 +1891,7 @@ mod tests {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), text.to_owned());
         app.update(Action::Resize(Geometry::new(columns, rows)))
             .unwrap();
+        settle_frame(&mut app);
         app
     }
 
@@ -1790,6 +1941,26 @@ mod tests {
 
     fn settle(app: &mut App) {
         settle_count(app);
+    }
+
+    fn settle_frame(app: &mut App) {
+        for _ in 0..BACKGROUND_STEP_LIMIT {
+            if app.frame_ready() {
+                return;
+            }
+            app.advance_background().unwrap();
+        }
+        panic!("render work exceeded the test step limit");
+    }
+
+    fn settle_viewport(app: &mut App) {
+        for _ in 0..BACKGROUND_STEP_LIMIT {
+            if app.viewport_request.is_none() {
+                return;
+            }
+            app.advance_background().unwrap();
+        }
+        panic!("viewport work exceeded the test step limit");
     }
 
     fn settle_count(app: &mut App) -> (usize, usize) {
@@ -2112,7 +2283,7 @@ mod tests {
         app.document_cache.reset_metrics();
 
         app.update(Action::LineDown).unwrap();
-        settle(&mut app);
+        settle_viewport(&mut app);
 
         assert_eq!(app.anchor, anchor.checked_add(width).unwrap());
         let height = usize::from(app.geometry.body_height().unwrap().get());
@@ -2203,14 +2374,14 @@ mod tests {
 
         for _ in 0..100 {
             app.update(Action::LineDown).unwrap();
-            settle(&mut app);
+            settle_viewport(&mut app);
         }
         assert_eq!(app.anchor, initial.checked_add(width * 100).unwrap());
 
         app.document_cache.reset_metrics();
         for _ in 0..100 {
             app.update(Action::LineUp).unwrap();
-            settle(&mut app);
+            settle_viewport(&mut app);
         }
 
         assert_eq!(app.anchor, initial);
@@ -2343,11 +2514,13 @@ mod tests {
         ));
 
         app.update(Action::BeginSearch).unwrap();
-        assert!(!app.has_background_work());
+        assert!(app.has_background_work());
         assert!(matches!(
             app.viewport_request,
             Some(ViewportRequest::Reflow { .. })
         ));
+        settle_viewport(&mut app);
+        assert!(app.viewport_request.is_none());
         app.update(Action::SearchCancel).unwrap();
         settle(&mut app);
         assert_eq!(app.anchor, SourceOffset::new(65_520));
@@ -2815,6 +2988,93 @@ mod tests {
     }
 
     #[test]
+    fn asynchronous_reuse_failures_schedule_one_later_fresh_attempt() {
+        let mut app = reader(&"x".repeat(16), 16, 4);
+        let row_capacity = app.render_row_capacity();
+        let layout = app.layout.as_ref().unwrap();
+        let fresh = project_render_rows_with_limit(
+            &app.document,
+            &mut app.document_cache,
+            layout,
+            app.anchor,
+            row_capacity,
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        let fresh_storage = fresh.rows.storage();
+
+        let mut retained_text = String::new();
+        retained_text.try_reserve_exact(1024).unwrap();
+        let mut retained_rows = Vec::new();
+        retained_rows.try_reserve_exact(row_capacity).unwrap();
+        let reusable = RenderRows {
+            text: retained_text,
+            spans: Vec::new(),
+            rows: retained_rows,
+            reserve_attempts: RenderReserveAttempts::ZERO,
+        };
+        let reused_storage = reusable.storage();
+        let limit = reused_storage
+            .bytes()
+            .unwrap()
+            .max(fresh_storage.bytes().unwrap());
+        app.render_limit = limit;
+        app.render_body = RenderBody::Cached(RenderViewportCache {
+            geometry: app.geometry,
+            anchor: SourceOffset::new(1),
+            viewport: Viewport {
+                visible_rows: 1,
+                first_visible_start: SourceOffset::new(1),
+                visible_end: SourceOffset::new(1),
+            },
+            rows: reusable,
+        });
+
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+        assert!(!app.advance_background().unwrap());
+        assert!(matches!(
+            app.render_body,
+            RenderBody::Scanning(RenderJob {
+                attempt: RenderAttempt::Fresh,
+                ..
+            })
+        ));
+        assert!(!app.frame_ready());
+
+        assert!(app.advance_background().unwrap());
+        let cached = app.current_render_cache().unwrap();
+        assert_eq!(cached.rows, fresh.rows);
+        assert_eq!(cached.viewport.visible_rows, fresh.visible_rows);
+        assert_eq!(cached.viewport.visible_end, fresh.visible_end);
+    }
+
+    #[test]
+    fn asynchronous_fresh_failures_do_not_schedule_a_third_attempt() {
+        let mut app = reader("x", 16, 4);
+        app.render_limit = std::mem::size_of::<RenderRowRange>();
+        match &mut app.render_body {
+            RenderBody::Cached(cache) => cache.anchor = SourceOffset::new(1),
+            RenderBody::Empty | RenderBody::Scanning(_) => panic!("test starts with cached rows"),
+        }
+
+        assert!(!app.advance_background().unwrap());
+        assert!(matches!(
+            app.render_body,
+            RenderBody::Scanning(RenderJob {
+                attempt: RenderAttempt::Fresh,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            app.advance_background(),
+            Err(TutError::VisibleRenderTooLarge { .. })
+        ));
+        assert!(matches!(app.render_body, RenderBody::Empty));
+    }
+
+    #[test]
     fn fresh_render_failures_are_returned_without_another_retry() {
         let mut fresh_attempts = 0;
         let error: Result<(), TutError> =
@@ -3012,7 +3272,9 @@ mod tests {
     fn rendering_segments_each_visible_grapheme_once() {
         let mut app = reader("a\nb\nc\nd\ne\noutside\n", 16, 8);
         app.document_cache = DocumentCache::default();
+        app.render_body = RenderBody::Empty;
         app.document_cache.reset_metrics();
+        settle_frame(&mut app);
 
         {
             let state = app.render_state().unwrap();
@@ -3026,10 +3288,216 @@ mod tests {
     }
 
     #[test]
+    fn render_jobs_publish_only_complete_frames_after_bounded_atom_steps() {
+        let mut app = app_from_text(Path::new("bounded-render.txt"), "x".repeat(4096));
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+
+        let mut steps = 0;
+        while !app.frame_ready() {
+            app.document_cache.reset_metrics();
+            assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+            let changed = app.advance_background().unwrap();
+            steps += 1;
+            assert!(app.document_cache.metrics().grapheme_emissions() <= 1024);
+            assert!(
+                app.document_cache
+                    .metrics()
+                    .grapheme_window_returned_bytes()
+                    <= SOURCE_WINDOW_BYTES + 4
+            );
+            if !changed {
+                assert!(app.render_cache().is_none());
+                assert!(matches!(app.render_body, RenderBody::Scanning(_)));
+            }
+        }
+
+        assert_eq!(steps, 5);
+        let state = app.render_state().unwrap();
+        assert_eq!(state.rows.len(), 1);
+        assert_eq!(state.rows.get(0).unwrap().text.len(), 4096);
+    }
+
+    #[test]
+    fn asynchronous_frames_match_synchronous_unicode_projection() {
+        let cases = [
+            (
+                "\u{feff}\talpha\r\n界🙂\u{200d}↔\u{fe0f}🙂 e\u{301}\n",
+                16,
+                8,
+            ),
+            ("a b\tc\n\n中🙂\rfinal", 17, 7),
+        ];
+
+        for (text, columns, rows) in cases {
+            let mut app = app_from_text(Path::new("unicode-render.txt"), text.to_owned());
+            app.update(Action::Resize(Geometry::new(columns, rows)))
+                .unwrap();
+            let anchor = app.anchor;
+            let row_capacity = app.render_row_capacity();
+            let expected = project_render_rows_with_limit(
+                &app.document,
+                &mut app.document_cache,
+                app.layout.as_ref().unwrap(),
+                anchor,
+                row_capacity,
+                None,
+                MAX_VISIBLE_RENDER_BYTES,
+            )
+            .unwrap();
+
+            settle_frame(&mut app);
+
+            let actual = app.current_render_cache().unwrap();
+            assert_eq!(actual.rows, expected.rows);
+            assert_eq!(actual.viewport.first_visible_start, anchor);
+            assert_eq!(actual.viewport.visible_rows, expected.visible_rows);
+            assert_eq!(actual.viewport.visible_end, expected.visible_end);
+        }
+    }
+
+    #[test]
+    fn maximum_graphemes_require_independent_bounded_render_steps() {
+        const CLUSTERS: usize = 32;
+        let cluster_bytes = usize::try_from(crate::document::MAX_FILE_BYTES).unwrap() / CLUSTERS;
+        let mut cluster = String::from('é');
+        cluster.extend(std::iter::repeat_n(
+            '\u{301}',
+            (cluster_bytes - 'é'.len_utf8()) / '\u{301}'.len_utf8(),
+        ));
+        assert_eq!(cluster.len(), cluster_bytes);
+        let text = cluster.repeat(CLUSTERS);
+        assert_eq!(
+            text.len(),
+            usize::try_from(crate::document::MAX_FILE_BYTES).unwrap()
+        );
+        let mut app = app_from_text(Path::new("oversized-render.txt"), text);
+        app.update(Action::Resize(Geometry::new(32, 4))).unwrap();
+
+        let mut steps = 0;
+        let mut emissions = 0;
+        let mut segmented_bytes = 0;
+        while !app.frame_ready() {
+            app.document_cache.reset_metrics();
+            let changed = app.advance_background().unwrap();
+            steps += 1;
+            let metrics = app.document_cache.metrics();
+            let step_emissions = metrics.grapheme_emissions();
+            emissions += step_emissions;
+            segmented_bytes += metrics.segmentation_advanced_bytes();
+            assert!(step_emissions <= 1);
+            assert!(
+                metrics.grapheme_window_returned_bytes() <= cluster_bytes + SOURCE_WINDOW_BYTES + 4
+            );
+            if !changed {
+                assert!(app.render_cache().is_none());
+            }
+        }
+
+        assert!(steps >= CLUSTERS);
+        assert_eq!(emissions, CLUSTERS);
+        assert_eq!(segmented_bytes, crate::document::MAX_FILE_BYTES as usize);
+        let row = app.render_state().unwrap().rows.get(0).unwrap();
+        assert_eq!(row.spans.len(), CLUSTERS);
+        assert_eq!(row.text, REPLACEMENT_CHARACTER.repeat(CLUSTERS));
+    }
+
+    #[test]
+    fn navigation_and_resize_discard_pending_render_jobs() {
+        let text = "x".repeat(4096);
+        let mut moved = app_from_text(Path::new("move-render.txt"), text.clone());
+        moved
+            .update(Action::Resize(Geometry::new(4096, 4)))
+            .unwrap();
+        assert!(!moved.advance_background().unwrap());
+        assert!(matches!(moved.render_body, RenderBody::Scanning(_)));
+
+        moved.update(Action::LineDown).unwrap();
+        assert!(matches!(moved.render_body, RenderBody::Empty));
+        assert!(moved.viewport_request.is_some());
+
+        let mut resized = app_from_text(Path::new("resize-render.txt"), text.clone());
+        resized
+            .update(Action::Resize(Geometry::new(4096, 4)))
+            .unwrap();
+        assert!(!resized.advance_background().unwrap());
+        resized
+            .update(Action::Resize(Geometry::new(2048, 4)))
+            .unwrap();
+        assert!(matches!(resized.render_body, RenderBody::Empty));
+        assert_eq!(resized.background_work(), Some(BackgroundWork::Render));
+
+        let mut ended = app_from_text(Path::new("end-render.txt"), text.clone());
+        ended
+            .update(Action::Resize(Geometry::new(4096, 4)))
+            .unwrap();
+        assert!(!ended.advance_background().unwrap());
+        ended.update(Action::DocumentEnd).unwrap();
+        assert!(matches!(ended.render_body, RenderBody::Empty));
+        assert_eq!(ended.viewport_request, Some(ViewportRequest::End));
+
+        let mut jumped = app_from_text(Path::new("search-jump-render.txt"), text);
+        jumped
+            .update(Action::Resize(Geometry::new(4096, 4)))
+            .unwrap();
+        assert!(!jumped.advance_background().unwrap());
+        assert!(jumped.schedule_search_jump(
+            SearchRange::new(SourceOffset::new(32), SourceOffset::new(33)).unwrap()
+        ));
+        assert!(matches!(jumped.render_body, RenderBody::Empty));
+        assert_eq!(
+            jumped.viewport_request,
+            Some(ViewportRequest::Search {
+                target: SourceOffset::new(32)
+            })
+        );
+    }
+
+    #[test]
+    fn search_drafts_preserve_pending_render_jobs_for_the_same_frame() {
+        let mut app = app_from_text(Path::new("search-render.txt"), "x".repeat(4096));
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+        assert!(!app.advance_background().unwrap());
+        let key = match &app.render_body {
+            RenderBody::Scanning(job) => job.key,
+            RenderBody::Empty | RenderBody::Cached(_) => panic!("render job is pending"),
+        };
+
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchInsert('q')).unwrap();
+
+        assert!(matches!(app.mode, Mode::SearchInput { .. }));
+        assert!(matches!(
+            &app.render_body,
+            RenderBody::Scanning(job) if job.key == key
+        ));
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+    }
+
+    #[test]
+    fn document_start_preserves_a_pending_frame_at_the_same_anchor() {
+        let mut app = app_from_text(Path::new("start-render.txt"), "x".repeat(4096));
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+        assert!(!app.advance_background().unwrap());
+
+        assert_eq!(
+            app.update(Action::DocumentStart).unwrap(),
+            Outcome::Unchanged
+        );
+        assert!(matches!(app.render_body, RenderBody::Scanning(_)));
+
+        let mut remaining = 0;
+        while !app.frame_ready() {
+            app.advance_background().unwrap();
+            remaining += 1;
+        }
+        assert_eq!(remaining, 4);
+    }
+
+    #[test]
     fn repeated_rendering_reuses_the_unchanged_visible_body() {
         let mut app = reader("a\nb\nc\nd\ne\noutside\n", 16, 8);
         let first = app.render_state().unwrap().rows.storage_identity();
-        let cached = app.render_cache.as_ref().unwrap().rows.storage_identity();
+        let cached = app.render_cache().unwrap().rows.storage_identity();
         assert_eq!(first, cached);
         app.document_cache.reset_metrics();
 
@@ -3044,7 +3512,7 @@ mod tests {
     fn moved_viewports_reuse_render_storage_without_reserving() {
         let mut app = reader(&"x".repeat(1024), 16, 7);
         app.render_state().unwrap();
-        let first = app.render_cache.as_ref().unwrap();
+        let first = app.render_cache().unwrap();
         let (_, first_text, first_spans, first_rows) = first.rows.storage_identity();
         let first_storage = first.rows.storage();
         let first_anchor = app.anchor;
@@ -3057,7 +3525,7 @@ mod tests {
         assert_ne!(app.anchor, first_anchor);
         app.render_state().unwrap();
 
-        let second = app.render_cache.as_ref().unwrap();
+        let second = app.render_cache().unwrap();
         let (_, second_text, second_spans, second_rows) = second.rows.storage_identity();
         assert_eq!(
             (second_text, second_spans, second_rows),
@@ -3072,13 +3540,13 @@ mod tests {
         let cluster = "\u{301}".repeat(512);
         let mut app = reader(&format!("a\n{cluster}\n"), 16, 4);
         app.render_state().unwrap();
-        let first_storage = app.render_cache.as_ref().unwrap().rows.storage();
+        let first_storage = app.render_cache().unwrap().rows.storage();
 
         app.update(Action::LineDown).unwrap();
         settle(&mut app);
         app.render_state().unwrap();
 
-        let rows = &app.render_cache.as_ref().unwrap().rows;
+        let rows = &app.render_cache().unwrap().rows;
         assert!(rows.storage().text > first_storage.text);
         assert!(rows.reserve_attempts().text > 0);
         assert!(rows.storage().bytes().unwrap() <= MAX_VISIBLE_RENDER_BYTES);
@@ -3088,13 +3556,13 @@ mod tests {
     fn geometry_changes_discard_render_storage() {
         let mut app = reader(&"x".repeat(4096), 127, 7);
         app.render_state().unwrap();
-        let first_storage = app.render_cache.as_ref().unwrap().rows.storage();
+        let first_storage = app.render_cache().unwrap().rows.storage();
 
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
         settle(&mut app);
         app.render_state().unwrap();
 
-        let rows = &app.render_cache.as_ref().unwrap().rows;
+        let rows = &app.render_cache().unwrap().rows;
         assert_eq!(rows.reserve_attempts().rows, 1);
         assert!(rows.storage().bytes().unwrap() < first_storage.bytes().unwrap());
         assert!(rows.storage().bytes().unwrap() <= MAX_VISIBLE_RENDER_BYTES);
@@ -3154,7 +3622,9 @@ mod tests {
     fn rendering_reads_one_grapheme_frontier_and_retains_atom_boundaries() {
         let mut app = reader(&"x".repeat(1024), 127, 4);
         app.document_cache = DocumentCache::with_window_bytes(128);
+        app.render_body = RenderBody::Empty;
         app.document_cache.reset_metrics();
+        settle_frame(&mut app);
 
         {
             let state = app.render_state().unwrap();
@@ -3235,11 +3705,29 @@ mod tests {
         fs::write(&path, "first").unwrap();
         let mut app = App::new(crate::document::load(path.clone()).unwrap());
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle_frame(&mut app);
         app.render_state().unwrap();
 
         fs::write(&path, "other").unwrap();
 
         assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+    }
+
+    #[test]
+    fn pending_file_rendering_rejects_changes_before_publishing_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-pending-render.txt");
+        fs::write(&path, "x".repeat(4096)).unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+
+        assert!(!app.advance_background().unwrap());
+        assert!(matches!(app.render_body, RenderBody::Scanning(_)));
+        fs::write(path, "y".repeat(4096)).unwrap();
+
+        assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
+        assert!(matches!(app.render_body, RenderBody::Empty));
+        assert!(!app.frame_ready());
     }
 
     #[test]
@@ -3249,14 +3737,15 @@ mod tests {
         fs::write(&path, "x".repeat(128)).unwrap();
         let mut app = App::new(crate::document::load(path.clone()).unwrap());
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle_frame(&mut app);
         app.render_state().unwrap();
 
         app.update(Action::LineDown).unwrap();
-        settle(&mut app);
+        settle_viewport(&mut app);
         fs::write(path, "y".repeat(128)).unwrap();
 
-        assert!(matches!(app.render_state(), Err(TutError::Load(_))));
-        assert!(app.render_cache.is_none());
+        assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
+        assert!(app.render_cache().is_none());
     }
 
     #[test]
@@ -3266,10 +3755,11 @@ mod tests {
         fs::write(&path, "first\nsecond").unwrap();
         let mut app = App::new(crate::document::load(path.clone()).unwrap());
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle_frame(&mut app);
         let viewport = {
             let state = app.render_state().unwrap();
             assert_eq!(state.current_line, Some(1));
-            app.render_cache.as_ref().unwrap().viewport
+            app.render_cache().unwrap().viewport
         };
         app.document_cache.reset_metrics();
 
@@ -3483,6 +3973,7 @@ mod tests {
         fs::write(&path, text).unwrap();
         let mut app = App::new(crate::document::load(path).unwrap());
         app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+        settle_frame(&mut app);
         submit(&mut app, "needle");
         let first_frontier = SourceOffset::from_usize(SOURCE_WINDOW_BYTES);
 
@@ -3514,6 +4005,7 @@ mod tests {
         fs::write(&path, text).unwrap();
         let mut app = App::new(crate::document::load(path).unwrap());
         app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+        settle_frame(&mut app);
 
         let initial = app.render_state().unwrap();
         assert_eq!((initial.current_line, initial.total_lines), (Some(1), None));
