@@ -40,7 +40,8 @@ install-strip: install
 	$(STRIP) "$(DESTDIR)$(bindir)/tut"
 
 installcheck:
-	"$(DESTDIR)$(bindir)/tut" --version >/dev/null
+	test "$$("$(DESTDIR)$(bindir)/tut" --version | sed -n '1p')" = "tut (TUT) $(PACKAGE_VERSION)"
+	"$(DESTDIR)$(bindir)/tut" --help >/dev/null
 
 uninstall:
 	$(RM) "$(DESTDIR)$(bindir)/tut"
