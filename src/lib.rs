@@ -16,6 +16,7 @@ mod layout;
 mod line_index;
 mod locator;
 mod observer;
+mod path_binding;
 mod search;
 mod source;
 mod tui;
@@ -118,7 +119,7 @@ fn run_document(
         return Ok(RunResult::Completed(RunOutcome::Signal(signal)));
     }
     let start = observer
-        .start(input, document.content_len(), document.file_identity())
+        .start(input, document.content_len(), document.input_identity())
         .map_err(TutError::from);
     if let Some(signal) = handlers.state().received() {
         let logging = match start {
