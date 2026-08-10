@@ -7,8 +7,8 @@ use crate::{
     error::TutError,
     layout::{
         BodyHeight, ContentWidth, DOTTED_CIRCLE, DisplayColumn, DisplayProjection, GraphemeRange,
-        ProjectedAtom, ProjectedRowSink, REPLACEMENT_CHARACTER, ViewportLayout,
-        ensure_viewport_layout, progress_percent,
+        MAX_RENDER_GRAPHEME_BYTES, ProjectedAtom, ProjectedRowSink, REPLACEMENT_CHARACTER,
+        ViewportLayout, ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
     locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator},
@@ -24,6 +24,8 @@ pub(super) const MIN_TERMINAL_ROWS: u16 = 4;
 pub(super) const SEARCH_DRAFT_LIMIT_BYTES: usize = MAX_SEARCH_QUERY_BYTES;
 const CHROME_ROWS: u16 = 3;
 const MAX_VISIBLE_RENDER_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TRANSIENT_RENDER_TEXT_BYTES: usize =
+    (u16::MAX as usize + 1) * (MAX_RENDER_GRAPHEME_BYTES + DOTTED_CIRCLE.len());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Geometry {
@@ -138,10 +140,36 @@ pub(super) enum RenderProjectionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenderSpan {
-    text: Range<usize>,
+    text: RenderTextRange,
     source: GraphemeRange,
     pub projection: RenderProjectionKind,
     pub cell_width: DisplayColumn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderTextRange {
+    start: u32,
+    end: u32,
+}
+
+impl RenderTextRange {
+    fn new(start: usize, end: usize) -> Self {
+        debug_assert!(start <= end && end <= MAX_TRANSIENT_RENDER_TEXT_BYTES);
+        Self {
+            start: start as u32,
+            end: end as u32,
+        }
+    }
+
+    fn as_usize(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+
+    fn shift_left(&mut self, base: u32) {
+        debug_assert!(base <= self.start && base <= self.end);
+        self.start -= base;
+        self.end -= base;
+    }
 }
 
 impl RenderSpan {
@@ -160,7 +188,7 @@ impl RenderSpan {
     }
 
     pub(super) fn text<'a>(&self, row: &'a str) -> &'a str {
-        row.get(self.text.clone())
+        row.get(self.text.as_usize())
             .expect("render spans retain valid row-text boundaries")
     }
 
@@ -263,7 +291,7 @@ impl<'a> PendingRenderSpan<'a> {
         let start = output.len();
         self.text.append_to(output);
         RenderSpan {
-            text: start..output.len(),
+            text: RenderTextRange::new(start, output.len()),
             source: self.source,
             projection: self.projection,
             cell_width: self.cell_width,
@@ -1386,9 +1414,10 @@ impl ProjectedRowSink for RenderRowsBuilder {
             self.text.truncate(through.text);
             self.spans.truncate(through.spans);
         }
+        debug_assert!(self.row_start.text <= MAX_TRANSIENT_RENDER_TEXT_BYTES);
+        let row_text_start = self.row_start.text as u32;
         for span in &mut self.spans[self.row_start.spans..through.spans] {
-            span.text.start -= self.row_start.text;
-            span.text.end -= self.row_start.text;
+            span.text.shift_left(row_text_start);
         }
         self.rows.push(RenderRowRange {
             text: self.row_start.text..through.text,
@@ -2534,6 +2563,12 @@ mod tests {
             rows.iter().map(|row| row.text).collect::<Vec<_>>(),
             vec!["a", "b"]
         );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.spans[0].text(row.text))
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 
     #[test]
@@ -2578,6 +2613,10 @@ mod tests {
             rows: cells / usize::from(MIN_TERMINAL_COLUMNS),
         };
 
+        assert_eq!(size_of::<RenderSpan>(), 32);
+        assert!(MAX_VISIBLE_RENDER_BYTES <= u32::MAX as usize);
+        assert!(MAX_TRANSIENT_RENDER_TEXT_BYTES <= u32::MAX as usize);
+        assert_eq!(estimate.bytes(), Some(24 * 1024 * 1024 - 1));
         assert!(estimate.bytes().unwrap() < MAX_VISIBLE_RENDER_BYTES);
         assert!(estimate.require(MAX_VISIBLE_RENDER_BYTES).is_ok());
     }

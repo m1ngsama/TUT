@@ -14,7 +14,7 @@ use crate::{
 
 pub(super) const REPLACEMENT_CHARACTER: &str = "\u{fffd}";
 pub(super) const DOTTED_CIRCLE: &str = "\u{25cc}";
-const MAX_RENDER_GRAPHEME_BYTES: usize = 1024;
+pub(super) const MAX_RENDER_GRAPHEME_BYTES: usize = 1024;
 const TAB_STOP: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
