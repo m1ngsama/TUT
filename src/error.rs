@@ -111,6 +111,9 @@ pub enum TutError {
         rows: u16,
         cell_limit: u64,
     },
+    VisibleRenderTooLarge {
+        limit: usize,
+    },
     Layout(LayoutError),
     Search(SearchError),
     Log(LogError),
@@ -181,6 +184,9 @@ impl TutError {
                 rows,
                 cell_limit,
             } => format!("terminal size {columns}x{rows} exceeds the {cell_limit}-cell limit"),
+            Self::VisibleRenderTooLarge { limit } => {
+                format!("visible rendered content exceeds the {limit}-byte limit")
+            }
             Self::Layout(LayoutError::DocumentMismatch) => {
                 "layout state belongs to another document".to_owned()
             }
@@ -455,6 +461,16 @@ mod tests {
         );
         assert_eq!(terminal.exit_code(), 1);
         assert!(!terminal.show_usage());
+
+        let render = TutError::VisibleRenderTooLarge {
+            limit: 32 * 1024 * 1024,
+        };
+        assert_eq!(
+            render.message(),
+            "visible rendered content exceeds the 33554432-byte limit"
+        );
+        assert_eq!(render.exit_code(), 1);
+        assert!(!render.show_usage());
 
         let log = TutError::Log(LogError::InputConflict(PathBuf::from("bad\n.log")));
         assert_eq!(

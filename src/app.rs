@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{mem::size_of, ops::Range};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -23,6 +23,7 @@ pub(super) const MIN_TERMINAL_COLUMNS: u16 = 16;
 pub(super) const MIN_TERMINAL_ROWS: u16 = 4;
 pub(super) const SEARCH_DRAFT_LIMIT_BYTES: usize = MAX_SEARCH_QUERY_BYTES;
 const CHROME_ROWS: u16 = 3;
+const MAX_VISIBLE_RENDER_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Geometry {
@@ -146,48 +147,14 @@ impl RenderSpan {
         atom: ProjectedAtom<'_>,
         output: &mut String,
     ) -> Result<Self, TutError> {
-        let cell_width = atom.width();
-        let start = output.len();
-        let projection = match atom.projection() {
-            DisplayProjection::Text(text) => {
-                append_render_text(output, text)?;
-                RenderProjectionKind::Text
-            }
-            DisplayProjection::Spaces(count) => {
-                let text = match count {
-                    1 => " ",
-                    2 => "  ",
-                    3 => "   ",
-                    4 => "    ",
-                    _ => unreachable!("tab expansion is one through four cells"),
-                };
-                append_render_text(output, text)?;
-                RenderProjectionKind::Spaces
-            }
-            DisplayProjection::Replacement => {
-                append_render_text(output, REPLACEMENT_CHARACTER)?;
-                RenderProjectionKind::Replacement
-            }
-            DisplayProjection::DottedCircle(source) => {
-                let additional = DOTTED_CIRCLE
-                    .len()
-                    .checked_add(source.len())
-                    .ok_or(TutError::Allocation("zero-width render atom"))?;
-                output
-                    .try_reserve(additional)
-                    .map_err(|_| TutError::Allocation("zero-width render atom"))?;
-                output.push_str(DOTTED_CIRCLE);
-                output.push_str(source);
-                RenderProjectionKind::DottedCircle
-            }
-        };
-
-        Ok(Self {
-            text: start..output.len(),
-            source: atom.source(),
-            projection,
-            cell_width,
-        })
+        let pending = PendingRenderSpan::new(atom);
+        let additional = pending
+            .text_len()
+            .ok_or(TutError::Allocation("visible row text"))?;
+        output
+            .try_reserve(additional)
+            .map_err(|_| TutError::Allocation("visible row text"))?;
+        Ok(pending.append_to(output))
     }
 
     pub(super) fn text<'a>(&self, row: &'a str) -> &'a str {
@@ -217,12 +184,89 @@ impl RenderSpan {
     }
 }
 
-fn append_render_text(output: &mut String, text: &str) -> Result<(), TutError> {
-    output
-        .try_reserve(text.len())
-        .map_err(|_| TutError::Allocation("visible row text"))?;
-    output.push_str(text);
-    Ok(())
+#[derive(Debug, Clone, Copy)]
+enum PendingRenderText<'a> {
+    Single(&'a str),
+    DottedCircle(&'a str),
+}
+
+impl PendingRenderText<'_> {
+    fn len(self) -> Option<usize> {
+        match self {
+            Self::Single(text) => Some(text.len()),
+            Self::DottedCircle(source) => DOTTED_CIRCLE.len().checked_add(source.len()),
+        }
+    }
+
+    fn append_to(self, output: &mut String) {
+        match self {
+            Self::Single(text) => output.push_str(text),
+            Self::DottedCircle(source) => {
+                output.push_str(DOTTED_CIRCLE);
+                output.push_str(source);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingRenderSpan<'a> {
+    source: GraphemeRange,
+    projection: RenderProjectionKind,
+    cell_width: DisplayColumn,
+    text: PendingRenderText<'a>,
+}
+
+impl<'a> PendingRenderSpan<'a> {
+    fn new(atom: ProjectedAtom<'a>) -> Self {
+        let (projection, text) = match atom.projection() {
+            DisplayProjection::Text(text) => {
+                (RenderProjectionKind::Text, PendingRenderText::Single(text))
+            }
+            DisplayProjection::Spaces(count) => {
+                let text = match count {
+                    1 => " ",
+                    2 => "  ",
+                    3 => "   ",
+                    4 => "    ",
+                    _ => unreachable!("tab expansion is one through four cells"),
+                };
+                (
+                    RenderProjectionKind::Spaces,
+                    PendingRenderText::Single(text),
+                )
+            }
+            DisplayProjection::Replacement => (
+                RenderProjectionKind::Replacement,
+                PendingRenderText::Single(REPLACEMENT_CHARACTER),
+            ),
+            DisplayProjection::DottedCircle(source) => (
+                RenderProjectionKind::DottedCircle,
+                PendingRenderText::DottedCircle(source),
+            ),
+        };
+        Self {
+            source: atom.source(),
+            projection,
+            cell_width: atom.width(),
+            text,
+        }
+    }
+
+    fn text_len(self) -> Option<usize> {
+        self.text.len()
+    }
+
+    fn append_to(self, output: &mut String) -> RenderSpan {
+        let start = output.len();
+        self.text.append_to(output);
+        RenderSpan {
+            text: start..output.len(),
+            source: self.source,
+            projection: self.projection,
+            cell_width: self.cell_width,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1100,10 +1144,43 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenderRowsCheckpoint {
     text: usize,
     spans: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderStorage {
+    text: usize,
+    spans: usize,
+    rows: usize,
+}
+
+impl RenderStorage {
+    fn bytes(self) -> Option<usize> {
+        let spans = self.spans.checked_mul(size_of::<RenderSpan>())?;
+        let rows = self.rows.checked_mul(size_of::<RenderRowRange>())?;
+        self.text.checked_add(spans)?.checked_add(rows)
+    }
+
+    fn require(self, limit: usize) -> Result<Self, TutError> {
+        match self.bytes() {
+            Some(bytes) if bytes <= limit => Ok(self),
+            Some(_) | None => Err(TutError::VisibleRenderTooLarge { limit }),
+        }
+    }
+}
+
+fn planned_render_capacity(length: usize, capacity: usize, additional: usize) -> Option<usize> {
+    let required = length.checked_add(additional)?;
+    if required <= capacity {
+        return Some(capacity);
+    }
+    if capacity == 0 {
+        return Some(required);
+    }
+    Some(required.max(capacity.checked_mul(2)?))
 }
 
 struct RenderRowsBuilder {
@@ -1111,29 +1188,119 @@ struct RenderRowsBuilder {
     spans: Vec<RenderSpan>,
     rows: Vec<RenderRowRange>,
     row_start: RenderRowsCheckpoint,
+    limit: usize,
 }
 
 impl RenderRowsBuilder {
     fn new(row_capacity: usize) -> Result<Self, TutError> {
+        Self::with_limit(row_capacity, MAX_VISIBLE_RENDER_BYTES)
+    }
+
+    fn with_limit(row_capacity: usize, limit: usize) -> Result<Self, TutError> {
+        RenderStorage {
+            text: 0,
+            spans: 0,
+            rows: row_capacity,
+        }
+        .require(limit)?;
         let mut rows = Vec::new();
         rows.try_reserve_exact(row_capacity)
             .map_err(|_| TutError::Allocation("visible rows"))?;
-        Ok(Self {
+        let builder = Self {
             text: String::new(),
             spans: Vec::new(),
             rows,
             row_start: RenderRowsCheckpoint { text: 0, spans: 0 },
-        })
+            limit,
+        };
+        builder.storage().require(limit)?;
+        Ok(builder)
     }
 
     fn finish(self) -> RenderRows {
         debug_assert_eq!(self.row_start.text, self.text.len());
         debug_assert_eq!(self.row_start.spans, self.spans.len());
+        debug_assert!(self.storage().require(self.limit).is_ok());
         RenderRows {
             text: self.text,
             spans: self.spans,
             rows: self.rows,
         }
+    }
+
+    fn storage(&self) -> RenderStorage {
+        RenderStorage {
+            text: self.text.capacity(),
+            spans: self.spans.capacity(),
+            rows: self.rows.capacity(),
+        }
+    }
+
+    fn planned_storage(
+        &self,
+        text: usize,
+        spans: usize,
+        rows: usize,
+    ) -> Result<RenderStorage, TutError> {
+        let planned = RenderStorage {
+            text: planned_render_capacity(self.text.len(), self.text.capacity(), text)
+                .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?,
+            spans: planned_render_capacity(self.spans.len(), self.spans.capacity(), spans)
+                .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?,
+            rows: planned_render_capacity(self.rows.len(), self.rows.capacity(), rows)
+                .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?,
+        };
+        planned.require(self.limit)
+    }
+
+    fn require_storage(&self, storage: RenderStorage) -> Result<(), TutError> {
+        storage.require(self.limit).map(|_| ())
+    }
+
+    fn reserve_to(&mut self, planned: RenderStorage) -> Result<(), TutError> {
+        if planned.text > self.text.capacity() {
+            let additional = planned
+                .text
+                .checked_sub(self.text.len())
+                .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+            self.text
+                .try_reserve_exact(additional)
+                .map_err(|_| TutError::Allocation("visible row text"))?;
+            self.require_storage(RenderStorage {
+                text: self.text.capacity(),
+                ..planned
+            })?;
+        }
+        if planned.spans > self.spans.capacity() {
+            let additional = planned
+                .spans
+                .checked_sub(self.spans.len())
+                .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+            self.spans
+                .try_reserve_exact(additional)
+                .map_err(|_| TutError::Allocation("visible row spans"))?;
+            self.require_storage(RenderStorage {
+                text: self.text.capacity(),
+                spans: self.spans.capacity(),
+                rows: planned.rows,
+            })?;
+        }
+        if planned.rows > self.rows.capacity() {
+            let additional = planned
+                .rows
+                .checked_sub(self.rows.len())
+                .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+            self.rows
+                .try_reserve_exact(additional)
+                .map_err(|_| TutError::Allocation("visible rows"))?;
+        }
+        self.storage().require(self.limit)?;
+        Ok(())
+    }
+
+    fn reserve(&mut self, text: usize, spans: usize, rows: usize) -> Result<(), TutError> {
+        let planned = self.planned_storage(text, spans, rows)?;
+        self.reserve_to(planned)
     }
 }
 
@@ -1148,19 +1315,23 @@ impl ProjectedRowSink for RenderRowsBuilder {
     }
 
     fn push(&mut self, atom: ProjectedAtom<'_>) -> Result<(), TutError> {
-        if self.spans.len() == self.spans.capacity() {
-            self.spans
-                .try_reserve(1)
-                .map_err(|_| TutError::Allocation("visible row spans"))?;
-        }
-        let span = RenderSpan::from_projected(atom, &mut self.text)?;
+        let pending = PendingRenderSpan::new(atom);
+        let text = pending
+            .text_len()
+            .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+        self.reserve(text, 1, 0)?;
+        let storage = self.storage();
+        let span = pending.append_to(&mut self.text);
         self.spans.push(span);
+        debug_assert_eq!(self.storage(), storage);
         Ok(())
     }
 
     fn finish_row(&mut self, through: Self::Checkpoint, carry_tail: bool) -> Result<(), TutError> {
         debug_assert!(through.text >= self.row_start.text && through.text <= self.text.len());
         debug_assert!(through.spans >= self.row_start.spans && through.spans <= self.spans.len());
+        self.reserve(0, 0, 1)?;
+        let storage = self.storage();
         if !carry_tail {
             self.text.truncate(through.text);
             self.spans.truncate(through.spans);
@@ -1169,16 +1340,12 @@ impl ProjectedRowSink for RenderRowsBuilder {
             span.text.start -= self.row_start.text;
             span.text.end -= self.row_start.text;
         }
-        if self.rows.len() == self.rows.capacity() {
-            self.rows
-                .try_reserve(1)
-                .map_err(|_| TutError::Allocation("visible rows"))?;
-        }
         self.rows.push(RenderRowRange {
             text: self.row_start.text..through.text,
             spans: self.row_start.spans..through.spans,
         });
         self.row_start = through;
+        debug_assert_eq!(self.storage(), storage);
         Ok(())
     }
 }
@@ -1256,6 +1423,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::layout::DisplayAtoms;
 
     const BACKGROUND_STEP_LIMIT: usize = 100_000;
 
@@ -1294,6 +1462,17 @@ mod tests {
         app.update(Action::Resize(Geometry::new(columns, rows)))
             .unwrap();
         app
+    }
+
+    fn projected_atom(text: &str) -> ProjectedAtom<'_> {
+        DisplayAtoms::new(text)
+            .next()
+            .expect("test text contains a grapheme")
+            .project(
+                DisplayColumn::ZERO,
+                ContentWidth::new(u16::MAX).expect("maximum terminal width is nonzero"),
+            )
+            .expect("test graphemes are not line feeds")
     }
 
     fn highlighted_row(state: &RenderState<'_>, index: usize) -> Vec<(String, Highlight)> {
@@ -2063,6 +2242,191 @@ mod tests {
         app.update(Action::NextMatch).unwrap();
         settle(&mut app);
         assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(8));
+    }
+
+    #[test]
+    fn visible_render_budget_accepts_exact_capacity_and_rejects_the_next_atom_atomically() {
+        let atom = projected_atom("a");
+        let mut builder = RenderRowsBuilder::with_limit(1, usize::MAX).unwrap();
+        let text = PendingRenderSpan::new(atom).text_len().unwrap();
+        let planned = builder.planned_storage(text, 1, 0).unwrap();
+        builder.reserve_to(planned).unwrap();
+        let limit = builder.storage().bytes().unwrap();
+        builder.limit = limit;
+
+        let fill = builder.text.capacity().min(builder.spans.capacity());
+        assert!(fill > 0);
+        for _ in 0..fill {
+            builder.push(atom).unwrap();
+        }
+        assert_eq!(builder.storage().bytes(), Some(limit));
+
+        let before_text = builder.text.clone();
+        let before_spans = builder.spans.clone();
+        let before_rows = builder.rows.clone();
+        let before_start = builder.row_start;
+        let before_storage = builder.storage();
+        let error = builder.push(atom).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TutError::VisibleRenderTooLarge { limit: actual } if actual == limit
+        ));
+        assert_eq!(builder.text, before_text);
+        assert_eq!(builder.spans, before_spans);
+        assert_eq!(builder.rows, before_rows);
+        assert_eq!(builder.row_start, before_start);
+        assert_eq!(builder.storage(), before_storage);
+    }
+
+    #[test]
+    fn allocator_capacity_rounding_is_rechecked_against_the_aggregate_limit() {
+        let planned = RenderStorage {
+            text: 8,
+            spans: 2,
+            rows: 1,
+        };
+        let limit = planned.bytes().unwrap();
+        assert!(planned.require(limit).is_ok());
+
+        let rounded = RenderStorage {
+            text: planned.text + 1,
+            ..planned
+        };
+        assert!(matches!(
+            rounded.require(limit),
+            Err(TutError::VisibleRenderTooLarge { limit: actual }) if actual == limit
+        ));
+    }
+
+    #[test]
+    fn discarded_provisional_tail_releases_length_but_not_capacity() {
+        let mut builder = RenderRowsBuilder::with_limit(1, usize::MAX).unwrap();
+        builder.push(projected_atom("a")).unwrap();
+        let through = builder.checkpoint();
+        builder.push(projected_atom("b")).unwrap();
+        let storage = builder.storage();
+
+        builder.finish_row(through, false).unwrap();
+
+        assert_eq!(builder.text, "a");
+        assert_eq!(builder.spans.len(), 1);
+        assert_eq!(builder.rows.len(), 1);
+        assert_eq!(builder.row_start, through);
+        assert_eq!(builder.storage(), storage);
+    }
+
+    #[test]
+    fn carried_provisional_tail_becomes_the_next_row_without_copying() {
+        let mut builder = RenderRowsBuilder::with_limit(2, usize::MAX).unwrap();
+        builder.push(projected_atom("a")).unwrap();
+        let through = builder.checkpoint();
+        builder.push(projected_atom("b")).unwrap();
+        let text_pointer = builder.text.as_ptr();
+        let spans_pointer = builder.spans.as_ptr();
+        let storage = builder.storage();
+
+        builder.finish_row(through, true).unwrap();
+
+        assert_eq!(builder.text, "ab");
+        assert_eq!(builder.spans.len(), 2);
+        assert_eq!(builder.row_start, through);
+        assert_eq!(builder.text.as_ptr(), text_pointer);
+        assert_eq!(builder.spans.as_ptr(), spans_pointer);
+        assert_eq!(builder.storage(), storage);
+
+        let end = builder.checkpoint();
+        builder.finish_row(end, false).unwrap();
+        let rows = builder.finish();
+        assert_eq!(
+            rows.iter().map(|row| row.text).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn visible_render_budget_calculations_reject_integer_overflow() {
+        assert_eq!(planned_render_capacity(usize::MAX, usize::MAX, 1), None);
+        assert_eq!(
+            planned_render_capacity(usize::MAX - 1, usize::MAX - 1, 1),
+            None
+        );
+        let overflow = RenderStorage {
+            text: 0,
+            spans: usize::MAX,
+            rows: 0,
+        };
+        assert_eq!(overflow.bytes(), None);
+        assert!(matches!(
+            overflow.require(MAX_VISIBLE_RENDER_BYTES),
+            Err(TutError::VisibleRenderTooLarge {
+                limit: MAX_VISIBLE_RENDER_BYTES
+            })
+        ));
+        assert!(matches!(
+            RenderRowsBuilder::with_limit(usize::MAX, MAX_VISIBLE_RENDER_BYTES),
+            Err(TutError::VisibleRenderTooLarge {
+                limit: MAX_VISIBLE_RENDER_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn normal_unicode_at_the_terminal_cell_limit_fits_the_visible_render_budget() {
+        let cells = 512_usize * 1024;
+        assert!(cells.is_power_of_two());
+        let maximum_scalar_bytes = '\u{10ffff}'.len_utf8();
+        let text = cells
+            .checked_mul(DOTTED_CIRCLE.len() + maximum_scalar_bytes)
+            .unwrap();
+        let maximum_geometric_text_capacity = text.checked_mul(2).unwrap() - 1;
+        let estimate = RenderStorage {
+            text: maximum_geometric_text_capacity,
+            spans: cells,
+            rows: cells / usize::from(MIN_TERMINAL_COLUMNS),
+        };
+
+        assert!(estimate.bytes().unwrap() < MAX_VISIBLE_RENDER_BYTES);
+        assert!(estimate.require(MAX_VISIBLE_RENDER_BYTES).is_ok());
+    }
+
+    #[test]
+    fn pathological_zero_width_rendering_is_bounded_by_injected_budget() {
+        let mut cluster = String::new();
+        cluster.extend(std::iter::repeat_n('\u{301}', 512));
+        assert_eq!(cluster.len(), 1024);
+        let atom = projected_atom(&cluster);
+        let pending = PendingRenderSpan::new(atom);
+        assert_eq!(
+            pending.text_len(),
+            Some(DOTTED_CIRCLE.len() + cluster.len())
+        );
+
+        let limit = 64 * 1024;
+        let mut builder = RenderRowsBuilder::with_limit(1, limit).unwrap();
+        let mut accepted = 0;
+        loop {
+            let before_text = builder.text.len();
+            let before_spans = builder.spans.len();
+            let before_storage = builder.storage();
+            match builder.push(atom) {
+                Ok(()) => {
+                    accepted += 1;
+                    assert!(builder.storage().bytes().unwrap() <= limit);
+                }
+                Err(TutError::VisibleRenderTooLarge { limit: actual }) => {
+                    assert_eq!(actual, limit);
+                    assert_eq!(builder.text.len(), before_text);
+                    assert_eq!(builder.spans.len(), before_spans);
+                    assert_eq!(builder.storage(), before_storage);
+                    break;
+                }
+                Err(error) => panic!("unexpected render error: {}", error.message()),
+            }
+        }
+
+        assert!(accepted > 0);
+        assert!(accepted < 512 * 1024);
     }
 
     #[test]
