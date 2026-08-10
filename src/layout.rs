@@ -549,7 +549,10 @@ impl ViewportLayout {
         Ok(top)
     }
 
-    fn require_matching_source(&self, reader: &DocumentReader<'_>) -> Result<(), TutError> {
+    pub(super) fn require_matching_source(
+        &self,
+        reader: &DocumentReader<'_>,
+    ) -> Result<(), TutError> {
         if reader.document_id() != self.document_id {
             return Err(LayoutError::DocumentMismatch.into());
         }
@@ -641,6 +644,11 @@ impl ProjectedScanMeter {
 
     pub(super) const fn exhausted(&self) -> bool {
         self.atoms >= self.atom_limit.get() || self.bytes >= self.byte_limit.get()
+    }
+
+    pub(super) fn charge_cached_row(&mut self) {
+        debug_assert!(!self.exhausted());
+        self.atoms = self.atoms.saturating_add(1);
     }
 
     fn charge(&mut self, source: GraphemeRange) {

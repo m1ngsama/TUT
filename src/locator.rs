@@ -103,6 +103,17 @@ impl RowNeighborhood {
         self.clamp(candidate_index, source_start, usize::from(height.get()))
     }
 
+    fn edge_at(&self, key: (DocumentId, ContentWidth), start: SourceOffset) -> Option<RowEdge> {
+        if self.key != Some(key) {
+            return None;
+        }
+        let index = self
+            .edges
+            .binary_search_by_key(&start, |edge| edge.start)
+            .ok()?;
+        self.edges.get(index).copied()
+    }
+
     fn clamp(
         &self,
         candidate_index: usize,
@@ -248,6 +259,12 @@ struct PendingRowScan {
     scanner: VisualRowScanner,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfirmedRow {
+    next: Option<SourceOffset>,
+    scanned: bool,
+}
+
 pub(super) struct ViewportLocator {
     target: SourceOffset,
     delta: RowDelta,
@@ -258,6 +275,7 @@ pub(super) struct ViewportLocator {
     prefix_rows: VecDeque<SourceOffset>,
     row_scan: Option<PendingRowScan>,
     capacity: usize,
+    reuse_forward_edges: bool,
 }
 
 impl ViewportLocator {
@@ -291,6 +309,7 @@ impl ViewportLocator {
             prefix_rows,
             row_scan: None,
             capacity,
+            reuse_forward_edges: false,
         })
     }
 
@@ -301,6 +320,7 @@ impl ViewportLocator {
         row_bound: NonZeroUsize,
     ) -> Result<Self, TutError> {
         let mut locator = Self::new(target, delta, height, row_bound)?;
+        locator.reuse_forward_edges = matches!(delta, RowDelta::Forward(_));
         locator.push_history(target);
         locator.begin_movement(target);
         Ok(locator)
@@ -312,6 +332,14 @@ impl ViewportLocator {
         reader: &mut DocumentReader<'_>,
         neighborhood: &mut RowNeighborhood,
     ) -> Result<Option<LocatedViewport>, TutError> {
+        if let Err(error) = layout.require_matching_source(reader) {
+            self.row_scan = None;
+            return Err(error);
+        }
+        if let Err(error) = reader.validate() {
+            self.row_scan = None;
+            return Err(error.into());
+        }
         let row_key = layout.row_cache_key();
         let mut meter = ProjectedScanMeter::standard();
         loop {
@@ -351,11 +379,21 @@ impl ViewportLocator {
                         self.begin_clamp(cursor);
                         continue;
                     }
-                    let Some(row) = self.advance_row(layout, reader, &mut meter, cursor)? else {
+                    let Some(row) = self.advance_movement_row(
+                        layout,
+                        reader,
+                        &mut meter,
+                        neighborhood,
+                        row_key,
+                        cursor,
+                    )?
+                    else {
                         return Ok(None);
                     };
                     let next = row.next;
-                    neighborhood.observe(row_key, cursor, next)?;
+                    if row.scanned {
+                        neighborhood.observe(row_key, cursor, next)?;
+                    }
                     if let Some(next) = next {
                         self.push_history(next);
                         self.phase = Phase::MoveForward {
@@ -371,11 +409,21 @@ impl ViewportLocator {
                     cursor,
                     visible,
                 } => {
-                    let Some(row) = self.advance_row(layout, reader, &mut meter, cursor)? else {
+                    let Some(row) = self.advance_movement_row(
+                        layout,
+                        reader,
+                        &mut meter,
+                        neighborhood,
+                        row_key,
+                        cursor,
+                    )?
+                    else {
                         return Ok(None);
                     };
                     let next = row.next;
-                    neighborhood.observe(row_key, cursor, next)?;
+                    if row.scanned {
+                        neighborhood.observe(row_key, cursor, next)?;
+                    }
                     let visible = visible + 1;
                     match next {
                         None => {
@@ -493,6 +541,33 @@ impl ViewportLocator {
         }
     }
 
+    fn advance_movement_row(
+        &mut self,
+        layout: &ViewportLayout,
+        reader: &mut DocumentReader<'_>,
+        meter: &mut ProjectedScanMeter,
+        neighborhood: &RowNeighborhood,
+        row_key: (DocumentId, ContentWidth),
+        start: SourceOffset,
+    ) -> Result<Option<ConfirmedRow>, TutError> {
+        if self.reuse_forward_edges
+            && self.row_scan.is_none()
+            && let Some(edge) = neighborhood.edge_at(row_key, start)
+        {
+            meter.charge_cached_row();
+            return Ok(Some(ConfirmedRow {
+                next: edge.next,
+                scanned: false,
+            }));
+        }
+        Ok(self
+            .advance_row(layout, reader, meter, start)?
+            .map(|row| ConfirmedRow {
+                next: row.next,
+                scanned: true,
+            }))
+    }
+
     fn push_history(&mut self, row: SourceOffset) {
         if self.history.len() == self.capacity {
             self.history.pop_front();
@@ -581,6 +656,7 @@ mod tests {
     use super::*;
     use crate::{
         document::{Document, DocumentCache, SOURCE_WINDOW_BYTES, load},
+        error::LayoutError,
         layout::rebuild_viewport_layout,
     };
 
@@ -924,7 +1000,16 @@ mod tests {
         rows.observe(key, offset(0), Some(offset(1))).unwrap();
         rows.observe(key, offset(1), None).unwrap();
 
+        assert_eq!(
+            rows.edge_at(key, offset(0)),
+            Some(RowEdge {
+                start: offset(0),
+                next: Some(offset(1)),
+            })
+        );
+
         let other_width = (key.0, ContentWidth::new(17).unwrap());
+        assert_eq!(rows.edge_at(other_width, offset(0)), None);
         assert_eq!(
             rows.locate_target(
                 other_width,
@@ -938,6 +1023,7 @@ mod tests {
         );
 
         let other_document = row_key(16);
+        assert_eq!(rows.edge_at(other_document, offset(0)), None);
         assert_eq!(
             rows.locate_target(
                 other_document,
@@ -1190,6 +1276,107 @@ mod tests {
             }
         }
         panic!("short-row locator did not complete within its bounded turns");
+    }
+
+    #[test]
+    fn cached_forward_edges_share_the_atom_budget_and_existing_storage() {
+        let document = Document::from_text(Path::new("cached-rows.txt"), "x".repeat(2_000));
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, 1, 1_500);
+        let mut rows = RowNeighborhood::default();
+        let key = layout.row_cache_key();
+        for start in 0..=1_600 {
+            rows.observe(
+                key,
+                SourceOffset::from_usize(start),
+                Some(SourceOffset::from_usize(start + 1)),
+            )
+            .unwrap();
+        }
+        let cached_len = rows.edges.len();
+        let cached_capacity = rows.edges.capacity();
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::ZERO,
+            RowDelta::Forward(1),
+            BodyHeight::new(1_500).unwrap(),
+            row_bound(&document),
+        )
+        .unwrap();
+
+        cache.reset_metrics();
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            None
+        );
+        assert_eq!(cache.metrics().grapheme_emissions(), 0);
+        assert_eq!(rows.edges.len(), cached_len);
+        assert_eq!(rows.edges.capacity(), cached_capacity);
+        assert_eq!(
+            locator.phase,
+            Phase::Clamp {
+                candidate: SourceOffset::new(1),
+                cursor: SourceOffset::new(1_024),
+                visible: 1_023,
+            }
+        );
+
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            Some(LocatedViewport {
+                anchor: SourceOffset::new(1),
+                at_end: false,
+            })
+        );
+        assert_eq!(cache.metrics().grapheme_emissions(), 0);
+        assert_eq!(rows.edges.len(), cached_len);
+        assert_eq!(rows.edges.capacity(), cached_capacity);
+    }
+
+    #[test]
+    fn cached_forward_edges_reject_another_document_before_state_changes() {
+        let first = Document::from_text(Path::new("first.txt"), "x".repeat(64));
+        let mut first_cache = DocumentCache::default();
+        let layout = viewport_layout(&first, &mut first_cache, 16, 4);
+        let key = layout.row_cache_key();
+        let mut rows = RowNeighborhood::default();
+        for start in [0, 16, 32, 48] {
+            rows.observe(
+                key,
+                SourceOffset::from_usize(start),
+                Some(SourceOffset::from_usize(start + 16)),
+            )
+            .unwrap();
+        }
+        rows.observe(key, SourceOffset::new(64), None).unwrap();
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::ZERO,
+            RowDelta::Forward(1),
+            BodyHeight::new(4).unwrap(),
+            row_bound(&first),
+        )
+        .unwrap();
+        let original_phase = locator.phase;
+        let original_history = locator.history.clone();
+        let cached_edges = rows.edges.clone();
+
+        let second = Document::from_text(Path::new("second.txt"), "y".repeat(64));
+        let mut second_cache = DocumentCache::default();
+        let error = {
+            let mut reader = second.reader(&mut second_cache);
+            locator
+                .advance(&layout, &mut reader, &mut rows)
+                .unwrap_err()
+        };
+
+        assert!(matches!(
+            error,
+            TutError::Layout(LayoutError::DocumentMismatch)
+        ));
+        assert_eq!(second_cache.metrics().grapheme_emissions(), 0);
+        assert_eq!(locator.phase, original_phase);
+        assert_eq!(locator.history, original_history);
+        assert!(locator.row_scan.is_none());
+        assert_eq!(rows.edges, cached_edges);
     }
 
     #[test]
