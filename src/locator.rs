@@ -9,6 +9,7 @@ use crate::{
 
 const ROW_BUDGET: usize = 1024;
 const BYTE_BUDGET: u64 = SOURCE_WINDOW_BYTES as u64;
+const INITIAL_ROW_NEIGHBORHOOD_CAPACITY: usize = 64;
 const ROW_NEIGHBORHOOD_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,28 +157,37 @@ impl RowNeighborhood {
     }
 
     fn reserve(&mut self) -> Result<(), TutError> {
-        if self.edges.capacity() < ROW_NEIGHBORHOOD_CAPACITY {
-            self.edges
-                .try_reserve_exact(ROW_NEIGHBORHOOD_CAPACITY - self.edges.len())
-                .map_err(|_| TutError::Allocation("visual row neighborhood"))?;
+        if self.edges.len() < self.edges.capacity() || self.edges.len() == ROW_NEIGHBORHOOD_CAPACITY
+        {
+            return Ok(());
         }
-        Ok(())
+        let target = if self.edges.capacity() == 0 {
+            INITIAL_ROW_NEIGHBORHOOD_CAPACITY
+        } else {
+            self.edges
+                .capacity()
+                .saturating_mul(2)
+                .min(ROW_NEIGHBORHOOD_CAPACITY)
+        };
+        self.edges
+            .try_reserve_exact(target - self.edges.len())
+            .map_err(|_| TutError::Allocation("visual row neighborhood"))
     }
 
     fn push_back(&mut self, edge: RowEdge) -> Result<(), TutError> {
-        self.reserve()?;
         if self.edges.len() == ROW_NEIGHBORHOOD_CAPACITY {
             self.edges.pop_front();
         }
+        self.reserve()?;
         self.edges.push_back(edge);
         Ok(())
     }
 
     fn push_front(&mut self, edge: RowEdge) -> Result<(), TutError> {
-        self.reserve()?;
         if self.edges.len() == ROW_NEIGHBORHOOD_CAPACITY {
             self.edges.pop_back();
         }
+        self.reserve()?;
         self.edges.push_front(edge);
         Ok(())
     }
@@ -754,7 +764,57 @@ mod tests {
     }
 
     #[test]
-    fn row_neighborhood_has_a_fixed_memory_bound() {
+    fn row_neighborhood_starts_with_a_small_allocation() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+
+        rows.observe(key, offset(0), Some(offset(1))).unwrap();
+
+        assert_eq!(rows.edges.len(), 1);
+        assert!(rows.edges.capacity() >= INITIAL_ROW_NEIGHBORHOOD_CAPACITY);
+        assert!(rows.edges.capacity() < ROW_NEIGHBORHOOD_CAPACITY);
+    }
+
+    #[test]
+    fn row_neighborhood_growth_preserves_continuity_and_locations() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+        rows.observe(key, offset(0), Some(offset(1))).unwrap();
+        let initial_capacity = rows.edges.capacity();
+
+        for start in 1..=initial_capacity {
+            rows.observe(
+                key,
+                SourceOffset::from_usize(start),
+                Some(SourceOffset::from_usize(start + 1)),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(rows.edges.len(), initial_capacity + 1);
+        assert!(rows.edges.capacity() > initial_capacity);
+        assert!(rows.edges.iter().enumerate().all(|(start, edge)| edge.start
+            == SourceOffset::from_usize(start)
+            && edge.next == Some(SourceOffset::from_usize(start + 1))));
+        let target = initial_capacity / 2;
+        assert_eq!(
+            rows.locate_target(
+                key,
+                SourceOffset::ZERO,
+                SourceOffset::from_usize(initial_capacity + 1),
+                SourceOffset::from_usize(target),
+                RowDelta::Forward(1),
+                BodyHeight::new(1).unwrap(),
+            ),
+            Some(LocatedViewport {
+                anchor: SourceOffset::from_usize(target + 1),
+                at_end: false,
+            })
+        );
+    }
+
+    #[test]
+    fn row_neighborhood_has_a_fixed_logical_bound() {
         let mut rows = RowNeighborhood::default();
         let key = row_key(16);
         for start in 0..ROW_NEIGHBORHOOD_CAPACITY {
@@ -764,6 +824,7 @@ mod tests {
                 Some(SourceOffset::from_usize(start + 1)),
             )
             .unwrap();
+            assert!(rows.edges.len() <= ROW_NEIGHBORHOOD_CAPACITY);
         }
         rows.observe(
             key,
@@ -777,6 +838,15 @@ mod tests {
         assert_eq!(
             rows.edges.back().unwrap().start,
             SourceOffset::from_usize(ROW_NEIGHBORHOOD_CAPACITY)
+        );
+
+        rows.observe(key, SourceOffset::ZERO, Some(SourceOffset::new(1)))
+            .unwrap();
+        assert_eq!(rows.edges.len(), ROW_NEIGHBORHOOD_CAPACITY);
+        assert_eq!(rows.edges.front().unwrap().start, SourceOffset::ZERO);
+        assert_eq!(
+            rows.edges.back().unwrap().start,
+            SourceOffset::from_usize(ROW_NEIGHBORHOOD_CAPACITY - 1)
         );
     }
 
