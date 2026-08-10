@@ -218,6 +218,7 @@ pub(super) struct DocumentCache {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct DocumentMetrics {
+    window_calls: usize,
     grapheme_emissions: usize,
     segmentation_runs: usize,
     segmentation_advanced_bytes: usize,
@@ -227,6 +228,10 @@ pub(super) struct DocumentMetrics {
 
 #[cfg(test)]
 impl DocumentMetrics {
+    pub(super) const fn window_calls(self) -> usize {
+        self.window_calls
+    }
+
     pub(super) const fn grapheme_emissions(self) -> usize {
         self.grapheme_emissions
     }
@@ -339,6 +344,10 @@ impl<'document> DocumentReader<'document> {
         start: SourceOffset,
         target_bytes: NonZeroUsize,
     ) -> Result<SourceText<'_>, LoadError> {
+        #[cfg(test)]
+        {
+            self.cache.metrics.window_calls += 1;
+        }
         self.document.store.copy_window(
             WindowRequest::new(start, target_bytes),
             &mut self.cache.chunk,

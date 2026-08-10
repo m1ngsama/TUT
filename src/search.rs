@@ -317,7 +317,11 @@ impl SearchSession {
                         });
                     };
                     return Ok(SearchStep {
-                        changed: highlights.advance(reader, self.query.as_str())?,
+                        changed: highlights.advance(
+                            reader,
+                            self.query.as_str(),
+                            &mut self.match_block,
+                        )?,
                         jump: None,
                     });
                 }
@@ -629,6 +633,8 @@ impl SearchIndex {
             document_id: self.document_id,
             visible,
             cursor: checkpoint.scan_at,
+            needed_from: earliest,
+            previous: checkpoint.previous_match,
             source_end: self.source_end,
             ranges,
             mode,
@@ -757,6 +763,22 @@ impl MatchBlock {
             .checked_add(self.query_len)
             .expect("match blocks retain validated source coordinates");
         SearchRange::new(start, end).expect("nonempty queries produce nonempty ranges")
+    }
+
+    fn overlapping(&self, visible: &Range<SourceOffset>) -> impl Iterator<Item = SearchRange> + '_ {
+        debug_assert_ne!(self.query_len, 0);
+        let overlap = u64::try_from(self.query_len - 1).expect("query lengths fit u64");
+        let earliest = visible.start.get().saturating_sub(overlap);
+        let lower = earliest.saturating_sub(self.start.get());
+        let upper = visible.end.get().saturating_sub(self.start.get());
+        let first = self
+            .starts
+            .partition_point(|start| u64::from(*start) < lower);
+        let last = self
+            .starts
+            .partition_point(|start| u64::from(*start) < upper);
+
+        (first..last).map(|index| self.range(index))
     }
 
     fn locate(&mut self, range: SearchRange) -> Option<usize> {
@@ -984,6 +1006,8 @@ struct SearchHighlights {
     document_id: DocumentId,
     visible: Range<SourceOffset>,
     cursor: SourceOffset,
+    needed_from: SourceOffset,
+    previous: Option<SearchRange>,
     source_end: SourceOffset,
     ranges: Vec<SearchRange>,
     mode: HighlightMode,
@@ -1013,7 +1037,12 @@ impl SearchHighlights {
         if self.complete { &self.ranges } else { &[] }
     }
 
-    fn advance(&mut self, reader: &mut DocumentReader<'_>, needle: &str) -> Result<bool, TutError> {
+    fn advance(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+        cached: &mut Option<MatchBlock>,
+    ) -> Result<bool, TutError> {
         if reader.document_id() != self.document_id {
             return Err(SearchError::SourceMismatch.into());
         }
@@ -1026,12 +1055,37 @@ impl SearchHighlights {
             return Ok(true);
         }
 
-        self.cursor = scan_window(reader, needle, self.cursor, self.source_end, |range| {
-            if range.start() < self.visible.end && range.end() > self.visible.start {
-                self.push(range)?;
+        let block = cached.take().filter(|block| {
+            block.query_len == needle.len()
+                && block.start <= self.needed_from
+                && self.needed_from < block.next
+        });
+        let block = if let Some(block) = block {
+            if let Err(error) = reader.validate() {
+                *cached = Some(block);
+                return Err(error.into());
             }
-            Ok(())
-        })?;
+            block
+        } else {
+            MatchBlock::scan(
+                reader,
+                needle,
+                self.document_id,
+                self.source_end,
+                self.cursor,
+                self.previous,
+            )?
+        };
+        let push_result = block
+            .overlapping(&self.visible)
+            .try_for_each(|range| self.push(range));
+        if push_result.is_ok() {
+            self.cursor = block.next;
+            self.needed_from = block.next;
+            self.previous = block.last_or_previous();
+        }
+        *cached = Some(block);
+        push_result?;
         if self.cursor >= self.source_end || self.cursor >= self.visible.end {
             self.finish();
         }
@@ -1173,10 +1227,11 @@ fn scan_window(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     use super::*;
     use crate::document::{Document, DocumentCache};
+    use tempfile::tempdir;
 
     fn complete_at(
         text: &str,
@@ -1207,8 +1262,9 @@ mod tests {
         let mut highlights = index.highlights(visible).unwrap();
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
+        let mut block = None;
         while !highlights.is_complete() {
-            highlights.advance(&mut reader, needle).unwrap();
+            highlights.advance(&mut reader, needle, &mut block).unwrap();
         }
         highlights.ranges().to_vec()
     }
@@ -1581,6 +1637,215 @@ mod tests {
     }
 
     #[test]
+    fn cached_highlights_preserve_global_greedy_matches() {
+        let (document, index) = complete("aaaaaa", "aa");
+        let mut cache = DocumentCache::default();
+        let mut block = None;
+
+        let mut first = index
+            .highlights(SourceOffset::new(1)..SourceOffset::new(3))
+            .unwrap();
+        {
+            let mut reader = document.reader(&mut cache);
+            assert!(first.advance(&mut reader, "aa", &mut block).unwrap());
+        }
+        assert_eq!(
+            first.ranges(),
+            &[SearchRange::new(SourceOffset::ZERO, SourceOffset::new(4)).unwrap()]
+        );
+
+        let mut second = index
+            .highlights(SourceOffset::new(3)..SourceOffset::new(5))
+            .unwrap();
+        {
+            let mut reader = document.reader(&mut cache);
+            assert!(second.advance(&mut reader, "aa", &mut block).unwrap());
+        }
+        assert_eq!(
+            second.ranges(),
+            &[SearchRange::new(SourceOffset::new(2), SourceOffset::new(6)).unwrap()]
+        );
+        assert_eq!(cache.metrics().window_calls(), 1);
+    }
+
+    #[test]
+    fn cached_highlights_reuse_one_window_across_contiguous_viewports() {
+        const ROW_BYTES: usize = 160;
+        const VIEWPORTS: usize = SOURCE_WINDOW_BYTES / ROW_BYTES;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rows.txt");
+        let mut text = String::with_capacity((VIEWPORTS + 1) * ROW_BYTES);
+        for row in 0..=VIEWPORTS {
+            text.push(if row % 7 == 0 { 'z' } else { 'x' });
+            text.extend(std::iter::repeat_n('x', ROW_BYTES - 2));
+            text.push('\n');
+        }
+        fs::write(&path, text).unwrap();
+        let document = crate::document::load(path).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut session = {
+            let reader = document.reader(&mut cache);
+            SearchSession::new(&reader, "z".to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        settle_session(&document, &mut cache, &mut session);
+        cache.reset_metrics();
+
+        for row in 0..VIEWPORTS {
+            let start = SourceOffset::from_usize(row * ROW_BYTES);
+            let end = start.checked_add(ROW_BYTES).unwrap();
+            let visible = start..end;
+            let target = SearchRange::new(start, end).unwrap();
+            session
+                .prepare_highlights(visible.clone(), [target])
+                .unwrap();
+            settle_session(&document, &mut cache, &mut session);
+            let expected = if row % 7 == 0 { &[target][..] } else { &[] };
+            assert_eq!(session.highlight_ranges(&visible), expected);
+        }
+
+        assert_eq!(VIEWPORTS, 409);
+        assert_eq!(cache.metrics().window_calls(), 1);
+    }
+
+    #[test]
+    fn cached_highlights_keep_utf8_boundary_matches_and_selection() {
+        let needle = "é猫";
+        let crossing = SOURCE_WINDOW_BYTES - "é".len();
+        let mut text = "x".repeat(crossing);
+        text.push_str(needle);
+        let (document, index) = complete(&text, needle);
+        let start = SourceOffset::from_usize(crossing);
+        let after_first_character = start.checked_add("é".len()).unwrap();
+        let end = start.checked_add(needle.len()).unwrap();
+        let expected = SearchRange::new(start, end).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut block = None;
+
+        let mut suffix = index.highlights(after_first_character..end).unwrap();
+        {
+            let mut reader = document.reader(&mut cache);
+            assert!(suffix.advance(&mut reader, needle, &mut block).unwrap());
+        }
+        assert_eq!(suffix.ranges(), &[expected]);
+        block.as_mut().unwrap().selected = Some(0);
+        cache.reset_metrics();
+
+        let mut prefix = index.highlights(start..after_first_character).unwrap();
+        {
+            let mut reader = document.reader(&mut cache);
+            assert!(prefix.advance(&mut reader, needle, &mut block).unwrap());
+        }
+        assert_eq!(prefix.ranges(), &[expected]);
+        assert_eq!(block.as_ref().unwrap().selected, Some(0));
+        assert_eq!(cache.metrics().window_calls(), 0);
+    }
+
+    #[test]
+    fn cached_highlights_validate_tracked_files_before_reuse() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing.txt");
+        fs::write(&path, "cat cat").unwrap();
+        let document = crate::document::load(path.clone()).unwrap();
+        let mut cache = DocumentCache::default();
+        let index = {
+            let mut reader = document.reader(&mut cache);
+            let mut index = SearchIndex::new(&reader, "cat", SourceOffset::ZERO)
+                .unwrap()
+                .unwrap();
+            while !index.is_complete() {
+                index.advance(&mut reader, "cat").unwrap();
+            }
+            index
+        };
+
+        let visible = document.source_start()..document.source_end();
+        let mut block = None;
+        let mut first = index.highlights(visible.clone()).unwrap();
+        {
+            let mut reader = document.reader(&mut cache);
+            assert!(first.advance(&mut reader, "cat", &mut block).unwrap());
+        }
+        assert!(block.is_some());
+        fs::write(path, "changed contents").unwrap();
+        cache.reset_metrics();
+
+        let mut stale = index.highlights(visible).unwrap();
+        let result = {
+            let mut reader = document.reader(&mut cache);
+            stale.advance(&mut reader, "cat", &mut block)
+        };
+        assert!(matches!(result, Err(TutError::Load(_))));
+        assert!(block.is_some());
+        assert!(stale.ranges().is_empty());
+        assert_eq!(cache.metrics().window_calls(), 0);
+    }
+
+    #[test]
+    fn sessions_return_one_match_block_between_highlights_and_navigation() {
+        let document = Document::from_text(Path::new("session.txt"), "cat cat".to_owned());
+        let mut cache = DocumentCache::default();
+        let mut session = {
+            let reader = document.reader(&mut cache);
+            SearchSession::new(&reader, "cat".to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        settle_session(&document, &mut cache, &mut session);
+
+        let whole = document.source_start()..document.source_end();
+        let whole_target = SearchRange::new(whole.start, whole.end).unwrap();
+        session.prepare_highlights(whole, [whole_target]).unwrap();
+        settle_session(&document, &mut cache, &mut session);
+        let allocation = session.match_block.as_ref().unwrap().starts.as_ptr();
+        cache.reset_metrics();
+
+        assert!(request_session_navigation(
+            &document,
+            &mut cache,
+            &mut session,
+            true
+        ));
+        settle_session(&document, &mut cache, &mut session);
+        assert_eq!(
+            session.current_match().unwrap().start(),
+            SourceOffset::new(4)
+        );
+        assert_eq!(
+            session.match_block.as_ref().unwrap().starts.as_ptr(),
+            allocation
+        );
+
+        let second = SourceOffset::new(4)..SourceOffset::new(7);
+        let second_target = SearchRange::new(second.start, second.end).unwrap();
+        session
+            .prepare_highlights(second.clone(), [second_target])
+            .unwrap();
+        settle_session(&document, &mut cache, &mut session);
+        assert_eq!(session.highlight_ranges(&second), &[second_target]);
+        assert_eq!(
+            session.match_block.as_ref().unwrap().starts.as_ptr(),
+            allocation
+        );
+
+        assert!(request_session_navigation(
+            &document,
+            &mut cache,
+            &mut session,
+            false
+        ));
+        settle_session(&document, &mut cache, &mut session);
+        assert_eq!(session.current_match().unwrap().start(), SourceOffset::ZERO);
+        assert_eq!(
+            session.match_block.as_ref().unwrap().starts.as_ptr(),
+            allocation
+        );
+        assert_eq!(cache.metrics().window_calls(), 0);
+    }
+
+    #[test]
     fn viewport_highlights_advance_one_source_window_at_a_time() {
         let text = "x".repeat(SOURCE_WINDOW_BYTES * 2 + 17);
         let source_end = SourceOffset::from_usize(text.len());
@@ -1588,18 +1853,31 @@ mod tests {
         let mut highlights = index.highlights(SourceOffset::ZERO..source_end).unwrap();
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
+        let mut block = None;
 
-        assert!(!highlights.advance(&mut reader, "absent").unwrap());
+        assert!(
+            !highlights
+                .advance(&mut reader, "absent", &mut block)
+                .unwrap()
+        );
         assert_eq!(
             highlights.cursor,
             SourceOffset::from_usize(SOURCE_WINDOW_BYTES)
         );
-        assert!(!highlights.advance(&mut reader, "absent").unwrap());
+        assert!(
+            !highlights
+                .advance(&mut reader, "absent", &mut block)
+                .unwrap()
+        );
         assert_eq!(
             highlights.cursor,
             SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2)
         );
-        assert!(highlights.advance(&mut reader, "absent").unwrap());
+        assert!(
+            highlights
+                .advance(&mut reader, "absent", &mut block)
+                .unwrap()
+        );
         assert!(highlights.is_complete());
     }
 
@@ -1616,9 +1894,10 @@ mod tests {
             .unwrap();
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
+        let mut block = None;
 
         while !highlights.is_complete() {
-            highlights.advance(&mut reader, "a").unwrap();
+            highlights.advance(&mut reader, "a", &mut block).unwrap();
         }
 
         assert_eq!(highlights.ranges(), &[target]);
