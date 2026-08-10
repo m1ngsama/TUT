@@ -13,6 +13,28 @@ const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
 const MATCH_BLOCK_START_LIMIT: usize = SOURCE_WINDOW_BYTES + MAX_SEARCH_QUERY_BYTES;
 
+#[derive(Debug)]
+struct SearchQuery(String);
+
+impl SearchQuery {
+    fn new(text: String) -> Result<Option<Self>, TutError> {
+        if text.is_empty() {
+            return Ok(None);
+        }
+        if text.len() > MAX_SEARCH_QUERY_BYTES {
+            return Err(SearchError::QueryTooLong {
+                limit: MAX_SEARCH_QUERY_BYTES,
+            }
+            .into());
+        }
+        Ok(Some(Self(text)))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SearchRange {
     start: SourceOffset,
@@ -69,18 +91,16 @@ impl SearchIndexLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SearchAdvance {
+struct SearchAdvance {
     selected: Option<SearchRange>,
     completed: bool,
 }
 
 #[derive(Debug)]
-pub(super) struct SearchNavigation {
+struct SearchNavigation {
     document_id: DocumentId,
     cursor: SourceOffset,
-    source_start: SourceOffset,
     source_end: SourceOffset,
-    query_len: usize,
     current: SearchRange,
     previous: Option<SearchRange>,
     block: Option<MatchBlock>,
@@ -97,10 +117,7 @@ enum NavigationDirection {
 }
 
 #[derive(Debug)]
-pub(super) struct MatchBlock {
-    document_id: DocumentId,
-    source_start: SourceOffset,
-    source_end: SourceOffset,
+struct MatchBlock {
     query_len: usize,
     start: SourceOffset,
     next: SourceOffset,
@@ -110,17 +127,17 @@ pub(super) struct MatchBlock {
 }
 
 impl SearchAdvance {
-    pub(super) const fn selected(self) -> Option<SearchRange> {
+    const fn selected(self) -> Option<SearchRange> {
         self.selected
     }
 
-    pub(super) const fn completed(self) -> bool {
+    const fn completed(self) -> bool {
         self.completed
     }
 }
 
 #[derive(Debug)]
-pub(super) struct SearchIndex {
+struct SearchIndex {
     document_id: DocumentId,
     source_start: SourceOffset,
     source_end: SourceOffset,
@@ -137,8 +154,239 @@ pub(super) struct SearchIndex {
     complete: bool,
 }
 
-impl SearchIndex {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SearchStep {
+    changed: bool,
+    jump: Option<SearchRange>,
+}
+
+impl SearchStep {
+    pub(super) const fn changed(self) -> bool {
+        self.changed
+    }
+
+    pub(super) const fn jump(self) -> Option<SearchRange> {
+        self.jump
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct SearchSession {
+    query: SearchQuery,
+    index: SearchIndex,
+    current_match: Option<SearchRange>,
+    navigation: Option<SearchNavigation>,
+    match_block: Option<MatchBlock>,
+    pending_navigation: i64,
+    highlights: Option<SearchHighlights>,
+    jump_pending: bool,
+}
+
+impl SearchSession {
     pub(super) fn new(
+        reader: &DocumentReader<'_>,
+        text: String,
+        selection_anchor: SourceOffset,
+    ) -> Result<Option<Self>, TutError> {
+        let Some(query) = SearchQuery::new(text)? else {
+            return Ok(None);
+        };
+        let index = SearchIndex::with_limits(
+            reader,
+            query.as_str(),
+            selection_anchor,
+            SearchIndexLimits::DEFAULT,
+        )?;
+        let jump_pending = !index.is_complete();
+        Ok(Some(Self {
+            query,
+            index,
+            current_match: None,
+            navigation: None,
+            match_block: None,
+            pending_navigation: 0,
+            highlights: None,
+            jump_pending,
+        }))
+    }
+
+    pub(super) fn query(&self) -> &str {
+        self.query.as_str()
+    }
+
+    pub(super) const fn current_match(&self) -> Option<SearchRange> {
+        self.current_match
+    }
+
+    pub(super) const fn no_matches(&self) -> bool {
+        self.index.is_complete() && !self.index.has_matches()
+    }
+
+    pub(super) const fn is_searching(&self) -> bool {
+        !self.index.is_complete() || self.navigation.is_some() || self.pending_navigation != 0
+    }
+
+    pub(super) const fn has_work(&self) -> bool {
+        self.is_searching()
+            || matches!(&self.highlights, Some(highlights) if !highlights.is_complete())
+    }
+
+    pub(super) fn highlight_ranges(&self, visible: &Range<SourceOffset>) -> &[SearchRange] {
+        self.highlights
+            .as_ref()
+            .filter(|highlights| highlights.covers(visible))
+            .map_or(&[], SearchHighlights::ranges)
+    }
+
+    pub(super) fn prepare_highlights(
+        &mut self,
+        visible: Range<SourceOffset>,
+        targets: impl IntoIterator<Item = SearchRange>,
+    ) -> Result<(), TutError> {
+        if self
+            .highlights
+            .as_ref()
+            .is_some_and(|highlights| highlights.covers(&visible))
+        {
+            return Ok(());
+        }
+        self.highlights = if self.index.is_complete() && self.index.has_matches() {
+            self.index.display_highlights(visible, targets)?
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    pub(super) fn invalidate_highlights(&mut self) {
+        self.highlights = None;
+    }
+
+    pub(super) fn cancel_motion(&mut self) -> bool {
+        let changed =
+            self.navigation.is_some() || self.pending_navigation != 0 || self.jump_pending;
+        if let Some(mut navigation) = self.navigation.take()
+            && let Some(block) = navigation.take_block()
+        {
+            self.match_block = Some(block);
+        }
+        self.pending_navigation = 0;
+        self.jump_pending = false;
+        changed
+    }
+
+    pub(super) fn request_navigation(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        forward: bool,
+    ) -> Result<bool, TutError> {
+        if reader.document_id() != self.index.document_id {
+            return Err(SearchError::SourceMismatch.into());
+        }
+        if self.index.is_complete() && self.current_match.is_none() {
+            reader.validate()?;
+            return Ok(false);
+        }
+        if self.current_match.is_none() {
+            self.jump_pending = true;
+        }
+        self.pending_navigation = if forward {
+            self.pending_navigation.saturating_add(1)
+        } else {
+            self.pending_navigation.saturating_sub(1)
+        };
+        Ok(true)
+    }
+
+    pub(super) fn advance(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+    ) -> Result<SearchStep, TutError> {
+        let initial_scan = !self.index.is_complete();
+        let selection_should_jump;
+        let advance = if initial_scan {
+            selection_should_jump = self.jump_pending;
+            self.index.advance(reader, self.query.as_str())?
+        } else {
+            if self.navigation.is_none() {
+                if self.pending_navigation == 0 {
+                    let Some(highlights) = self.highlights.as_mut() else {
+                        return Ok(SearchStep {
+                            changed: false,
+                            jump: None,
+                        });
+                    };
+                    return Ok(SearchStep {
+                        changed: highlights.advance(reader, self.query.as_str())?,
+                        jump: None,
+                    });
+                }
+                let Some(current) = self.current_match else {
+                    let changed = self.pending_navigation != 0;
+                    self.pending_navigation = 0;
+                    self.jump_pending = false;
+                    return Ok(SearchStep {
+                        changed,
+                        jump: None,
+                    });
+                };
+                let forward = self.pending_navigation > 0;
+                self.pending_navigation -= if forward { 1 } else { -1 };
+                self.navigation =
+                    self.index
+                        .navigation_with_block(current, forward, self.match_block.take());
+            }
+            let Some(navigation) = self.navigation.as_mut() else {
+                let changed = self.pending_navigation != 0;
+                self.pending_navigation = 0;
+                return Ok(SearchStep {
+                    changed,
+                    jump: None,
+                });
+            };
+            selection_should_jump = true;
+            navigation.advance(reader, self.query.as_str())?
+        };
+        let mut changed = advance.completed();
+        if initial_scan && (advance.selected().is_some() || advance.completed()) {
+            self.jump_pending = false;
+        }
+        if advance.completed() && self.navigation.is_some() {
+            self.match_block = self
+                .navigation
+                .as_mut()
+                .and_then(SearchNavigation::take_block);
+            self.navigation = None;
+        }
+        let jump = if let Some(selected) = advance.selected() {
+            changed |= self.current_match != Some(selected);
+            self.current_match = Some(selected);
+            selection_should_jump.then_some(selected)
+        } else {
+            None
+        };
+        Ok(SearchStep { changed, jump })
+    }
+
+    #[cfg(test)]
+    pub(super) const fn index_complete(&self) -> bool {
+        self.index.is_complete()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn jump_pending(&self) -> bool {
+        self.jump_pending
+    }
+
+    #[cfg(test)]
+    pub(super) const fn has_cached_block(&self) -> bool {
+        self.match_block.is_some()
+    }
+}
+
+impl SearchIndex {
+    #[cfg(test)]
+    fn new(
         reader: &DocumentReader<'_>,
         needle: &str,
         selection_anchor: SourceOffset,
@@ -191,15 +439,15 @@ impl SearchIndex {
         })
     }
 
-    pub(super) const fn is_complete(&self) -> bool {
+    const fn is_complete(&self) -> bool {
         self.complete
     }
 
-    pub(super) const fn has_matches(&self) -> bool {
+    const fn has_matches(&self) -> bool {
         self.first_match.is_some()
     }
 
-    pub(super) fn advance(
+    fn advance(
         &mut self,
         reader: &mut DocumentReader<'_>,
         needle: &str,
@@ -253,15 +501,11 @@ impl SearchIndex {
     }
 
     #[cfg(test)]
-    pub(super) fn navigation(
-        &self,
-        current: SearchRange,
-        forward: bool,
-    ) -> Option<SearchNavigation> {
+    fn navigation(&self, current: SearchRange, forward: bool) -> Option<SearchNavigation> {
         self.navigation_with_block(current, forward, None)
     }
 
-    pub(super) fn navigation_with_block(
+    fn navigation_with_block(
         &self,
         current: SearchRange,
         forward: bool,
@@ -276,7 +520,7 @@ impl SearchIndex {
             NavigationDirection::Backward
         };
         let checkpoint = (!forward).then(|| self.checkpoint_at_or_before(current.start()));
-        let mut block = block.filter(|block| block.belongs_to(self));
+        let mut block = block;
         if block.as_mut().is_some_and(|block| {
             let contains = block.locate(current).is_some();
             !(contains || forward && block.previous == Some(current))
@@ -311,9 +555,7 @@ impl SearchIndex {
         Some(SearchNavigation {
             document_id: self.document_id,
             cursor,
-            source_start: self.source_start,
             source_end: self.source_end,
-            query_len: self.query_len,
             current,
             previous,
             block,
@@ -329,11 +571,11 @@ impl SearchIndex {
     }
 
     #[cfg(test)]
-    pub(super) fn highlights(&self, visible: Range<SourceOffset>) -> Option<SearchHighlights> {
+    fn highlights(&self, visible: Range<SourceOffset>) -> Option<SearchHighlights> {
         self.make_highlights(visible, Vec::new(), HighlightMode::Exact)
     }
 
-    pub(super) fn display_highlights(
+    fn display_highlights(
         &self,
         visible: Range<SourceOffset>,
         targets: impl IntoIterator<Item = SearchRange>,
@@ -463,7 +705,6 @@ impl MatchBlock {
         reader: &mut DocumentReader<'_>,
         needle: &str,
         document_id: DocumentId,
-        source_start: SourceOffset,
         source_end: SourceOffset,
         start: SourceOffset,
         previous: Option<SearchRange>,
@@ -472,9 +713,6 @@ impl MatchBlock {
             return Err(SearchError::SourceMismatch.into());
         }
         let mut block = Self {
-            document_id,
-            source_start,
-            source_end,
             query_len: needle.len(),
             start,
             next: start,
@@ -486,16 +724,6 @@ impl MatchBlock {
             block.push(range.start())
         })?;
         Ok(block)
-    }
-
-    fn belongs_to(&self, index: &SearchIndex) -> bool {
-        self.document_id == index.document_id
-            && self.source_start == index.source_start
-            && self.source_end == index.source_end
-            && self.query_len == index.query_len
-            && self.start >= self.source_start
-            && self.start < self.next
-            && self.next <= self.source_end
     }
 
     fn push(&mut self, start: SourceOffset) -> Result<(), TutError> {
@@ -592,7 +820,7 @@ impl MatchBlock {
 }
 
 impl SearchNavigation {
-    pub(super) fn advance(
+    fn advance(
         &mut self,
         reader: &mut DocumentReader<'_>,
         needle: &str,
@@ -600,14 +828,13 @@ impl SearchNavigation {
         if reader.document_id() != self.document_id {
             return Err(SearchError::SourceMismatch.into());
         }
-        debug_assert_eq!(needle.len(), self.query_len);
         match self.direction {
             NavigationDirection::Forward => self.advance_forward(reader, needle),
             NavigationDirection::Backward => self.advance_backward(reader, needle),
         }
     }
 
-    pub(super) fn take_block(&mut self) -> Option<MatchBlock> {
+    fn take_block(&mut self) -> Option<MatchBlock> {
         self.block.take()
     }
 
@@ -658,7 +885,6 @@ impl SearchNavigation {
             reader,
             needle,
             self.document_id,
-            self.source_start,
             self.source_end,
             self.cursor,
             self.previous,
@@ -723,7 +949,6 @@ impl SearchNavigation {
             reader,
             needle,
             self.document_id,
-            self.source_start,
             self.source_end,
             self.cursor,
             self.previous,
@@ -755,7 +980,7 @@ impl SearchNavigation {
 }
 
 #[derive(Debug)]
-pub(super) struct SearchHighlights {
+struct SearchHighlights {
     document_id: DocumentId,
     visible: Range<SourceOffset>,
     cursor: SourceOffset,
@@ -776,23 +1001,19 @@ enum HighlightMode {
 }
 
 impl SearchHighlights {
-    pub(super) const fn is_complete(&self) -> bool {
+    const fn is_complete(&self) -> bool {
         self.complete
     }
 
-    pub(super) fn covers(&self, visible: &Range<SourceOffset>) -> bool {
+    fn covers(&self, visible: &Range<SourceOffset>) -> bool {
         self.visible == *visible
     }
 
-    pub(super) fn ranges(&self) -> &[SearchRange] {
+    fn ranges(&self) -> &[SearchRange] {
         if self.complete { &self.ranges } else { &[] }
     }
 
-    pub(super) fn advance(
-        &mut self,
-        reader: &mut DocumentReader<'_>,
-        needle: &str,
-    ) -> Result<bool, TutError> {
+    fn advance(&mut self, reader: &mut DocumentReader<'_>, needle: &str) -> Result<bool, TutError> {
         if reader.document_id() != self.document_id {
             return Err(SearchError::SourceMismatch.into());
         }
@@ -1046,6 +1267,113 @@ mod tests {
                 return (advance.selected(), navigation.take_block(), scans);
             }
         }
+    }
+
+    fn settle_session(document: &Document, cache: &mut DocumentCache, session: &mut SearchSession) {
+        while session.has_work() {
+            let mut reader = document.reader(cache);
+            session.advance(&mut reader).unwrap();
+        }
+    }
+
+    fn request_session_navigation(
+        document: &Document,
+        cache: &mut DocumentCache,
+        session: &mut SearchSession,
+        forward: bool,
+    ) -> bool {
+        let mut reader = document.reader(cache);
+        session.request_navigation(&mut reader, forward).unwrap()
+    }
+
+    #[test]
+    fn sessions_make_equal_length_query_replacement_atomic() {
+        let document = Document::from_text(Path::new("session.txt"), "cat dog dog cat".to_owned());
+        let mut cache = DocumentCache::default();
+        let mut cat = {
+            let reader = document.reader(&mut cache);
+            SearchSession::new(&reader, "cat".to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        settle_session(&document, &mut cache, &mut cat);
+        assert_eq!(cat.current_match().unwrap().start(), SourceOffset::ZERO);
+        assert!(request_session_navigation(
+            &document, &mut cache, &mut cat, true
+        ));
+        settle_session(&document, &mut cache, &mut cat);
+        assert_eq!(cat.current_match().unwrap().start(), SourceOffset::new(12));
+        assert!(cat.has_cached_block());
+
+        let visible = document.source_start()..document.source_end();
+        let target = SearchRange::new(visible.start, visible.end).unwrap();
+        cat.prepare_highlights(visible.clone(), [target]).unwrap();
+        settle_session(&document, &mut cache, &mut cat);
+        assert_eq!(cat.highlight_ranges(&visible), &[target]);
+
+        let mut dog = {
+            let reader = document.reader(&mut cache);
+            SearchSession::new(&reader, "dog".to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(dog.query(), "dog");
+        assert_eq!(dog.current_match(), None);
+        assert_eq!(dog.highlight_ranges(&visible), &[]);
+        settle_session(&document, &mut cache, &mut dog);
+        assert_eq!(dog.current_match().unwrap().start(), SourceOffset::new(4));
+        assert!(request_session_navigation(
+            &document, &mut cache, &mut dog, true
+        ));
+        settle_session(&document, &mut cache, &mut dog);
+        assert_eq!(dog.current_match().unwrap().start(), SourceOffset::new(8));
+    }
+
+    #[test]
+    fn session_constructor_enforces_query_boundaries() {
+        let document = Document::from_text(Path::new("session.txt"), "body".to_owned());
+        let mut cache = DocumentCache::default();
+        let reader = document.reader(&mut cache);
+
+        assert!(
+            SearchSession::new(&reader, String::new(), SourceOffset::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            SearchSession::new(
+                &reader,
+                "q".repeat(MAX_SEARCH_QUERY_BYTES + 1),
+                SourceOffset::ZERO,
+            ),
+            Err(TutError::Search(SearchError::QueryTooLong {
+                limit: MAX_SEARCH_QUERY_BYTES
+            }))
+        ));
+    }
+
+    #[test]
+    fn sessions_reject_readers_from_another_document() {
+        let first = Document::from_text(Path::new("first.txt"), "cat".to_owned());
+        let second = Document::from_text(Path::new("second.txt"), "cat".to_owned());
+        let mut first_cache = DocumentCache::default();
+        let mut session = {
+            let reader = first.reader(&mut first_cache);
+            SearchSession::new(&reader, "cat".to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        let mut second_cache = DocumentCache::default();
+        let mut reader = second.reader(&mut second_cache);
+
+        assert!(matches!(
+            session.request_navigation(&mut reader, true),
+            Err(TutError::Search(SearchError::SourceMismatch))
+        ));
+        assert!(matches!(
+            session.advance(&mut reader),
+            Err(TutError::Search(SearchError::SourceMismatch))
+        ));
     }
 
     #[test]

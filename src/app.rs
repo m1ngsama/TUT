@@ -12,10 +12,7 @@ use crate::{
     },
     line_index::LinePosition,
     locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator},
-    search::{
-        MAX_SEARCH_QUERY_BYTES, MatchBlock, SearchHighlights, SearchIndex, SearchNavigation,
-        SearchRange,
-    },
+    search::{MAX_SEARCH_QUERY_BYTES, SearchRange, SearchSession},
     source::SourceOffset,
 };
 
@@ -437,19 +434,12 @@ pub(super) struct App {
     follow_end: bool,
     geometry: Geometry,
     mode: Mode,
-    committed_query: String,
-    search_index: Option<SearchIndex>,
-    current_match: Option<SearchRange>,
-    navigation: Option<SearchNavigation>,
-    match_block: Option<MatchBlock>,
-    pending_navigation: i64,
-    highlights: Option<SearchHighlights>,
+    search: Option<SearchSession>,
     viewport_request: Option<ViewportRequest>,
     locator: Option<ViewportLocator>,
     row_neighborhood: RowNeighborhood,
     render_cache: Option<RenderViewportCache>,
     queued_rows: i64,
-    search_jump_pending: bool,
     search_turn: bool,
 }
 
@@ -471,19 +461,12 @@ impl App {
             follow_end: false,
             geometry: Geometry::new(0, 0),
             mode: Mode::Reading,
-            committed_query: String::new(),
-            search_index: None,
-            current_match: None,
-            navigation: None,
-            match_block: None,
-            pending_navigation: 0,
-            highlights: None,
+            search: None,
             viewport_request: None,
             locator: None,
             row_neighborhood: RowNeighborhood::default(),
             render_cache: None,
             queued_rows: 0,
-            search_jump_pending: false,
             search_turn: true,
         }
     }
@@ -496,26 +479,25 @@ impl App {
         &self.mode
     }
 
+    #[cfg(test)]
+    fn current_match(&self) -> Option<SearchRange> {
+        self.search.as_ref().and_then(SearchSession::current_match)
+    }
+
     pub(super) fn search_status(&self) -> SearchStatus<'_> {
         match &self.mode {
             Mode::SearchInput { draft, limit_hit } => SearchStatus::Draft {
                 draft,
                 limit_hit: *limit_hit,
             },
-            Mode::Reading if self.committed_query.is_empty() => SearchStatus::None,
-            Mode::Reading => SearchStatus::Committed {
-                query: &self.committed_query,
-                no_matches: self
-                    .search_index
-                    .as_ref()
-                    .is_some_and(|index| index.is_complete() && !index.has_matches()),
-                searching: self
-                    .search_index
-                    .as_ref()
-                    .is_some_and(|index| !index.is_complete())
-                    || self.navigation.is_some()
-                    || self.pending_navigation != 0
-                    || matches!(self.viewport_request, Some(ViewportRequest::Search { .. })),
+            Mode::Reading => match &self.search {
+                None => SearchStatus::None,
+                Some(search) => SearchStatus::Committed {
+                    query: search.query(),
+                    no_matches: search.no_matches(),
+                    searching: search.is_searching()
+                        || matches!(self.viewport_request, Some(ViewportRequest::Search { .. })),
+                },
             },
         }
     }
@@ -544,14 +526,13 @@ impl App {
         self.prepare_search_highlights(viewport)?;
         let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
-        let ranges = if let Some(viewport) = viewport {
+        let (ranges, current) = if let Some(viewport) = viewport {
             let visible = viewport.first_visible_start..viewport.visible_end;
-            self.highlights
-                .as_ref()
-                .filter(|highlights| highlights.covers(&visible))
-                .map_or(&[][..], SearchHighlights::ranges)
+            self.search.as_ref().map_or((&[][..], None), |search| {
+                (search.highlight_ranges(&visible), search.current_match())
+            })
         } else {
-            &[]
+            (&[][..], None)
         };
         let rows = self
             .render_cache
@@ -560,7 +541,7 @@ impl App {
         Ok(RenderState {
             filename: self.document.display_name(),
             path: self.document.display_path(),
-            rows: RenderRowsView::new(rows, ranges, self.current_match),
+            rows: RenderRowsView::new(rows, ranges, current),
             progress,
             current_line: line.map(LinePosition::current),
             total_lines: line.and_then(LinePosition::total),
@@ -570,27 +551,19 @@ impl App {
 
     fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) -> Result<(), TutError> {
         let Some(viewport) = viewport else {
-            self.highlights = None;
+            if let Some(search) = &mut self.search {
+                search.invalidate_highlights();
+            }
             return Ok(());
         };
         let visible = viewport.first_visible_start..viewport.visible_end;
         if !matches!(self.mode, Mode::Reading) {
-            self.highlights = None;
+            if let Some(search) = &mut self.search {
+                search.invalidate_highlights();
+            }
             return Ok(());
         }
-        if self
-            .highlights
-            .as_ref()
-            .is_some_and(|highlights| highlights.covers(&visible))
-        {
-            return Ok(());
-        }
-        self.highlights = None;
-        let Some(index) = self
-            .search_index
-            .as_ref()
-            .filter(|index| index.is_complete() && index.has_matches())
-        else {
+        let Some(search) = &mut self.search else {
             return Ok(());
         };
         let rows = &self
@@ -602,8 +575,7 @@ impl App {
             SearchRange::new(span.source.start(), span.source.end())
                 .expect("render spans retain nonempty source ranges")
         });
-        self.highlights = index.display_highlights(visible, targets)?;
-        Ok(())
+        search.prepare_highlights(visible, targets)
     }
 
     fn line_position_for(
@@ -624,16 +596,7 @@ impl App {
                 && self.viewport_request.is_some())
             || (matches!(self.mode, Mode::Reading)
                 && self.geometry.is_usable()
-                && (self
-                    .search_index
-                    .as_ref()
-                    .is_some_and(|index| !index.is_complete())
-                    || self.navigation.is_some()
-                    || self.pending_navigation != 0
-                    || self
-                        .highlights
-                        .as_ref()
-                        .is_some_and(|highlights| !highlights.is_complete())))
+                && self.search.as_ref().is_some_and(SearchSession::has_work))
     }
 
     pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
@@ -657,16 +620,7 @@ impl App {
         }
         let search_pending = matches!(self.mode, Mode::Reading)
             && self.geometry.is_usable()
-            && (self
-                .search_index
-                .as_ref()
-                .is_some_and(|index| !index.is_complete())
-                || self.navigation.is_some()
-                || self.pending_navigation != 0
-                || self
-                    .highlights
-                    .as_ref()
-                    .is_some_and(|highlights| !highlights.is_complete()));
+            && self.search.as_ref().is_some_and(SearchSession::has_work);
         let line_pending = !self.document.line_index_complete();
         if search_pending && (!line_pending || self.search_turn) {
             self.search_turn = false;
@@ -755,61 +709,17 @@ impl App {
     }
 
     fn advance_search(&mut self) -> Result<bool, TutError> {
-        let Some(index) = self.search_index.as_mut() else {
+        let Some(search) = self.search.as_mut() else {
             return Ok(false);
         };
-        let initial_scan = !index.is_complete();
-        let selection_should_jump;
-        let advance = if initial_scan {
-            selection_should_jump = self.search_jump_pending;
-            let mut reader = self.document.reader(&mut self.search_cache);
-            index.advance(&mut reader, &self.committed_query)?
-        } else {
-            if self.navigation.is_none() {
-                if self.pending_navigation == 0 {
-                    let Some(highlights) = self.highlights.as_mut() else {
-                        return Ok(false);
-                    };
-                    let mut reader = self.document.reader(&mut self.search_cache);
-                    return highlights.advance(&mut reader, &self.committed_query);
-                }
-                let Some(current) = self.current_match else {
-                    let changed = self.pending_navigation != 0;
-                    self.pending_navigation = 0;
-                    self.search_jump_pending = false;
-                    return Ok(changed);
-                };
-                let forward = self.pending_navigation > 0;
-                self.pending_navigation -= if forward { 1 } else { -1 };
-                self.navigation =
-                    index.navigation_with_block(current, forward, self.match_block.take());
-            }
-            let Some(navigation) = self.navigation.as_mut() else {
-                let changed = self.pending_navigation != 0;
-                self.pending_navigation = 0;
-                return Ok(changed);
-            };
-            selection_should_jump = true;
-            let mut reader = self.document.reader(&mut self.search_cache);
-            navigation.advance(&mut reader, &self.committed_query)?
-        };
-        let mut changed = advance.completed();
-        if initial_scan && (advance.selected().is_some() || advance.completed()) {
-            self.search_jump_pending = false;
-        }
-        if advance.completed() && self.navigation.is_some() {
-            self.match_block = self
-                .navigation
-                .as_mut()
-                .and_then(SearchNavigation::take_block);
-            self.navigation = None;
-        }
-        if let Some(selected) = advance.selected() {
-            changed |= self.current_match != Some(selected);
-            self.current_match = Some(selected);
-            if selection_should_jump && self.viewport_request.is_none() && !self.follow_end {
-                changed |= self.schedule_search_jump(selected);
-            }
+        let mut reader = self.document.reader(&mut self.search_cache);
+        let step = search.advance(&mut reader)?;
+        let mut changed = step.changed();
+        if let Some(selected) = step.jump()
+            && self.viewport_request.is_none()
+            && !self.follow_end
+        {
+            changed |= self.schedule_search_jump(selected);
         }
         Ok(changed)
     }
@@ -852,8 +762,8 @@ impl App {
             Action::SearchCommit if editing => self.commit_search()?,
             Action::SearchCancel if editing => self.cancel_search(),
             Action::SearchCancel if reading => self.cancel_committed_search(),
-            Action::NextMatch if reading => self.select_match(true),
-            Action::PreviousMatch if reading => self.select_match(false),
+            Action::NextMatch if reading => self.select_match(true)?,
+            Action::PreviousMatch if reading => self.select_match(false)?,
             _ => false,
         };
 
@@ -884,7 +794,9 @@ impl App {
         if !geometry_changed {
             return false;
         }
-        self.highlights = None;
+        if let Some(search) = &mut self.search {
+            search.invalidate_highlights();
+        }
         if self.geometry.content_width() != geometry.content_width() {
             self.row_neighborhood.clear();
             self.anchor_is_row_start = self.anchor == self.document.source_start();
@@ -922,10 +834,9 @@ impl App {
     }
 
     fn move_rows(&mut self, downward: bool, amount: usize) -> bool {
-        let canceled_search = self.cancel_search_navigation();
-        let canceled_jump = std::mem::take(&mut self.search_jump_pending);
+        let canceled_search = self.cancel_search_motion();
         if downward && self.follow_end && self.viewport_request.is_none() {
-            return canceled_search || canceled_jump;
+            return canceled_search;
         }
 
         let amount = i64::try_from(amount).expect("viewport row counts fit in i64");
@@ -938,16 +849,15 @@ impl App {
         let canceled_viewport = self.cancel_viewport_request();
         self.queued_rows = delta;
         let scheduled = self.start_queued_move();
-        canceled_search || canceled_jump || canceled_viewport || scheduled
+        canceled_search || canceled_viewport || scheduled
     }
 
     fn document_start(&mut self) -> bool {
         let source_start = self.document.source_start();
-        let changed = self.cancel_viewport_request()
-            || self.cancel_search_navigation()
-            || std::mem::take(&mut self.search_jump_pending)
-            || self.anchor != source_start
-            || self.follow_end;
+        let canceled_viewport = self.cancel_viewport_request();
+        let canceled_search = self.cancel_search_motion();
+        let changed =
+            canceled_viewport || canceled_search || self.anchor != source_start || self.follow_end;
         self.anchor = source_start;
         self.anchor_is_row_start = true;
         self.follow_end = false;
@@ -955,13 +865,12 @@ impl App {
     }
 
     fn document_end(&mut self) -> bool {
-        let canceled_search = self.cancel_search_navigation();
-        let canceled_jump = std::mem::take(&mut self.search_jump_pending);
+        let canceled_search = self.cancel_search_motion();
         if self.viewport_request == Some(ViewportRequest::End) {
-            return canceled_search || canceled_jump;
+            return canceled_search;
         }
         if self.follow_end && self.viewport_request.is_none() {
-            return canceled_search || canceled_jump;
+            return canceled_search;
         }
         self.cancel_viewport_request();
         self.viewport_request = Some(ViewportRequest::End);
@@ -1007,23 +916,20 @@ impl App {
         true
     }
 
-    fn cancel_search_navigation(&mut self) -> bool {
-        let changed = self.navigation.is_some() || self.pending_navigation != 0;
-        if let Some(mut navigation) = self.navigation.take()
-            && let Some(block) = navigation.take_block()
-        {
-            self.match_block = Some(block);
-        }
-        self.pending_navigation = 0;
-        changed
+    fn cancel_search_motion(&mut self) -> bool {
+        self.search
+            .as_mut()
+            .is_some_and(SearchSession::cancel_motion)
     }
 
     fn begin_search(&mut self) -> bool {
         if !matches!(self.viewport_request, Some(ViewportRequest::Reflow { .. })) {
             self.cancel_viewport_request();
         }
-        self.cancel_search_navigation();
-        self.search_jump_pending = false;
+        self.cancel_search_motion();
+        if let Some(search) = &mut self.search {
+            search.invalidate_highlights();
+        }
         self.mode = Mode::SearchInput {
             draft: String::new(),
             limit_hit: false,
@@ -1067,21 +973,14 @@ impl App {
     }
 
     fn cancel_committed_search(&mut self) -> bool {
-        if self.committed_query.is_empty() {
+        if self.search.is_none() {
             return false;
         }
         if matches!(self.viewport_request, Some(ViewportRequest::Search { .. })) {
             self.viewport_request = None;
             self.locator = None;
         }
-        self.committed_query.clear();
-        self.search_index = None;
-        self.current_match = None;
-        self.navigation = None;
-        self.match_block = None;
-        self.pending_navigation = 0;
-        self.highlights = None;
-        self.search_jump_pending = false;
+        self.search = None;
         true
     }
 
@@ -1092,14 +991,7 @@ impl App {
         };
 
         if draft.is_empty() {
-            self.committed_query.clear();
-            self.search_index = None;
-            self.current_match = None;
-            self.navigation = None;
-            self.match_block = None;
-            self.pending_navigation = 0;
-            self.highlights = None;
-            self.search_jump_pending = false;
+            self.search = None;
             return Ok(true);
         }
 
@@ -1109,40 +1001,23 @@ impl App {
                 viewport.first_visible_start
             });
         let reader = self.document.reader(&mut self.search_cache);
-        let index = SearchIndex::new(&reader, &draft, first_visible)?
-            .expect("nonempty queries create search indexes");
-        let search_jump_pending = !index.is_complete();
-        self.committed_query = draft;
-        self.search_index = Some(index);
-        self.current_match = None;
-        self.navigation = None;
-        self.match_block = None;
-        self.pending_navigation = 0;
-        self.highlights = None;
+        self.search = SearchSession::new(&reader, draft, first_visible)?;
         self.follow_end = false;
-        self.search_jump_pending = search_jump_pending;
         self.search_turn = true;
         Ok(true)
     }
 
-    fn select_match(&mut self, forward: bool) -> bool {
-        let Some(index) = self.search_index.as_ref() else {
-            return false;
+    fn select_match(&mut self, forward: bool) -> Result<bool, TutError> {
+        let Some(search) = self.search.as_mut() else {
+            return Ok(false);
         };
-        if index.is_complete() && self.current_match.is_none() {
-            return false;
+        let mut reader = self.document.reader(&mut self.search_cache);
+        if !search.request_navigation(&mut reader, forward)? {
+            return Ok(false);
         }
         self.cancel_viewport_request();
         self.follow_end = false;
-        if self.current_match.is_none() {
-            self.search_jump_pending = true;
-        }
-        self.pending_navigation = if forward {
-            self.pending_navigation.saturating_add(1)
-        } else {
-            self.pending_navigation.saturating_sub(1)
-        };
-        true
+        Ok(true)
     }
 
     fn schedule_search_jump(&mut self, selected: SearchRange) -> bool {
@@ -1604,7 +1479,7 @@ mod tests {
         assert!(app.viewport_request.is_none());
 
         submit(&mut app, "needle");
-        advance_until(&mut app, |app| app.current_match.is_some());
+        advance_until(&mut app, |app| app.current_match().is_some());
         assert!(matches!(
             app.viewport_request,
             Some(ViewportRequest::Search { .. })
@@ -1762,8 +1637,11 @@ mod tests {
         settle(&mut app);
 
         assert_eq!(app.anchor, SourceOffset::new(16));
-        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
-        assert!(!app.search_jump_pending);
+        assert_eq!(
+            app.current_match().unwrap().end(),
+            app.document.source_end()
+        );
+        assert!(!app.search.as_ref().unwrap().jump_pending());
         assert!(app.viewport_request.is_none());
     }
 
@@ -1822,12 +1700,32 @@ mod tests {
         app.update(Action::DocumentEnd).unwrap();
         settle(&mut app);
 
-        assert_eq!(app.current_match.unwrap().start(), SourceOffset::ZERO);
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::ZERO);
         assert_eq!(
             app.anchor,
             SourceOffset::from_usize(text.len() - text.len().rem_euclid(16))
         );
         assert!(app.follow_end);
+    }
+
+    #[test]
+    fn document_start_cancels_viewport_and_search_work_together() {
+        let mut app = reader("cat cat", 16, 4);
+        commit(&mut app, "cat");
+        let requested = {
+            let mut reader = app.document.reader(&mut app.search_cache);
+            app.search
+                .as_mut()
+                .unwrap()
+                .request_navigation(&mut reader, true)
+                .unwrap()
+        };
+        assert!(requested);
+        app.viewport_request = Some(ViewportRequest::Reflow { target: app.anchor });
+
+        assert_eq!(app.update(Action::DocumentStart).unwrap(), Outcome::Changed);
+        assert!(app.viewport_request.is_none());
+        assert!(!app.search.as_ref().unwrap().is_searching());
     }
 
     #[test]
@@ -1843,13 +1741,13 @@ mod tests {
     fn search_editing_is_transactional_and_grapheme_aware() {
         let mut app = reader("alpha beta alpha", 16, 5);
         commit(&mut app, "alpha");
-        let first = app.current_match.unwrap();
+        let first = app.current_match().unwrap();
         app.update(Action::NextMatch).unwrap();
         settle(&mut app);
-        assert_ne!(app.current_match, Some(first));
+        assert_ne!(app.current_match(), Some(first));
         app.update(Action::PreviousMatch).unwrap();
         settle(&mut app);
-        assert_eq!(app.current_match, Some(first));
+        assert_eq!(app.current_match(), Some(first));
 
         app.update(Action::BeginSearch).unwrap();
         app.update(Action::SearchInsert('e')).unwrap();
@@ -1860,7 +1758,7 @@ mod tests {
             SearchStatus::Draft { draft: "", .. }
         ));
         app.update(Action::SearchCancel).unwrap();
-        assert_eq!(app.committed_query, "alpha");
+        assert_eq!(app.search.as_ref().unwrap().query(), "alpha");
     }
 
     #[test]
@@ -1895,11 +1793,11 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(app.current_match, None);
+        assert_eq!(app.current_match(), None);
         assert!(app.has_background_work());
 
         app.advance_background().unwrap();
-        assert_eq!(app.current_match, None);
+        assert_eq!(app.current_match(), None);
         assert_eq!(app.update(Action::SearchCancel).unwrap(), Outcome::Changed);
         assert_eq!(app.search_status(), SearchStatus::None);
         assert!(!app.has_background_work());
@@ -1917,7 +1815,7 @@ mod tests {
         assert!(!app.has_background_work());
         assert!(!app.advance_background().unwrap());
         assert_eq!(app.anchor, anchor);
-        assert_eq!(app.current_match, None);
+        assert_eq!(app.current_match(), None);
 
         app.update(Action::SearchCancel).unwrap();
         assert!(app.has_background_work());
@@ -1933,11 +1831,14 @@ mod tests {
         app.update(Action::Resize(Geometry::new(10, 3))).unwrap();
         assert!(!app.has_background_work());
         assert!(!app.advance_background().unwrap());
-        assert_eq!(app.current_match, None);
+        assert_eq!(app.current_match(), None);
 
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
         settle(&mut app);
-        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
+        assert_eq!(
+            app.current_match().unwrap().end(),
+            app.document.source_end()
+        );
     }
 
     #[test]
@@ -1950,7 +1851,7 @@ mod tests {
         app.advance_background().unwrap();
 
         assert_eq!(
-            app.current_match.unwrap().start(),
+            app.current_match().unwrap().start(),
             app.document.source_start()
         );
         assert!(matches!(
@@ -1970,10 +1871,10 @@ mod tests {
         let mut app = reader(&text, 16, 4);
         submit(&mut app, "cat");
         app.advance_background().unwrap();
-        let first = app.current_match.unwrap();
+        let first = app.current_match().unwrap();
 
         app.update(Action::NextMatch).unwrap();
-        assert_eq!(app.current_match, Some(first));
+        assert_eq!(app.current_match(), Some(first));
         assert!(matches!(
             app.search_status(),
             SearchStatus::Committed {
@@ -1983,7 +1884,10 @@ mod tests {
         ));
         settle(&mut app);
 
-        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
+        assert_eq!(
+            app.current_match().unwrap().end(),
+            app.document.source_end()
+        );
     }
 
     #[test]
@@ -1995,13 +1899,40 @@ mod tests {
 
         submit(&mut app, "alpha");
         app.advance_background().unwrap();
-        assert!(app.current_match.is_some());
+        assert!(app.current_match().is_some());
         submit(&mut app, "beta");
-        assert_eq!(app.current_match, None);
+        assert_eq!(app.current_match(), None);
         settle(&mut app);
 
-        assert_eq!(app.committed_query, "beta");
-        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
+        assert_eq!(app.search.as_ref().unwrap().query(), "beta");
+        assert_eq!(
+            app.current_match().unwrap().end(),
+            app.document.source_end()
+        );
+    }
+
+    #[test]
+    fn equal_length_query_replacement_discards_all_derived_state() {
+        let mut app = reader("cat dog dog cat", 16, 5);
+        commit(&mut app, "cat");
+        app.update(Action::NextMatch).unwrap();
+        settle(&mut app);
+        app.render_state().unwrap();
+        settle(&mut app);
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(12));
+        assert!(app.search.as_ref().unwrap().has_cached_block());
+
+        submit(&mut app, "dog");
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.query(), "dog");
+        assert_eq!(search.current_match(), None);
+        assert!(!search.has_cached_block());
+        settle(&mut app);
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(4));
+
+        app.update(Action::NextMatch).unwrap();
+        settle(&mut app);
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(8));
     }
 
     #[test]
@@ -2105,7 +2036,7 @@ mod tests {
         assert_eq!((state.current_line, state.total_lines), (Some(1), Some(3)));
 
         commit(&mut app, "cat");
-        assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(6));
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(6));
         assert_eq!(
             highlighted_row(&app.render_state().unwrap(), 1)[0].1,
             Highlight::Current
@@ -2125,7 +2056,7 @@ mod tests {
         app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
 
         commit(&mut app, "needle");
-        assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(9));
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(9));
         let state = app.render_state().unwrap();
         assert!((0..state.rows.len()).any(|index| {
             highlighted_row(&state, index)
@@ -2175,12 +2106,30 @@ mod tests {
         commit(&mut app, "cat");
         app.update(Action::NextMatch).unwrap();
         settle(&mut app);
-        assert!(app.match_block.is_some());
+        assert!(app.search.as_ref().unwrap().has_cached_block());
 
         fs::write(&path, "dog dog dog").unwrap();
         app.update(Action::NextMatch).unwrap();
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
+    }
+
+    #[test]
+    fn cached_no_match_navigation_still_rejects_in_place_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-no-match.txt");
+        fs::write(&path, "cat").unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        commit(&mut app, "dog");
+        assert!(app.search.as_ref().unwrap().no_matches());
+
+        fs::write(&path, "dog").unwrap();
+
+        assert!(matches!(
+            app.update(Action::NextMatch),
+            Err(TutError::Load(_))
+        ));
     }
 
     #[test]
@@ -2229,17 +2178,20 @@ mod tests {
         let first_frontier = SourceOffset::from_usize(SOURCE_WINDOW_BYTES);
 
         assert!(!app.document.line_index_covers(first_frontier));
-        assert!(!app.search_index.as_ref().unwrap().is_complete());
+        assert!(!app.search.as_ref().unwrap().index_complete());
         assert!(!app.advance_background().unwrap());
         assert!(!app.document.line_index_covers(first_frontier));
         assert!(!app.advance_background().unwrap());
         assert!(app.document.line_index_covers(first_frontier));
-        assert!(!app.search_index.as_ref().unwrap().is_complete());
+        assert!(!app.search.as_ref().unwrap().index_complete());
 
         settle(&mut app);
         assert!(app.document.line_index_complete());
-        assert!(app.search_index.as_ref().unwrap().is_complete());
-        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
+        assert!(app.search.as_ref().unwrap().index_complete());
+        assert_eq!(
+            app.current_match().unwrap().end(),
+            app.document.source_end()
+        );
     }
 
     #[test]
