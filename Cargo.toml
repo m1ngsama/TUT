@@ -11,11 +11,11 @@ description = "A local plain-text reader for the terminal"
 [dependencies]
 crossterm = "0.29"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "stdio", "termios"] }
 signal-hook = "0.3"
+tempfile = "3"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 
 [dev-dependencies]
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
-tempfile = "3"

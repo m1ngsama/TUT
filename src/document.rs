@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io,
+    io::{self, Read, Write},
     num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
@@ -18,6 +18,7 @@ use crate::{
 
 pub const MAX_FILE_BYTES: u64 = 33_554_432;
 pub(super) const SOURCE_WINDOW_BYTES: usize = 64 * 1024;
+const STANDARD_INPUT_NAME: &str = "standard input";
 const UTF8_BOM_BYTES: usize = 3;
 const UTF8_BOUNDARY_SLOP_BYTES: usize = 3;
 const MAX_GRAPHEME_BYTES: usize = 1024 * 1024;
@@ -150,6 +151,32 @@ impl Document {
     }
 
     fn from_parts(path: &Path, store: DocumentStore, line_index: LineIndex) -> Self {
+        Self::assemble(
+            path.to_path_buf(),
+            sanitize_os(path.as_os_str()),
+            sanitize_os(path.file_name().unwrap_or(path.as_os_str())),
+            store,
+            line_index,
+        )
+    }
+
+    fn from_standard_input(store: DocumentStore, line_index: LineIndex) -> Self {
+        Self::assemble(
+            PathBuf::from(STANDARD_INPUT_NAME),
+            STANDARD_INPUT_NAME.to_owned(),
+            STANDARD_INPUT_NAME.to_owned(),
+            store,
+            line_index,
+        )
+    }
+
+    fn assemble(
+        path: PathBuf,
+        display_path: String,
+        display_name: String,
+        store: DocumentStore,
+        line_index: LineIndex,
+    ) -> Self {
         let source_start = store.source_start();
         let source_end = store.source_end();
         Self {
@@ -158,9 +185,9 @@ impl Document {
             line_index,
             source_start,
             source_end,
-            path: path.to_path_buf(),
-            display_path: sanitize_os(path.as_os_str()),
-            display_name: sanitize_os(path.file_name().unwrap_or(path.as_os_str())),
+            path,
+            display_path,
+            display_name,
         }
     }
 }
@@ -915,6 +942,119 @@ fn copy_source<'a>(
         .expect("copied source windows retain validated coordinates"))
 }
 
+pub(super) fn load_standard_input(reader: &mut impl Read) -> Result<Document, LoadError> {
+    load_standard_input_with_limit(reader, MAX_FILE_BYTES)
+}
+
+fn load_standard_input_with_limit(
+    reader: &mut impl Read,
+    limit: u64,
+) -> Result<Document, LoadError> {
+    let mut file =
+        tempfile::tempfile().map_err(|source| LoadError::BufferStandardInput { source })?;
+    let mut buffer = [0_u8; SOURCE_WINDOW_BYTES];
+    let mut validator = Utf8StreamValidator::default();
+    let mut total = 0_u64;
+
+    loop {
+        let probe = limit.saturating_sub(total).saturating_add(1);
+        let request = usize::try_from(probe.min(SOURCE_WINDOW_BYTES as u64))
+            .expect("bounded standard-input reads fit usize");
+        let count = match reader.read(&mut buffer[..request]) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => return Err(LoadError::ReadStandardInput { source }),
+        };
+        let next = total
+            .checked_add(u64::try_from(count).expect("source windows fit u64"))
+            .filter(|next| *next <= limit)
+            .ok_or(LoadError::StandardInputTooLarge { limit })?;
+        validator.advance(&buffer[..count], total);
+        if validator.invalid_offset.is_none() {
+            file.write_all(&buffer[..count])
+                .map_err(|source| LoadError::BufferStandardInput { source })?;
+        }
+        total = next;
+    }
+
+    if let Some(offset) = validator.finish() {
+        return Err(LoadError::InvalidStandardInputUtf8 { offset });
+    }
+
+    let path = PathBuf::from(STANDARD_INPUT_NAME);
+    let store = FileStore::from_file(file, path.clone(), limit)?;
+    let line_index = LineIndex::new(store.source_start, store.source_end)
+        .map_err(|error| map_line_index_error(&path, error))?;
+    Ok(Document::from_standard_input(
+        DocumentStore::File(store),
+        line_index,
+    ))
+}
+
+#[derive(Debug, Default)]
+struct Utf8StreamValidator {
+    tail: [u8; 4],
+    tail_len: usize,
+    tail_start: u64,
+    invalid_offset: Option<u64>,
+}
+
+impl Utf8StreamValidator {
+    fn advance(&mut self, bytes: &[u8], start: u64) {
+        if self.invalid_offset.is_some() {
+            return;
+        }
+
+        let mut consumed = 0;
+        while self.tail_len != 0 && consumed < bytes.len() {
+            self.tail[self.tail_len] = bytes[consumed];
+            self.tail_len += 1;
+            consumed += 1;
+            match std::str::from_utf8(&self.tail[..self.tail_len]) {
+                Ok(_) => self.tail_len = 0,
+                Err(error) if error.error_len().is_some() => {
+                    self.invalid_offset = Some(
+                        self.tail_start
+                            + u64::try_from(error.valid_up_to()).expect("UTF-8 tails fit u64"),
+                    );
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        if self.tail_len != 0 {
+            return;
+        }
+
+        let remaining = &bytes[consumed..];
+        let Err(error) = std::str::from_utf8(remaining) else {
+            return;
+        };
+        let valid = error.valid_up_to();
+        let invalid_start =
+            start + u64::try_from(consumed + valid).expect("source windows fit u64");
+        if error.error_len().is_some() {
+            self.invalid_offset = Some(invalid_start);
+            return;
+        }
+
+        let incomplete = &remaining[valid..];
+        debug_assert!(incomplete.len() < self.tail.len());
+        self.tail[..incomplete.len()].copy_from_slice(incomplete);
+        self.tail_len = incomplete.len();
+        self.tail_start = invalid_start;
+    }
+
+    const fn finish(&self) -> Option<u64> {
+        match (self.invalid_offset, self.tail_len) {
+            (Some(offset), _) => Some(offset),
+            (None, 0) => None,
+            (None, _) => Some(self.tail_start),
+        }
+    }
+}
+
 pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
     let store = FileStore::open(path, MAX_FILE_BYTES)?;
     let path = store.path.clone();
@@ -1006,7 +1146,10 @@ impl FileStore {
             source: io::Error::from(source),
         })?;
 
-        let file = File::from(descriptor);
+        Self::from_file(File::from(descriptor), path, limit)
+    }
+
+    fn from_file(file: File, path: PathBuf, limit: u64) -> Result<Self, LoadError> {
         let metadata = file.metadata().map_err(|source| LoadError::Read {
             path: path.clone(),
             source,
@@ -1326,7 +1469,10 @@ impl FileStore {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        io::{self, Cursor, Read},
+    };
 
     use tempfile::tempdir;
     use unicode_segmentation::UnicodeSegmentation;
@@ -1357,6 +1503,164 @@ mod tests {
             cursor = window.end();
         }
         output
+    }
+
+    struct ChunkedReader {
+        bytes: Vec<u8>,
+        cursor: usize,
+        chunk: usize,
+        interrupted: bool,
+    }
+
+    impl ChunkedReader {
+        fn new(bytes: &[u8], chunk: usize) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                cursor: 0,
+                chunk,
+                interrupted: true,
+            }
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.interrupted {
+                self.interrupted = false;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.cursor == self.bytes.len() {
+                return Ok(0);
+            }
+            let count = output
+                .len()
+                .min(self.chunk)
+                .min(self.bytes.len() - self.cursor);
+            output[..count].copy_from_slice(&self.bytes[self.cursor..self.cursor + count]);
+            self.cursor += count;
+            Ok(count)
+        }
+    }
+
+    struct EndlessReader {
+        consumed: usize,
+    }
+
+    impl Read for EndlessReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            output.fill(b'a');
+            self.consumed += output.len();
+            Ok(output.len())
+        }
+    }
+
+    struct FailedReader;
+
+    impl Read for FailedReader {
+        fn read(&mut self, _output: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("source failed"))
+        }
+    }
+
+    #[test]
+    fn standard_input_preserves_bom_coordinates_and_display_identity() {
+        let bytes = b"\xef\xbb\xbfone\r\ntwo\n";
+        let mut reader = Cursor::new(bytes);
+        let mut document = load_standard_input(&mut reader).unwrap();
+        assert_eq!(document.display_name(), STANDARD_INPUT_NAME);
+        assert_eq!(document.display_path(), STANDARD_INPUT_NAME);
+        assert_eq!(document.source_start(), SourceOffset::new(3));
+        assert_eq!(
+            document.source_end(),
+            SourceOffset::new(u64::try_from(bytes.len()).unwrap())
+        );
+        assert_eq!(read_all(&document), "one\r\ntwo\n");
+        finish_index(&mut document).unwrap();
+        let mut cache = DocumentCache::default();
+        let position = document
+            .reader(&mut cache)
+            .line_position(document.source_end())
+            .unwrap()
+            .unwrap();
+        assert_eq!((position.current(), position.total()), (3, Some(3)));
+    }
+
+    #[test]
+    fn standard_input_enforces_its_limit_with_one_probe_byte() {
+        let mut exact = Cursor::new(b"abcd");
+        let document = load_standard_input_with_limit(&mut exact, 4).unwrap();
+        assert_eq!(read_all(&document), "abcd");
+
+        let mut endless = EndlessReader { consumed: 0 };
+        assert!(matches!(
+            load_standard_input_with_limit(&mut endless, 4),
+            Err(LoadError::StandardInputTooLarge { limit: 4 })
+        ));
+        assert_eq!(endless.consumed, 5);
+    }
+
+    #[test]
+    fn standard_input_validates_utf8_across_every_small_chunk_size() {
+        let text = "\u{feff}\u{00a2}\u{20ac}\u{1f642}z";
+        for chunk in 1..=text.len() {
+            let mut reader = ChunkedReader::new(text.as_bytes(), chunk);
+            let document =
+                load_standard_input_with_limit(&mut reader, u64::try_from(text.len()).unwrap())
+                    .unwrap();
+            assert_eq!(read_all(&document), "\u{00a2}\u{20ac}\u{1f642}z");
+        }
+    }
+
+    #[test]
+    fn standard_input_reports_precise_utf8_errors_after_size_resolution() {
+        for bytes in [b"ok\xff".as_slice(), b"ok\xe2\x82".as_slice()] {
+            let mut reader = ChunkedReader::new(bytes, 1);
+            assert!(matches!(
+                load_standard_input_with_limit(&mut reader, 8),
+                Err(LoadError::InvalidStandardInputUtf8 { offset: 2 })
+            ));
+        }
+
+        let mut oversized = ChunkedReader::new(b"\xffabcd", 1);
+        assert!(matches!(
+            load_standard_input_with_limit(&mut oversized, 4),
+            Err(LoadError::StandardInputTooLarge { limit: 4 })
+        ));
+    }
+
+    #[test]
+    fn standard_input_utf8_errors_match_the_standard_validator_at_every_split() {
+        for bytes in [
+            b"\x80".as_slice(),
+            b"a\xc2A".as_slice(),
+            b"a\xe0\x80\x80".as_slice(),
+            b"a\xed\xa0\x80".as_slice(),
+            b"a\xf0\x90\x80A".as_slice(),
+            b"a\xf4\x90\x80\x80".as_slice(),
+            b"a\xf0\x90\x80".as_slice(),
+        ] {
+            let expected =
+                u64::try_from(std::str::from_utf8(bytes).unwrap_err().valid_up_to()).unwrap();
+            for chunk in 1..=bytes.len() {
+                let mut reader = ChunkedReader::new(bytes, chunk);
+                assert!(matches!(
+                    load_standard_input_with_limit(&mut reader, 32),
+                    Err(LoadError::InvalidStandardInputUtf8 { offset })
+                        if offset == expected
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn standard_input_preserves_non_interrupted_read_errors() {
+        let mut reader = FailedReader;
+        assert!(matches!(
+            load_standard_input_with_limit(&mut reader, 4),
+            Err(LoadError::ReadStandardInput { source })
+                if source.kind() == io::ErrorKind::Other
+                    && source.to_string() == "source failed"
+        ));
     }
 
     #[test]
