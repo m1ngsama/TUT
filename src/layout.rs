@@ -7,13 +7,14 @@ use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    document::{DocumentReader, SourceGrapheme},
-    error::{LayoutError, TutError},
+    document::{DocumentId, DocumentReader, SourceGrapheme},
+    error::{LayoutError, TutError, is_terminal_control},
     source::{SourceOffset, SourceText},
 };
 
 pub(super) const REPLACEMENT_CHARACTER: &str = "\u{fffd}";
 pub(super) const DOTTED_CIRCLE: &str = "\u{25cc}";
+const MAX_RENDER_GRAPHEME_BYTES: usize = 1024;
 const TAB_STOP: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -258,6 +259,15 @@ impl<'a> DisplayAtom<'a> {
     }
 
     fn from_text(source: GraphemeRange, grapheme: &'a str) -> Self {
+        if grapheme.len() > MAX_RENDER_GRAPHEME_BYTES {
+            return Self {
+                source,
+                source_text: "",
+                kind: DisplayAtomKind::Oversized,
+                unicode_whitespace: false,
+                measured_width: DisplayColumn::new(1),
+            };
+        }
         let measured_width = u32::try_from(UnicodeWidthStr::width(grapheme)).unwrap_or(u32::MAX);
         let kind = if matches!(grapheme, "\n" | "\r" | "\r\n") {
             DisplayAtomKind::LineFeed
@@ -281,15 +291,9 @@ impl<'a> DisplayAtom<'a> {
     }
 }
 
-fn is_terminal_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0000}'..='\u{001f}' | '\u{007f}' | '\u{0080}'..='\u{009f}'
-    )
-}
-
 #[derive(Debug)]
 pub(super) struct ViewportLayout {
+    document_id: DocumentId,
     width: ContentWidth,
     height: BodyHeight,
     source_start: SourceOffset,
@@ -305,6 +309,10 @@ pub(super) trait ProjectedRowSink {
 }
 
 impl ViewportLayout {
+    pub(super) const fn row_cache_key(&self) -> (DocumentId, ContentWidth) {
+        (self.document_id, self.width)
+    }
+
     pub(super) fn project_visible_rows<S>(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -489,17 +497,19 @@ impl ViewportLayout {
     }
 
     fn require_matching_source(&self, reader: &DocumentReader<'_>) -> Result<(), TutError> {
-        if reader.source_start() == self.source_start && reader.source_end() == self.source_end {
-            Ok(())
-        } else {
-            Err(LayoutError::SourceRangeMismatch {
+        if reader.document_id() != self.document_id {
+            return Err(LayoutError::DocumentMismatch.into());
+        }
+        if reader.source_start() != self.source_start || reader.source_end() != self.source_end {
+            return Err(LayoutError::SourceRangeMismatch {
                 expected_start: self.source_start.get(),
                 expected_end: self.source_end.get(),
                 actual_start: reader.source_start().get(),
                 actual_end: reader.source_end().get(),
             }
-            .into())
+            .into());
         }
+        Ok(())
     }
 
     fn require_visible_start(
@@ -565,6 +575,7 @@ pub(super) fn rebuild_viewport_layout(
     height: BodyHeight,
 ) {
     *slot = Some(ViewportLayout {
+        document_id: reader.document_id(),
         width,
         height,
         source_start: reader.source_start(),
@@ -582,7 +593,8 @@ pub(super) fn ensure_viewport_layout(
         return false;
     };
     if slot.as_ref().is_some_and(|layout| {
-        layout.width == width
+        layout.document_id == reader.document_id()
+            && layout.width == width
             && layout.height == height
             && layout.source_start == reader.source_start()
             && layout.source_end == reader.source_end()
@@ -976,8 +988,35 @@ mod tests {
     }
 
     #[test]
+    fn layouts_reject_another_document_with_the_same_source_range() {
+        let mut first = Fixture::new("abcd");
+        let layout = first.layout(4, 1);
+        let mut second = Fixture::new("wxyz");
+
+        let error = {
+            let mut reader = second.document.reader(&mut second.cache);
+            layout
+                .visible_extent(&mut reader, SourceOffset::ZERO)
+                .unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            TutError::Layout(LayoutError::DocumentMismatch)
+        ));
+
+        let mut slot = Some(layout);
+        let reader = second.document.reader(&mut second.cache);
+        assert!(ensure_viewport_layout(
+            &mut slot,
+            &reader,
+            ContentWidth::new(4),
+            BodyHeight::new(1)
+        ));
+    }
+
+    #[test]
     fn projection_sanitizes_controls_tabs_and_zero_width_graphemes() {
-        let text = "a\t\u{001b}\u{200b}ｶﾞ";
+        let text = "a\t\u{001b}\u{202e}\u{200b}ｶﾞ";
         let (mut fixture, layout) = case(text, 16, 2);
         assert_eq!(
             projected(&mut fixture, &layout, 0),
@@ -985,10 +1024,51 @@ mod tests {
                 ("a".to_owned(), 1),
                 ("   ".to_owned(), 3),
                 ("�".to_owned(), 1),
+                ("�".to_owned(), 1),
                 ("◌\u{200b}".to_owned(), 1),
                 ("ｶﾞ".to_owned(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn render_limit_replaces_complete_graphemes_without_losing_coordinates() {
+        let mut cluster = String::from("a");
+        cluster.extend(std::iter::repeat_n('\u{301}', 510));
+        cluster.push('\u{20dd}');
+        assert_eq!(cluster.len(), MAX_RENDER_GRAPHEME_BYTES);
+        assert_eq!(cluster.graphemes(true).count(), 1);
+
+        let mut text = cluster.clone();
+        text.push('z');
+        let (mut fixture, layout) = case(&text, 16, 1);
+        assert_eq!(projected(&mut fixture, &layout, 0)[0].0, cluster);
+
+        text.insert(text.len() - 1, '\u{301}');
+        let cluster_end = SourceOffset::from_usize(text.len() - 1);
+        let atom = DisplayAtoms::new(&text[..text.len() - 1]).next().unwrap();
+        assert_eq!(atom.kind(), DisplayAtomKind::Oversized);
+        assert_eq!(
+            atom.project(DisplayColumn::ZERO, ContentWidth::new(16).unwrap())
+                .unwrap()
+                .projection(),
+            DisplayProjection::Replacement
+        );
+        let (mut fixture, layout) = case(&text, 16, 1);
+        let mut rows = CollectedRows::default();
+        let mut reader = fixture.document.reader(&mut fixture.cache);
+        layout
+            .project_visible_rows(&mut reader, SourceOffset::ZERO, &mut rows)
+            .unwrap();
+        let rows = rows.owned_rows();
+
+        assert_eq!(
+            rows[0][0].source,
+            GraphemeRange::new(SourceOffset::ZERO, cluster_end).unwrap()
+        );
+        assert_eq!(rows[0][0].projection, OwnedProjection::Replacement);
+        assert_eq!(rows[0][1].source.start(), cluster_end);
+        assert_eq!(rows[0][1].projection, OwnedProjection::Text("z".to_owned()));
     }
 
     #[test]

@@ -11,15 +11,16 @@ use crate::{
         ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
-    locator::{RowDelta, ViewportLocator},
+    locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator},
     search::{
-        MAX_SEARCH_QUERY_BYTES, SearchHighlights, SearchIndex, SearchNavigation, SearchRange,
+        MAX_SEARCH_QUERY_BYTES, MatchBlock, SearchHighlights, SearchIndex, SearchNavigation,
+        SearchRange,
     },
     source::SourceOffset,
 };
 
 #[cfg(test)]
-use crate::{document::SOURCE_WINDOW_BYTES, locator::LocatedViewport};
+use crate::document::SOURCE_WINDOW_BYTES;
 
 pub(super) const MIN_TERMINAL_COLUMNS: u16 = 16;
 pub(super) const MIN_TERMINAL_ROWS: u16 = 4;
@@ -266,6 +267,25 @@ impl RenderRows {
         self.rows.len()
     }
 
+    fn try_clone(&self) -> Result<Self, TutError> {
+        let mut text = String::new();
+        text.try_reserve_exact(self.text.len())
+            .map_err(|_| TutError::Allocation("cached visible row text"))?;
+        text.push_str(&self.text);
+
+        let mut spans = Vec::new();
+        spans
+            .try_reserve_exact(self.spans.len())
+            .map_err(|_| TutError::Allocation("cached visible row spans"))?;
+        spans.extend_from_slice(&self.spans);
+
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.rows.len())
+            .map_err(|_| TutError::Allocation("cached visible rows"))?;
+        rows.extend_from_slice(&self.rows);
+        Ok(Self { text, spans, rows })
+    }
+
     fn apply_highlights(&mut self, ranges: &[SearchRange], current: Option<SearchRange>) {
         let mut matches = MatchCursor::new(ranges, current);
         let mut write = 0;
@@ -296,6 +316,13 @@ pub(super) struct RenderState<'a> {
     pub current_line: Option<u64>,
     pub total_lines: Option<u64>,
     pub status: SearchStatus<'a>,
+}
+
+struct RenderViewportCache {
+    geometry: Geometry,
+    anchor: SourceOffset,
+    viewport: Viewport,
+    rows: RenderRows,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +393,7 @@ pub(super) struct App {
     search_cache: DocumentCache,
     layout: Option<ViewportLayout>,
     anchor: SourceOffset,
+    anchor_is_row_start: bool,
     follow_end: bool,
     geometry: Geometry,
     mode: Mode,
@@ -373,10 +401,13 @@ pub(super) struct App {
     search_index: Option<SearchIndex>,
     current_match: Option<SearchRange>,
     navigation: Option<SearchNavigation>,
+    match_block: Option<MatchBlock>,
     pending_navigation: i64,
     highlights: Option<SearchHighlights>,
     viewport_request: Option<ViewportRequest>,
     locator: Option<ViewportLocator>,
+    row_neighborhood: RowNeighborhood,
+    render_cache: Option<RenderViewportCache>,
     queued_rows: i64,
     search_jump_pending: bool,
     search_turn: bool,
@@ -396,6 +427,7 @@ impl App {
             search_cache: DocumentCache::default(),
             layout: None,
             anchor,
+            anchor_is_row_start: true,
             follow_end: false,
             geometry: Geometry::new(0, 0),
             mode: Mode::Reading,
@@ -403,10 +435,13 @@ impl App {
             search_index: None,
             current_match: None,
             navigation: None,
+            match_block: None,
             pending_navigation: 0,
             highlights: None,
             viewport_request: None,
             locator: None,
+            row_neighborhood: RowNeighborhood::default(),
+            render_cache: None,
             queued_rows: 0,
             search_jump_pending: false,
             search_turn: true,
@@ -466,7 +501,7 @@ impl App {
 
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
         let (viewport, mut rows) = self.build_render_viewport()?;
-        self.prepare_search_highlights(viewport);
+        self.prepare_search_highlights(viewport, &rows)?;
         let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
         if let Some(viewport) = viewport {
@@ -489,31 +524,41 @@ impl App {
         })
     }
 
-    fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) {
+    fn prepare_search_highlights(
+        &mut self,
+        viewport: Option<Viewport>,
+        rows: &RenderRows,
+    ) -> Result<(), TutError> {
         let Some(viewport) = viewport else {
             self.highlights = None;
-            return;
+            return Ok(());
         };
         let visible = viewport.first_visible_start..viewport.visible_end;
+        if !matches!(self.mode, Mode::Reading) {
+            self.highlights = None;
+            return Ok(());
+        }
         if self
             .highlights
             .as_ref()
             .is_some_and(|highlights| highlights.covers(&visible))
         {
-            return;
+            return Ok(());
         }
         self.highlights = None;
-        if !matches!(self.mode, Mode::Reading) {
-            return;
-        }
         let Some(index) = self
             .search_index
             .as_ref()
             .filter(|index| index.is_complete() && index.has_matches())
         else {
-            return;
+            return Ok(());
         };
-        self.highlights = index.highlights(visible);
+        let targets = rows.spans.iter().map(|span| {
+            SearchRange::new(span.source.start(), span.source.end())
+                .expect("render spans retain nonempty source ranges")
+        });
+        self.highlights = index.display_highlights(visible, targets)?;
+        Ok(())
     }
 
     fn line_position_for(
@@ -596,7 +641,29 @@ impl App {
         if self.locator.is_none() {
             let height = self.geometry.body_height().expect("usable geometry");
             let (target, delta) = request.locator_parameters(self.document.source_end(), height);
-            self.locator = Some(ViewportLocator::new(target, delta, height)?);
+            let row_key = self
+                .layout
+                .as_ref()
+                .expect("usable geometry has a layout")
+                .row_cache_key();
+            if request.is_move()
+                && self.anchor_is_row_start
+                && let Some(located) = self.row_neighborhood.locate_move(
+                    row_key,
+                    self.document.source_start(),
+                    target,
+                    delta,
+                    height,
+                )
+            {
+                self.document.validate()?;
+                return Ok(self.finish_viewport_request(request, located));
+            }
+            self.locator = Some(if request.is_move() && self.anchor_is_row_start {
+                ViewportLocator::from_row_start(target, delta, height)?
+            } else {
+                ViewportLocator::new(target, delta, height)?
+            });
         }
 
         let layout = self.layout.as_ref().expect("usable geometry has a layout");
@@ -605,21 +672,30 @@ impl App {
             .locator
             .as_mut()
             .expect("viewport locator was initialized")
-            .advance(layout, &mut reader)?;
+            .advance(layout, &mut reader, &mut self.row_neighborhood)?;
         let Some(located) = located else {
             return Ok(false);
         };
 
+        Ok(self.finish_viewport_request(request, located))
+    }
+
+    fn finish_viewport_request(
+        &mut self,
+        request: ViewportRequest,
+        located: LocatedViewport,
+    ) -> bool {
         let old_anchor = self.anchor;
         let old_follow_end = self.follow_end;
         self.viewport_request = None;
         self.locator = None;
         self.anchor = located.anchor;
+        self.anchor_is_row_start = true;
         self.follow_end = request.follows_end(located.at_end);
         if request.is_move() {
             self.start_queued_move();
         }
-        Ok(old_anchor != self.anchor || old_follow_end != self.follow_end)
+        old_anchor != self.anchor || old_follow_end != self.follow_end
     }
 
     fn advance_line_index(&mut self) -> Result<bool, TutError> {
@@ -660,7 +736,8 @@ impl App {
                 };
                 let forward = self.pending_navigation > 0;
                 self.pending_navigation -= if forward { 1 } else { -1 };
-                self.navigation = index.navigation(current, forward);
+                self.navigation =
+                    index.navigation_with_block(current, forward, self.match_block.take());
             }
             let Some(navigation) = self.navigation.as_mut() else {
                 let changed = self.pending_navigation != 0;
@@ -676,6 +753,10 @@ impl App {
             self.search_jump_pending = false;
         }
         if advance.completed() && self.navigation.is_some() {
+            self.match_block = self
+                .navigation
+                .as_mut()
+                .and_then(SearchNavigation::take_block);
             self.navigation = None;
         }
         if let Some(selected) = advance.selected() {
@@ -721,7 +802,7 @@ impl App {
             Action::DocumentStart if reading => self.document_start(),
             Action::DocumentEnd if reading => self.document_end(),
             Action::BeginSearch if reading => self.begin_search(),
-            Action::SearchInsert(character) if editing => self.insert_search(character),
+            Action::SearchInsert(character) if editing => self.insert_search(character)?,
             Action::SearchBackspace if editing => self.backspace_search(),
             Action::SearchCommit if editing => self.commit_search()?,
             Action::SearchCancel if editing => self.cancel_search(),
@@ -757,6 +838,11 @@ impl App {
         let geometry_changed = self.geometry != geometry;
         if !geometry_changed {
             return false;
+        }
+        self.highlights = None;
+        if self.geometry.content_width() != geometry.content_width() {
+            self.row_neighborhood.clear();
+            self.anchor_is_row_start = self.anchor == self.document.source_start();
         }
         self.geometry = geometry;
         self.locator = None;
@@ -818,6 +904,7 @@ impl App {
             || self.anchor != source_start
             || self.follow_end;
         self.anchor = source_start;
+        self.anchor_is_row_start = true;
         self.follow_end = false;
         changed
     }
@@ -877,7 +964,11 @@ impl App {
 
     fn cancel_search_navigation(&mut self) -> bool {
         let changed = self.navigation.is_some() || self.pending_navigation != 0;
-        self.navigation = None;
+        if let Some(mut navigation) = self.navigation.take()
+            && let Some(block) = navigation.take_block()
+        {
+            self.match_block = Some(block);
+        }
         self.pending_navigation = 0;
         changed
     }
@@ -895,18 +986,21 @@ impl App {
         true
     }
 
-    fn insert_search(&mut self, character: char) -> bool {
+    fn insert_search(&mut self, character: char) -> Result<bool, TutError> {
         let Mode::SearchInput { draft, limit_hit } = &mut self.mode else {
-            return false;
+            return Ok(false);
         };
         if draft.len() + character.len_utf8() > SEARCH_DRAFT_LIMIT_BYTES {
             let changed = !*limit_hit;
             *limit_hit = true;
-            return changed;
+            return Ok(changed);
         }
+        draft
+            .try_reserve(character.len_utf8())
+            .map_err(|_| TutError::Allocation("search query"))?;
         draft.push(character);
         *limit_hit = false;
-        true
+        Ok(true)
     }
 
     fn backspace_search(&mut self) -> bool {
@@ -939,6 +1033,7 @@ impl App {
         self.search_index = None;
         self.current_match = None;
         self.navigation = None;
+        self.match_block = None;
         self.pending_navigation = 0;
         self.highlights = None;
         self.search_jump_pending = false;
@@ -956,6 +1051,7 @@ impl App {
             self.search_index = None;
             self.current_match = None;
             self.navigation = None;
+            self.match_block = None;
             self.pending_navigation = 0;
             self.highlights = None;
             self.search_jump_pending = false;
@@ -975,6 +1071,7 @@ impl App {
         self.search_index = Some(index);
         self.current_match = None;
         self.navigation = None;
+        self.match_block = None;
         self.pending_navigation = 0;
         self.highlights = None;
         self.follow_end = false;
@@ -1017,8 +1114,18 @@ impl App {
 
     fn build_render_viewport(&mut self) -> Result<(Option<Viewport>, RenderRows), TutError> {
         let Some(row_capacity) = self.geometry.body_height().map(BodyHeight::get) else {
+            self.render_cache = None;
             return Ok((None, RenderRows::default()));
         };
+        if let Some(cached) = self
+            .render_cache
+            .as_ref()
+            .filter(|cached| cached.geometry == self.geometry && cached.anchor == self.anchor)
+        {
+            self.document.validate()?;
+            return Ok((Some(cached.viewport), cached.rows.try_clone()?));
+        }
+        self.render_cache = None;
         let layout = self.layout.as_ref().expect("viewport has a layout");
         let mut rows = RenderRowsBuilder::new(usize::from(row_capacity))?;
         let mut reader = self.document.reader(&mut self.document_cache);
@@ -1026,14 +1133,18 @@ impl App {
             layout.project_visible_rows(&mut reader, self.anchor, &mut rows)?;
         let rows = rows.finish();
         debug_assert_eq!(rows.len(), visible_rows);
-        Ok((
-            Some(Viewport {
-                visible_rows,
-                first_visible_start: self.anchor,
-                visible_end,
-            }),
-            rows,
-        ))
+        let viewport = Viewport {
+            visible_rows,
+            first_visible_start: self.anchor,
+            visible_end,
+        };
+        self.render_cache = Some(RenderViewportCache {
+            geometry: self.geometry,
+            anchor: self.anchor,
+            viewport,
+            rows: rows.try_clone()?,
+        });
+        Ok((Some(viewport), rows))
     }
 }
 
@@ -1244,10 +1355,14 @@ mod tests {
     fn locate(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
         let height = app.geometry.body_height().unwrap();
         let mut locator = ViewportLocator::new(target, delta, height).unwrap();
+        let mut neighborhood = RowNeighborhood::default();
         for _ in 0..BACKGROUND_STEP_LIMIT {
             let layout = app.layout.as_ref().unwrap();
             let mut reader = app.document.reader(&mut app.document_cache);
-            if let Some(located) = locator.advance(layout, &mut reader).unwrap() {
+            if let Some(located) = locator
+                .advance(layout, &mut reader, &mut neighborhood)
+                .unwrap()
+            {
                 return located;
             }
         }
@@ -1391,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_reflow_search_and_upward_navigation_remain_background_work() {
+    fn deep_reflow_and_search_remain_background_while_cached_moves_are_immediate() {
         let match_start = SOURCE_WINDOW_BYTES * 2;
         let mut text = "x".repeat(match_start);
         text.push_str("needle");
@@ -1419,10 +1534,9 @@ mod tests {
             })
         ));
         let before_move = app.anchor;
-        assert!(!app.advance_background().unwrap());
-        assert_eq!(app.anchor, before_move);
-        settle(&mut app);
+        assert!(app.advance_background().unwrap());
         assert_eq!(app.anchor, SourceOffset::new(before_move.get() - 20));
+        assert!(app.viewport_request.is_none());
 
         submit(&mut app, "needle");
         advance_until(&mut app, |app| app.current_match.is_some());
@@ -1435,6 +1549,70 @@ mod tests {
         assert_eq!(app.anchor, before_search);
         settle(&mut app);
         assert_eq!(app.anchor, SourceOffset::from_usize(131_020));
+    }
+
+    #[test]
+    fn forward_moves_from_known_rows_do_not_rescan_long_line_prefixes() {
+        let width = 16usize;
+        let mut app = reader(&"x".repeat(SOURCE_WINDOW_BYTES * 2), width as u16, 7);
+        let anchor = SourceOffset::from_usize(width * 2_000);
+        app.anchor = anchor;
+        app.document_cache = DocumentCache::default();
+        app.document_cache.reset_metrics();
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+
+        assert_eq!(app.anchor, anchor.checked_add(width).unwrap());
+        let height = usize::from(app.geometry.body_height().unwrap().get());
+        assert!(app.document_cache.metrics().grapheme_emissions() <= (height + 1) * (width + 1));
+    }
+
+    #[test]
+    fn recent_row_edges_make_repeated_long_line_navigation_constant_work() {
+        let width = 16usize;
+        let mut app = reader(&"x".repeat(SOURCE_WINDOW_BYTES * 2), width as u16, 7);
+        let initial = SourceOffset::from_usize(width * 2_000);
+        app.anchor = initial;
+
+        for _ in 0..100 {
+            app.update(Action::LineDown).unwrap();
+            settle(&mut app);
+        }
+        assert_eq!(app.anchor, initial.checked_add(width * 100).unwrap());
+
+        app.document_cache.reset_metrics();
+        for _ in 0..100 {
+            app.update(Action::LineUp).unwrap();
+            settle(&mut app);
+        }
+
+        assert_eq!(app.anchor, initial);
+        assert_eq!(app.document_cache.metrics().grapheme_emissions(), 0);
+    }
+
+    #[test]
+    fn cached_row_navigation_matches_the_layout_across_unicode_and_endings() {
+        let text = "alpha\t界 e\u{301} beta\r\nblank\rwide🙂word\n".repeat(40);
+        let mut app = reader(&text, 16, 7);
+
+        for downward in std::iter::repeat_n(true, 60).chain(std::iter::repeat_n(false, 60)) {
+            let expected = {
+                let layout = app.layout.as_ref().unwrap();
+                let mut reader = app.document.reader(&mut app.document_cache);
+                layout
+                    .move_row_start(&mut reader, app.anchor, downward, 1)
+                    .unwrap()
+            };
+            app.update(if downward {
+                Action::LineDown
+            } else {
+                Action::LineUp
+            })
+            .unwrap();
+            settle(&mut app);
+            assert_eq!(app.anchor, expected);
+        }
     }
 
     #[test]
@@ -1478,6 +1656,34 @@ mod tests {
         assert!(app.viewport_request.is_none());
         assert_eq!(app.queued_rows, 0);
         assert_eq!(app.anchor, SourceOffset::ZERO);
+    }
+
+    #[test]
+    fn moves_during_pending_width_reflow_relocate_the_old_anchor() {
+        let mut app = reader(&"x".repeat(1024), 20, 7);
+        app.anchor = SourceOffset::new(40);
+
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        assert!(!app.anchor_is_row_start);
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+
+        assert_eq!(app.anchor, SourceOffset::new(48));
+        assert!(app.anchor_is_row_start);
+    }
+
+    #[test]
+    fn resizing_a_pending_move_relocates_the_old_width_anchor() {
+        let mut app = reader(&"x".repeat(1024), 20, 7);
+        app.anchor = SourceOffset::new(40);
+
+        app.update(Action::LineDown).unwrap();
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        assert!(!app.anchor_is_row_start);
+        settle(&mut app);
+
+        assert_eq!(app.anchor, SourceOffset::new(48));
+        assert!(app.anchor_is_row_start);
     }
 
     #[test]
@@ -1772,6 +1978,19 @@ mod tests {
     }
 
     #[test]
+    fn repeated_rendering_reuses_the_unchanged_visible_body() {
+        let mut app = reader("a\nb\nc\nd\ne\noutside\n", 16, 8);
+        let first = app.render_state().unwrap().rows;
+        app.document_cache.reset_metrics();
+
+        let second = app.render_state().unwrap().rows;
+
+        assert_eq!(second, first);
+        assert_eq!(app.document_cache.metrics().grapheme_emissions(), 0);
+        assert_eq!(app.document_cache.metrics().grapheme_window_calls(), 0);
+    }
+
+    #[test]
     fn rendering_reads_one_grapheme_frontier_and_compacts_ascii_spans() {
         let mut app = reader(&"x".repeat(1024), 127, 4);
         app.document_cache = DocumentCache::with_window_bytes(128);
@@ -1847,6 +2066,55 @@ mod tests {
                 .iter()
                 .any(|span| span.highlight == Highlight::Current)
         }));
+    }
+
+    #[test]
+    fn cached_file_rendering_still_rejects_in_place_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing.txt");
+        fs::write(&path, "first").unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        app.render_state().unwrap();
+
+        fs::write(&path, "other").unwrap();
+
+        assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+    }
+
+    #[test]
+    fn cached_row_navigation_still_rejects_in_place_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-rows.txt");
+        fs::write(&path, "x".repeat(64)).unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+
+        fs::write(&path, "y".repeat(64)).unwrap();
+        app.update(Action::LineUp).unwrap();
+
+        assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
+        assert!(app.locator.is_none());
+    }
+
+    #[test]
+    fn cached_match_navigation_still_rejects_in_place_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-matches.txt");
+        fs::write(&path, "cat cat cat").unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        commit(&mut app, "cat");
+        app.update(Action::NextMatch).unwrap();
+        settle(&mut app);
+        assert!(app.match_block.is_some());
+
+        fs::write(&path, "dog dog dog").unwrap();
+        app.update(Action::NextMatch).unwrap();
+
+        assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
     }
 
     #[test]

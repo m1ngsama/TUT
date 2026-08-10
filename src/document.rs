@@ -1,9 +1,10 @@
 use std::{
     fs::File,
     io,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use rustix::fs::{Mode, OFlags};
@@ -20,9 +21,35 @@ pub(super) const SOURCE_WINDOW_BYTES: usize = 64 * 1024;
 const UTF8_BOM_BYTES: usize = 3;
 const UTF8_BOUNDARY_SLOP_BYTES: usize = 3;
 const MAX_GRAPHEME_BYTES: usize = 1024 * 1024;
+static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(super) struct DocumentId(NonZeroU64);
+
+impl DocumentId {
+    fn next() -> Self {
+        Self::try_next(&NEXT_DOCUMENT_ID).expect("document identity space is exhausted")
+    }
+
+    fn try_next(counter: &AtomicU64) -> Option<Self> {
+        let value = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .ok()?;
+        NonZeroU64::new(value).map(Self)
+    }
+
+    #[cfg(test)]
+    const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Document {
+    id: DocumentId,
     store: DocumentStore,
     line_index: LineIndex,
     source_start: SourceOffset,
@@ -56,10 +83,15 @@ impl Document {
         &self.display_name
     }
 
+    pub(super) fn validate(&self) -> Result<(), LoadError> {
+        self.store.validate()
+    }
+
     pub(super) fn reader<'a>(&'a self, cache: &'a mut DocumentCache) -> DocumentReader<'a> {
         DocumentReader {
             document: self,
             cache,
+            validated: false,
         }
     }
 
@@ -121,6 +153,7 @@ impl Document {
         let source_start = store.source_start();
         let source_end = store.source_end();
         Self {
+            id: DocumentId::next(),
             store,
             line_index,
             source_start,
@@ -138,7 +171,7 @@ pub(super) struct DocumentCache {
     grapheme: Vec<u8>,
     grapheme_start: SourceOffset,
     grapheme_end: SourceOffset,
-    grapheme_document: Option<usize>,
+    grapheme_document_id: Option<DocumentId>,
     window_bytes: NonZeroUsize,
     #[cfg(test)]
     metrics: DocumentMetrics,
@@ -179,7 +212,7 @@ impl Default for DocumentCache {
             grapheme: Vec::new(),
             grapheme_start: SourceOffset::ZERO,
             grapheme_end: SourceOffset::ZERO,
-            grapheme_document: None,
+            grapheme_document_id: None,
             window_bytes: NonZeroUsize::new(SOURCE_WINDOW_BYTES)
                 .expect("source window size is nonzero"),
             #[cfg(test)]
@@ -211,6 +244,7 @@ impl DocumentCache {
 pub(super) struct DocumentReader<'a> {
     document: &'a Document,
     cache: &'a mut DocumentCache,
+    validated: bool,
 }
 
 impl<'document> DocumentReader<'document> {
@@ -218,8 +252,9 @@ impl<'document> DocumentReader<'document> {
         &'reader mut self,
         start: SourceOffset,
     ) -> Result<DocumentGraphemes<'reader, 'document>, LoadError> {
-        let document = std::ptr::from_ref(self.document).addr();
-        if self.cache.grapheme_document == Some(document)
+        self.validate_once()?;
+        let document_id = self.document.id;
+        if self.cache.grapheme_document_id == Some(document_id)
             && start >= self.cache.grapheme_start
             && start <= self.cache.grapheme_end
         {
@@ -247,7 +282,7 @@ impl<'document> DocumentReader<'document> {
         self.cache.grapheme.clear();
         self.cache.grapheme_start = start;
         self.cache.grapheme_end = start;
-        self.cache.grapheme_document = Some(document);
+        self.cache.grapheme_document_id = Some(document_id);
         Ok(DocumentGraphemes {
             reader: self,
             cursor: 0,
@@ -282,8 +317,16 @@ impl<'document> DocumentReader<'document> {
         self.document.source_start()
     }
 
+    pub(super) const fn document_id(&self) -> DocumentId {
+        self.document.id
+    }
+
     pub(super) fn source_end(&self) -> SourceOffset {
         self.document.source_end()
+    }
+
+    pub(super) fn validate(&mut self) -> Result<(), LoadError> {
+        self.validate_once()
     }
 
     pub(super) fn line_position(
@@ -443,6 +486,14 @@ impl<'document> DocumentReader<'document> {
             source: io::Error::new(io::ErrorKind::InvalidData, message),
         }
     }
+
+    fn validate_once(&mut self) -> Result<(), LoadError> {
+        if !self.validated {
+            self.document.store.validate()?;
+            self.validated = true;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,7 +650,7 @@ impl DocumentGraphemes<'_, '_> {
         self.reader
             .cache
             .grapheme
-            .try_reserve_exact(length)
+            .try_reserve(length)
             .map_err(|_| LoadError::Allocation("grapheme buffer"))?;
         self.reader
             .cache
@@ -682,6 +733,14 @@ impl DocumentStore {
             Self::File(store) => store.source_end,
             #[cfg(test)]
             Self::InMemory(store) => store.source().end(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), LoadError> {
+        match self {
+            Self::File(store) => store.require_unchanged(),
+            #[cfg(test)]
+            Self::InMemory(_) => Ok(()),
         }
     }
 
@@ -1360,6 +1419,30 @@ mod tests {
     }
 
     #[test]
+    fn grapheme_cache_hits_reject_changes_to_the_open_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cached.txt");
+        fs::write(&path, "stable").unwrap();
+        let document = load(path.clone()).unwrap();
+        let mut cache = DocumentCache::default();
+        {
+            let mut reader = document.reader(&mut cache);
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("s")
+            );
+        }
+
+        fs::write(path, "change").unwrap();
+        let mut reader = document.reader(&mut cache);
+        assert!(matches!(
+            reader.graphemes(SourceOffset::ZERO),
+            Err(LoadError::Read { source, .. }) if source.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
     fn file_windows_extend_to_utf8_boundaries_with_bounded_slop() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("unicode.txt");
@@ -1771,6 +1854,79 @@ mod tests {
         assert_eq!(reader.cache.grapheme.as_slice(), b"abcd");
         assert_eq!(reader.cache.grapheme_start, SourceOffset::ZERO);
         assert_eq!(reader.cache.grapheme_end, SourceOffset::new(4));
+    }
+
+    #[test]
+    fn document_identity_exhaustion_does_not_wrap() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let last = DocumentId::try_next(&counter).unwrap();
+
+        assert_eq!(last.get(), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(DocumentId::try_next(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn grapheme_cache_identity_survives_document_moves() {
+        let document = Document::from_text(Path::new("move.txt"), "abcdefgh".to_owned());
+        let mut cache = DocumentCache::with_window_bytes(4);
+        let id = {
+            let mut reader = document.reader(&mut cache);
+            let id = reader.document_id();
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("a")
+            );
+            id
+        };
+
+        cache.reset_metrics();
+        let document = Box::new(document);
+        {
+            let mut reader = document.reader(&mut cache);
+            assert_eq!(reader.document_id(), id);
+            let mut graphemes = reader.graphemes(SourceOffset::new(1)).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("b")
+            );
+        }
+
+        assert_eq!(cache.metrics().grapheme_window_calls(), 0);
+    }
+
+    #[test]
+    fn grapheme_cache_rejects_another_document_with_the_same_range() {
+        let first = Document::from_text(Path::new("first.txt"), "abcd".to_owned());
+        let second = Document::from_text(Path::new("second.txt"), "wxyz".to_owned());
+        let mut cache = DocumentCache::with_window_bytes(4);
+
+        let first_id = {
+            let mut reader = first.reader(&mut cache);
+            let id = reader.document_id();
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("a")
+            );
+            id
+        };
+        cache.reset_metrics();
+        let second_id = {
+            let mut reader = second.reader(&mut cache);
+            let id = reader.document_id();
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            assert_eq!(
+                graphemes.next_grapheme().unwrap().unwrap().text(),
+                Some("w")
+            );
+            id
+        };
+
+        assert_ne!(first_id, second_id);
+        assert_eq!(cache.metrics().grapheme_window_calls(), 1);
     }
 
     #[test]

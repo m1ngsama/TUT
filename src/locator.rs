@@ -1,14 +1,15 @@
 use std::collections::VecDeque;
 
 use crate::{
-    document::{DocumentReader, SOURCE_WINDOW_BYTES},
+    document::{DocumentId, DocumentReader, SOURCE_WINDOW_BYTES},
     error::TutError,
-    layout::{BodyHeight, ViewportLayout},
+    layout::{BodyHeight, ContentWidth, ViewportLayout},
     source::SourceOffset,
 };
 
 const ROW_BUDGET: usize = 1024;
 const BYTE_BUDGET: u64 = SOURCE_WINDOW_BYTES as u64;
+const ROW_NEIGHBORHOOD_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RowDelta {
@@ -20,6 +21,160 @@ pub(super) enum RowDelta {
 pub(super) struct LocatedViewport {
     pub(super) anchor: SourceOffset,
     pub(super) at_end: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowEdge {
+    start: SourceOffset,
+    next: Option<SourceOffset>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RowNeighborhood {
+    key: Option<(DocumentId, ContentWidth)>,
+    edges: VecDeque<RowEdge>,
+}
+
+impl RowNeighborhood {
+    pub(super) fn clear(&mut self) {
+        self.key = None;
+        self.edges.clear();
+    }
+
+    pub(super) fn locate_move(
+        &self,
+        key: (DocumentId, ContentWidth),
+        source_start: SourceOffset,
+        anchor: SourceOffset,
+        delta: RowDelta,
+        height: BodyHeight,
+    ) -> Option<LocatedViewport> {
+        if self.key != Some(key) {
+            return None;
+        }
+        let anchor_index = self
+            .edges
+            .binary_search_by_key(&anchor, |edge| edge.start)
+            .ok()?;
+        let candidate_index = match delta {
+            RowDelta::Backward(amount) => {
+                if amount <= anchor_index {
+                    anchor_index - amount
+                } else if self.edges.front()?.start == source_start {
+                    0
+                } else {
+                    return None;
+                }
+            }
+            RowDelta::Forward(amount) => {
+                let mut index = anchor_index;
+                for _ in 0..amount {
+                    let Some(next) = self.edges.get(index)?.next else {
+                        break;
+                    };
+                    index += 1;
+                    if self.edges.get(index)?.start != next {
+                        return None;
+                    }
+                }
+                index
+            }
+        };
+        self.clamp(candidate_index, source_start, usize::from(height.get()))
+    }
+
+    fn clamp(
+        &self,
+        candidate_index: usize,
+        source_start: SourceOffset,
+        height: usize,
+    ) -> Option<LocatedViewport> {
+        let mut index = candidate_index;
+        for visible in 1..=height {
+            let edge = self.edges.get(index)?;
+            let Some(next) = edge.next else {
+                let first = (index + 1).saturating_sub(height);
+                if first == 0 && self.edges.front()?.start != source_start {
+                    return None;
+                }
+                return Some(LocatedViewport {
+                    anchor: self.edges.get(first)?.start,
+                    at_end: true,
+                });
+            };
+            if visible == height {
+                return Some(LocatedViewport {
+                    anchor: self.edges.get(candidate_index)?.start,
+                    at_end: false,
+                });
+            }
+            index += 1;
+            if self.edges.get(index)?.start != next {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn observe(
+        &mut self,
+        key: (DocumentId, ContentWidth),
+        start: SourceOffset,
+        next: Option<SourceOffset>,
+    ) -> Result<(), TutError> {
+        debug_assert!(next.is_none_or(|next| next > start));
+        if self.key != Some(key) {
+            self.clear();
+            self.key = Some(key);
+        }
+        let edge = RowEdge { start, next };
+        if let Ok(index) = self.edges.binary_search_by_key(&start, |edge| edge.start) {
+            if self.edges[index] == edge {
+                return Ok(());
+            }
+            self.edges.clear();
+        } else if self
+            .edges
+            .back()
+            .is_some_and(|last| last.next == Some(start))
+        {
+            return self.push_back(edge);
+        } else if next
+            .is_some_and(|next| self.edges.front().is_some_and(|first| first.start == next))
+        {
+            return self.push_front(edge);
+        } else {
+            self.edges.clear();
+        }
+        self.push_back(edge)
+    }
+
+    fn reserve(&mut self) -> Result<(), TutError> {
+        if self.edges.capacity() < ROW_NEIGHBORHOOD_CAPACITY {
+            self.edges
+                .try_reserve_exact(ROW_NEIGHBORHOOD_CAPACITY - self.edges.len())
+                .map_err(|_| TutError::Allocation("visual row neighborhood"))?;
+        }
+        Ok(())
+    }
+
+    fn push_back(&mut self, edge: RowEdge) -> Result<(), TutError> {
+        self.reserve()?;
+        if self.edges.len() == ROW_NEIGHBORHOOD_CAPACITY {
+            self.edges.pop_front();
+        }
+        self.edges.push_back(edge);
+        Ok(())
+    }
+
+    fn push_front(&mut self, edge: RowEdge) -> Result<(), TutError> {
+        self.reserve()?;
+        if self.edges.len() == ROW_NEIGHBORHOOD_CAPACITY {
+            self.edges.pop_back();
+        }
+        self.edges.push_front(edge);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,11 +281,24 @@ impl ViewportLocator {
         })
     }
 
+    pub(super) fn from_row_start(
+        target: SourceOffset,
+        delta: RowDelta,
+        height: BodyHeight,
+    ) -> Result<Self, TutError> {
+        let mut locator = Self::new(target, delta, height)?;
+        locator.push_history(target);
+        locator.begin_movement(target);
+        Ok(locator)
+    }
+
     pub(super) fn advance(
         &mut self,
         layout: &ViewportLayout,
         reader: &mut DocumentReader<'_>,
+        neighborhood: &mut RowNeighborhood,
     ) -> Result<Option<LocatedViewport>, TutError> {
+        let row_key = layout.row_cache_key();
         let mut budget = Budget::new();
         loop {
             if budget.exhausted() {
@@ -144,6 +312,7 @@ impl ViewportLocator {
                 Phase::Locate { cursor } => {
                     self.push_history(cursor);
                     let next = layout.next_row_start(reader, cursor)?;
+                    neighborhood.observe(row_key, cursor, next)?;
                     budget.charge(cursor, next.unwrap_or_else(|| reader.source_end()));
                     if let Some(next) = next.filter(|next| *next <= self.target) {
                         self.phase = Phase::Locate { cursor: next };
@@ -167,6 +336,7 @@ impl ViewportLocator {
                         continue;
                     }
                     let next = layout.next_row_start(reader, cursor)?;
+                    neighborhood.observe(row_key, cursor, next)?;
                     budget.charge(cursor, next.unwrap_or_else(|| reader.source_end()));
                     if let Some(next) = next {
                         self.push_history(next);
@@ -184,6 +354,7 @@ impl ViewportLocator {
                     visible,
                 } => {
                     let next = layout.next_row_start(reader, cursor)?;
+                    neighborhood.observe(row_key, cursor, next)?;
                     budget.charge(cursor, next.unwrap_or_else(|| reader.source_end()));
                     let visible = visible + 1;
                     match next {
@@ -247,6 +418,7 @@ impl ViewportLocator {
                     }
                     self.prefix_rows.push_back(prefix.cursor);
                     let next = layout.next_row_start(reader, prefix.cursor)?;
+                    neighborhood.observe(row_key, prefix.cursor, next)?;
                     let scan_end = next
                         .unwrap_or_else(|| reader.source_end())
                         .min(prefix.line_end);
@@ -351,5 +523,117 @@ impl ViewportLocator {
                     .expect("completed prefix scans satisfy end clamping"),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::document::{Document, DocumentCache};
+
+    fn offset(value: u64) -> SourceOffset {
+        SourceOffset::new(value)
+    }
+
+    fn row_key(width: u16) -> (DocumentId, ContentWidth) {
+        let document = Document::from_text(Path::new("rows.txt"), String::new());
+        let mut cache = DocumentCache::default();
+        let reader = document.reader(&mut cache);
+        (reader.document_id(), ContentWidth::new(width).unwrap())
+    }
+
+    #[test]
+    fn row_neighborhood_moves_in_both_directions_and_clamps_at_end() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+        for start in 0..5 {
+            rows.observe(key, offset(start), Some(offset(start + 1)))
+                .unwrap();
+        }
+        rows.observe(key, offset(5), None).unwrap();
+        let height = BodyHeight::new(3).unwrap();
+
+        assert_eq!(
+            rows.locate_move(key, offset(0), offset(0), RowDelta::Forward(2), height),
+            Some(LocatedViewport {
+                anchor: offset(2),
+                at_end: false,
+            })
+        );
+        assert_eq!(
+            rows.locate_move(key, offset(0), offset(4), RowDelta::Backward(2), height),
+            Some(LocatedViewport {
+                anchor: offset(2),
+                at_end: false,
+            })
+        );
+        assert_eq!(
+            rows.locate_move(key, offset(0), offset(0), RowDelta::Forward(20), height,),
+            Some(LocatedViewport {
+                anchor: offset(3),
+                at_end: true,
+            })
+        );
+    }
+
+    #[test]
+    fn row_neighborhood_has_a_fixed_memory_bound() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+        for start in 0..ROW_NEIGHBORHOOD_CAPACITY {
+            rows.observe(
+                key,
+                SourceOffset::from_usize(start),
+                Some(SourceOffset::from_usize(start + 1)),
+            )
+            .unwrap();
+        }
+        rows.observe(
+            key,
+            SourceOffset::from_usize(ROW_NEIGHBORHOOD_CAPACITY),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(rows.edges.len(), ROW_NEIGHBORHOOD_CAPACITY);
+        assert_eq!(rows.edges.front().unwrap().start, SourceOffset::new(1));
+        assert_eq!(
+            rows.edges.back().unwrap().start,
+            SourceOffset::from_usize(ROW_NEIGHBORHOOD_CAPACITY)
+        );
+    }
+
+    #[test]
+    fn row_neighborhood_rejects_another_layout_key() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+        rows.observe(key, offset(0), Some(offset(1))).unwrap();
+        rows.observe(key, offset(1), None).unwrap();
+
+        let other_width = (key.0, ContentWidth::new(17).unwrap());
+        assert_eq!(
+            rows.locate_move(
+                other_width,
+                offset(0),
+                offset(0),
+                RowDelta::Forward(1),
+                BodyHeight::new(1).unwrap(),
+            ),
+            None
+        );
+
+        let other_document = row_key(16);
+        assert_eq!(
+            rows.locate_move(
+                other_document,
+                offset(0),
+                offset(0),
+                RowDelta::Forward(1),
+                BodyHeight::new(1).unwrap(),
+            ),
+            None
+        );
     }
 }

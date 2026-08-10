@@ -1,7 +1,7 @@
 use std::{mem::size_of, num::NonZeroUsize, ops::Range};
 
 use crate::{
-    document::{DocumentReader, SOURCE_WINDOW_BYTES},
+    document::{DocumentId, DocumentReader, SOURCE_WINDOW_BYTES},
     error::{SearchError, TutError},
     source::SourceOffset,
 };
@@ -11,6 +11,7 @@ const SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = SOURCE_WINDOW_BYTES as u64;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
+const MATCH_BLOCK_START_LIMIT: usize = SOURCE_WINDOW_BYTES + MAX_SEARCH_QUERY_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SearchRange {
@@ -75,22 +76,37 @@ pub(super) struct SearchAdvance {
 
 #[derive(Debug)]
 pub(super) struct SearchNavigation {
+    document_id: DocumentId,
     cursor: SourceOffset,
+    source_start: SourceOffset,
     source_end: SourceOffset,
+    query_len: usize,
+    current: SearchRange,
+    previous: Option<SearchRange>,
+    block: Option<MatchBlock>,
     direction: NavigationDirection,
+    wrap: Option<SearchRange>,
+    #[cfg(test)]
+    window_scans: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavigationDirection {
+    Forward,
+    Backward,
 }
 
 #[derive(Debug)]
-enum NavigationDirection {
-    Forward {
-        after: SourceOffset,
-        wrap: Option<SearchRange>,
-    },
-    Backward {
-        before: SourceOffset,
-        previous: Option<SearchRange>,
-        wrap: Option<SearchRange>,
-    },
+pub(super) struct MatchBlock {
+    document_id: DocumentId,
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+    query_len: usize,
+    start: SourceOffset,
+    next: SourceOffset,
+    previous: Option<SearchRange>,
+    starts: Vec<u32>,
+    selected: Option<usize>,
 }
 
 impl SearchAdvance {
@@ -105,6 +121,7 @@ impl SearchAdvance {
 
 #[derive(Debug)]
 pub(super) struct SearchIndex {
+    document_id: DocumentId,
     source_start: SourceOffset,
     source_end: SourceOffset,
     scanned_to: SourceOffset,
@@ -157,6 +174,7 @@ impl SearchIndex {
         });
 
         Ok(Self {
+            document_id: reader.document_id(),
             source_start,
             source_end,
             scanned_to: source_start,
@@ -186,6 +204,9 @@ impl SearchIndex {
         reader: &mut DocumentReader<'_>,
         needle: &str,
     ) -> Result<SearchAdvance, TutError> {
+        if reader.document_id() != self.document_id {
+            return Err(SearchError::SourceMismatch.into());
+        }
         debug_assert_eq!(needle.len(), self.query_len);
         if self.complete {
             return Ok(SearchAdvance {
@@ -231,47 +252,129 @@ impl SearchIndex {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn navigation(
         &self,
         current: SearchRange,
         forward: bool,
     ) -> Option<SearchNavigation> {
+        self.navigation_with_block(current, forward, None)
+    }
+
+    pub(super) fn navigation_with_block(
+        &self,
+        current: SearchRange,
+        forward: bool,
+        block: Option<MatchBlock>,
+    ) -> Option<SearchNavigation> {
         if !self.complete {
             return None;
         }
-        if forward {
-            let insertion = self.checkpoints.partition_point(|checkpoint| {
-                checkpoint
-                    .previous_match
-                    .is_none_or(|range| range.start() < current.end())
-            });
-            let checkpoint = self.checkpoints[insertion.saturating_sub(1)];
-            return Some(SearchNavigation {
-                cursor: checkpoint.scan_at,
-                source_end: self.source_end,
-                direction: NavigationDirection::Forward {
-                    after: current.end(),
-                    wrap: self.first_match,
-                },
-            });
+        let direction = if forward {
+            NavigationDirection::Forward
+        } else {
+            NavigationDirection::Backward
+        };
+        let checkpoint = (!forward).then(|| self.checkpoint_at_or_before(current.start()));
+        let mut block = block.filter(|block| block.belongs_to(self));
+        if block.as_mut().is_some_and(|block| {
+            let contains = block.locate(current).is_some();
+            !(contains || forward && block.previous == Some(current))
+        }) {
+            block = None;
         }
-
-        let checkpoint = self.checkpoint_at_or_before(current.start());
+        let cursor = if forward {
+            block.as_ref().map_or(current.end(), |block| block.start)
+        } else {
+            block.as_ref().map_or_else(
+                || {
+                    checkpoint
+                        .expect("backward navigation starts from a checkpoint")
+                        .scan_at
+                },
+                |block| block.start,
+            )
+        };
+        let previous = if forward {
+            Some(current)
+        } else {
+            block.as_ref().map_or_else(
+                || {
+                    checkpoint
+                        .expect("backward navigation starts from a checkpoint")
+                        .previous_match
+                        .filter(|range| range.start() < current.start())
+                },
+                |block| block.previous,
+            )
+        };
         Some(SearchNavigation {
-            cursor: checkpoint.scan_at,
+            document_id: self.document_id,
+            cursor,
+            source_start: self.source_start,
             source_end: self.source_end,
-            direction: NavigationDirection::Backward {
-                before: current.start(),
-                previous: checkpoint
-                    .previous_match
-                    .filter(|range| range.start() < current.start()),
-                wrap: self.last_match,
+            query_len: self.query_len,
+            current,
+            previous,
+            block,
+            direction,
+            wrap: if forward {
+                self.first_match
+            } else {
+                self.last_match
             },
+            #[cfg(test)]
+            window_scans: 0,
         })
     }
 
+    #[cfg(test)]
     pub(super) fn highlights(&self, visible: Range<SourceOffset>) -> Option<SearchHighlights> {
-        if !self.complete || visible.start >= visible.end || visible.start >= self.source_end {
+        self.make_highlights(visible, Vec::new(), HighlightMode::Exact)
+    }
+
+    pub(super) fn display_highlights(
+        &self,
+        visible: Range<SourceOffset>,
+        targets: impl IntoIterator<Item = SearchRange>,
+    ) -> Result<Option<SearchHighlights>, TutError> {
+        if !self.highlightable(&visible) {
+            return Ok(None);
+        }
+        let mut ranges = Vec::new();
+        for target in targets {
+            debug_assert!(target.start() < visible.end && target.end() > visible.start);
+            debug_assert!(
+                ranges
+                    .last()
+                    .is_none_or(|last: &SearchRange| { last.end() <= target.start() })
+            );
+            if !reserve_display_target(&mut ranges)? {
+                return Ok(None);
+            }
+            ranges.push(target);
+        }
+        Ok(self.make_highlights(
+            visible,
+            ranges,
+            HighlightMode::Display { read: 0, write: 0 },
+        ))
+    }
+
+    fn highlightable(&self, visible: &Range<SourceOffset>) -> bool {
+        self.complete
+            && visible.start < visible.end
+            && visible.start < self.source_end
+            && visible.end > self.source_start
+    }
+
+    fn make_highlights(
+        &self,
+        visible: Range<SourceOffset>,
+        ranges: Vec<SearchRange>,
+        mode: HighlightMode,
+    ) -> Option<SearchHighlights> {
+        if !self.highlightable(&visible) {
             return None;
         }
         let earliest = visible
@@ -280,13 +383,19 @@ impl SearchIndex {
             .unwrap_or(self.source_start)
             .max(self.source_start);
         let checkpoint = self.checkpoint_at_or_before(earliest);
-        Some(SearchHighlights {
+        let mut highlights = SearchHighlights {
+            document_id: self.document_id,
             visible,
             cursor: checkpoint.scan_at,
             source_end: self.source_end,
-            ranges: Vec::new(),
-            complete: checkpoint.scan_at >= self.source_end,
-        })
+            ranges,
+            mode,
+            complete: false,
+        };
+        if checkpoint.scan_at >= self.source_end {
+            highlights.finish();
+        }
+        Some(highlights)
     }
 
     fn record_checkpoint(&mut self) -> Result<(), TutError> {
@@ -349,71 +458,321 @@ impl SearchIndex {
     }
 }
 
+impl MatchBlock {
+    fn scan(
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+        document_id: DocumentId,
+        source_start: SourceOffset,
+        source_end: SourceOffset,
+        start: SourceOffset,
+        previous: Option<SearchRange>,
+    ) -> Result<Self, TutError> {
+        if reader.document_id() != document_id {
+            return Err(SearchError::SourceMismatch.into());
+        }
+        let mut block = Self {
+            document_id,
+            source_start,
+            source_end,
+            query_len: needle.len(),
+            start,
+            next: start,
+            previous,
+            starts: Vec::new(),
+            selected: None,
+        };
+        block.next = scan_window(reader, needle, start, source_end, |range| {
+            block.push(range.start())
+        })?;
+        Ok(block)
+    }
+
+    fn belongs_to(&self, index: &SearchIndex) -> bool {
+        self.document_id == index.document_id
+            && self.source_start == index.source_start
+            && self.source_end == index.source_end
+            && self.query_len == index.query_len
+            && self.start >= self.source_start
+            && self.start < self.next
+            && self.next <= self.source_end
+    }
+
+    fn push(&mut self, start: SourceOffset) -> Result<(), TutError> {
+        if self.starts.len() >= MATCH_BLOCK_START_LIMIT {
+            return Err(SearchError::Allocation.into());
+        }
+        let relative = start
+            .get()
+            .checked_sub(self.start.get())
+            .and_then(|relative| u32::try_from(relative).ok())
+            .ok_or(SearchError::CoordinateOverflow)?;
+        if self.starts.len() == self.starts.capacity() {
+            let remaining = MATCH_BLOCK_START_LIMIT - self.starts.len();
+            let additional = self.starts.capacity().max(256).min(remaining);
+            self.starts
+                .try_reserve_exact(additional)
+                .map_err(|_| SearchError::Allocation)?;
+        }
+        self.starts.push(relative);
+        Ok(())
+    }
+
+    fn range(&self, index: usize) -> SearchRange {
+        let relative = usize::try_from(self.starts[index])
+            .expect("u32 match offsets fit the process address space");
+        let start = self
+            .start
+            .checked_add(relative)
+            .expect("match blocks retain validated source coordinates");
+        let end = start
+            .checked_add(self.query_len)
+            .expect("match blocks retain validated source coordinates");
+        SearchRange::new(start, end).expect("nonempty queries produce nonempty ranges")
+    }
+
+    fn locate(&mut self, range: SearchRange) -> Option<usize> {
+        if let Some(index) = self.selected
+            && self.range(index) == range
+        {
+            return Some(index);
+        }
+        let relative = range.start().get().checked_sub(self.start.get())?;
+        let relative = u32::try_from(relative).ok()?;
+        let index = self.starts.binary_search(&relative).ok()?;
+        if self.range(index) != range {
+            return None;
+        }
+        self.selected = Some(index);
+        Some(index)
+    }
+
+    fn select(&mut self, index: usize) -> SearchRange {
+        self.selected = Some(index);
+        self.range(index)
+    }
+
+    fn first(&mut self) -> Option<SearchRange> {
+        (!self.starts.is_empty()).then(|| self.select(0))
+    }
+
+    fn last_or_previous(&self) -> Option<SearchRange> {
+        self.starts
+            .len()
+            .checked_sub(1)
+            .map(|index| self.range(index))
+            .or(self.previous)
+    }
+
+    fn successor(&mut self, current: SearchRange) -> Option<SearchRange> {
+        if self.previous == Some(current) {
+            return self.first();
+        }
+        let index = self.locate(current)?.checked_add(1)?;
+        (index < self.starts.len()).then(|| self.select(index))
+    }
+
+    fn predecessor(&mut self, current: SearchRange) -> Option<SearchRange> {
+        let index = self.locate(current)?;
+        index.checked_sub(1).map(|index| self.select(index))
+    }
+
+    fn last_before(&mut self, before: SourceOffset) -> Option<SearchRange> {
+        let relative = before.get().saturating_sub(self.start.get());
+        let index = self
+            .starts
+            .partition_point(|start| u64::from(*start) < relative)
+            .checked_sub(1)?;
+        Some(self.select(index))
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+}
+
 impl SearchNavigation {
     pub(super) fn advance(
         &mut self,
         reader: &mut DocumentReader<'_>,
         needle: &str,
     ) -> Result<SearchAdvance, TutError> {
-        match &mut self.direction {
-            NavigationDirection::Forward { after, wrap } => {
-                if self.cursor >= self.source_end {
-                    return Ok(SearchAdvance {
-                        selected: *wrap,
-                        completed: true,
-                    });
-                }
-                let mut selected = None;
-                self.cursor = scan_window(reader, needle, self.cursor, self.source_end, |range| {
-                    if selected.is_none() && range.start() >= *after {
-                        selected = Some(range);
-                    }
-                    Ok(())
-                })?;
-                let completed = selected.is_some() || self.cursor == self.source_end;
-                Ok(SearchAdvance {
-                    selected: if completed {
-                        selected.or(*wrap)
-                    } else {
-                        selected
-                    },
-                    completed,
-                })
+        if reader.document_id() != self.document_id {
+            return Err(SearchError::SourceMismatch.into());
+        }
+        debug_assert_eq!(needle.len(), self.query_len);
+        match self.direction {
+            NavigationDirection::Forward => self.advance_forward(reader, needle),
+            NavigationDirection::Backward => self.advance_backward(reader, needle),
+        }
+    }
+
+    pub(super) fn take_block(&mut self) -> Option<MatchBlock> {
+        self.block.take()
+    }
+
+    #[cfg(test)]
+    const fn window_scans(&self) -> usize {
+        self.window_scans
+    }
+
+    fn advance_forward(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+    ) -> Result<SearchAdvance, TutError> {
+        let reused_block = self.block.is_some();
+        if reused_block {
+            reader.validate()?;
+        }
+        if let Some(mut block) = self.take_block() {
+            if let Some(selected) = block.successor(self.current) {
+                self.block = Some(block);
+                return Ok(SearchAdvance {
+                    selected: Some(selected),
+                    completed: true,
+                });
             }
-            NavigationDirection::Backward {
-                before,
-                previous,
-                wrap,
-            } => {
-                if self.cursor >= *before {
-                    return Ok(SearchAdvance {
-                        selected: (*previous).or(*wrap),
-                        completed: true,
-                    });
-                }
-                self.cursor = scan_window(reader, needle, self.cursor, self.source_end, |range| {
-                    if range.start() < *before {
-                        *previous = Some(range);
-                    }
-                    Ok(())
-                })?;
-                let completed = self.cursor >= *before;
-                Ok(SearchAdvance {
-                    selected: completed.then_some((*previous).or(*wrap)).flatten(),
-                    completed,
-                })
+            self.cursor = block.next;
+            self.previous = block.last_or_previous();
+            if self.cursor >= self.source_end {
+                block.clear_selection();
+                self.block = Some(block);
+                return Ok(SearchAdvance {
+                    selected: self.wrap,
+                    completed: true,
+                });
             }
         }
+        if self.cursor >= self.source_end {
+            if !reused_block {
+                reader.validate()?;
+            }
+            return Ok(SearchAdvance {
+                selected: self.wrap,
+                completed: true,
+            });
+        }
+
+        let mut block = MatchBlock::scan(
+            reader,
+            needle,
+            self.document_id,
+            self.source_start,
+            self.source_end,
+            self.cursor,
+            self.previous,
+        )?;
+        #[cfg(test)]
+        {
+            self.window_scans += 1;
+        }
+        self.cursor = block.next;
+        self.previous = block.last_or_previous();
+        let selected = block.first();
+        let completed = selected.is_some() || self.cursor == self.source_end;
+        if completed && selected.is_none() {
+            block.clear_selection();
+        }
+        self.block = Some(block);
+        Ok(SearchAdvance {
+            selected: if completed {
+                selected.or(self.wrap)
+            } else {
+                None
+            },
+            completed,
+        })
+    }
+
+    fn advance_backward(
+        &mut self,
+        reader: &mut DocumentReader<'_>,
+        needle: &str,
+    ) -> Result<SearchAdvance, TutError> {
+        let reused_block = self.block.is_some();
+        if reused_block {
+            reader.validate()?;
+        }
+        if let Some(mut block) = self.take_block() {
+            if block.locate(self.current).is_some() {
+                let selected = block.predecessor(self.current).or(block.previous);
+                if selected.is_none() || selected == block.previous {
+                    block.clear_selection();
+                }
+                self.block = Some(block);
+                return Ok(SearchAdvance {
+                    selected: selected.or(self.wrap),
+                    completed: true,
+                });
+            }
+            self.cursor = block.next;
+            self.previous = block.last_or_previous();
+        }
+        if self.cursor >= self.current.start() {
+            if !reused_block {
+                reader.validate()?;
+            }
+            return Ok(SearchAdvance {
+                selected: self.previous.or(self.wrap),
+                completed: true,
+            });
+        }
+
+        let mut block = MatchBlock::scan(
+            reader,
+            needle,
+            self.document_id,
+            self.source_start,
+            self.source_end,
+            self.cursor,
+            self.previous,
+        )?;
+        #[cfg(test)]
+        {
+            self.window_scans += 1;
+        }
+        self.cursor = block.next;
+        self.previous = block.last_or_previous();
+        if self.cursor < self.current.start() {
+            self.block = Some(block);
+            return Ok(SearchAdvance {
+                selected: None,
+                completed: false,
+            });
+        }
+
+        let selected = block.last_before(self.current.start()).or(block.previous);
+        if selected.is_none() || selected == block.previous {
+            block.clear_selection();
+        }
+        self.block = Some(block);
+        Ok(SearchAdvance {
+            selected: selected.or(self.wrap),
+            completed: true,
+        })
     }
 }
 
 #[derive(Debug)]
 pub(super) struct SearchHighlights {
+    document_id: DocumentId,
     visible: Range<SourceOffset>,
     cursor: SourceOffset,
     source_end: SourceOffset,
     ranges: Vec<SearchRange>,
+    mode: HighlightMode,
     complete: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HighlightMode {
+    #[cfg(test)]
+    Exact,
+    Display {
+        read: usize,
+        write: usize,
+    },
 }
 
 impl SearchHighlights {
@@ -434,11 +793,15 @@ impl SearchHighlights {
         reader: &mut DocumentReader<'_>,
         needle: &str,
     ) -> Result<bool, TutError> {
+        if reader.document_id() != self.document_id {
+            return Err(SearchError::SourceMismatch.into());
+        }
         if self.complete {
             return Ok(false);
         }
         if self.cursor >= self.source_end || self.cursor >= self.visible.end {
-            self.complete = true;
+            reader.validate()?;
+            self.finish();
             return Ok(true);
         }
 
@@ -448,31 +811,87 @@ impl SearchHighlights {
             }
             Ok(())
         })?;
-        self.complete = self.cursor >= self.source_end || self.cursor >= self.visible.end;
+        if self.cursor >= self.source_end || self.cursor >= self.visible.end {
+            self.finish();
+        }
         Ok(self.complete)
     }
 
     fn push(&mut self, range: SearchRange) -> Result<(), TutError> {
+        match self.mode {
+            #[cfg(test)]
+            HighlightMode::Exact => self.push_exact(range),
+            HighlightMode::Display { read, write } => {
+                self.push_display(range, read, write);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn push_exact(&mut self, range: SearchRange) -> Result<(), TutError> {
         if let Some(last) = self.ranges.last_mut()
             && last.end() == range.start()
         {
             last.end = range.end();
             return Ok(());
         }
-        let max_ranges = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>();
-        if self.ranges.len() >= max_ranges {
-            return Err(SearchError::Allocation.into());
-        }
-        if self.ranges.len() == self.ranges.capacity() {
-            let remaining = max_ranges - self.ranges.len();
-            let additional = self.ranges.capacity().max(256).min(remaining);
-            self.ranges
-                .try_reserve_exact(additional)
-                .map_err(|_| SearchError::Allocation)?;
-        }
+        reserve_highlight_range(&mut self.ranges)?;
         self.ranges.push(range);
         Ok(())
     }
+
+    fn push_display(&mut self, range: SearchRange, mut read: usize, mut write: usize) {
+        while let Some(target) = self.ranges.get(read).copied() {
+            if target.end() <= range.start() {
+                read += 1;
+                continue;
+            }
+            if target.start() >= range.end() {
+                break;
+            }
+            read += 1;
+            if write > 0 && self.ranges[write - 1].end() == target.start() {
+                self.ranges[write - 1].end = target.end();
+            } else {
+                self.ranges[write] = target;
+                write += 1;
+            }
+        }
+        self.mode = HighlightMode::Display { read, write };
+    }
+
+    fn finish(&mut self) {
+        match self.mode {
+            #[cfg(test)]
+            HighlightMode::Exact => {}
+            HighlightMode::Display { write, .. } => self.ranges.truncate(write),
+        }
+        self.complete = true;
+    }
+}
+
+#[cfg(test)]
+fn reserve_highlight_range(ranges: &mut Vec<SearchRange>) -> Result<(), TutError> {
+    if reserve_display_target(ranges)? {
+        return Ok(());
+    }
+    Err(SearchError::Allocation.into())
+}
+
+fn reserve_display_target(ranges: &mut Vec<SearchRange>) -> Result<bool, TutError> {
+    let max_ranges = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>();
+    if ranges.len() >= max_ranges {
+        return Ok(false);
+    }
+    if ranges.len() == ranges.capacity() {
+        let remaining = max_ranges - ranges.len();
+        let additional = ranges.capacity().max(256).min(remaining);
+        ranges
+            .try_reserve_exact(additional)
+            .map_err(|_| SearchError::Allocation)?;
+    }
+    Ok(true)
 }
 
 fn scan_window(
@@ -607,6 +1026,28 @@ mod tests {
         }
     }
 
+    fn navigate_with_block(
+        document: &Document,
+        index: &SearchIndex,
+        needle: &str,
+        current: SearchRange,
+        forward: bool,
+        block: Option<MatchBlock>,
+    ) -> (Option<SearchRange>, Option<MatchBlock>, usize) {
+        let mut navigation = index
+            .navigation_with_block(current, forward, block)
+            .unwrap();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        loop {
+            let advance = navigation.advance(&mut reader, needle).unwrap();
+            if advance.completed() {
+                let scans = navigation.window_scans();
+                return (advance.selected(), navigation.take_block(), scans);
+            }
+        }
+    }
+
     #[test]
     fn builds_a_global_nonoverlapping_index() {
         let (document, index) = complete("aaaaaa", "aa");
@@ -635,6 +1076,95 @@ mod tests {
             navigate(&document, &index, "cat", first, false),
             Some(second)
         );
+    }
+
+    #[test]
+    fn search_work_rejects_another_document_with_the_same_range() {
+        let (_document, index) = complete("cat cat", "cat");
+        let current = index.first_match.unwrap();
+        let mut navigation = index.navigation(current, true).unwrap();
+        let other = Document::from_text(Path::new("other.txt"), "cat cat".to_owned());
+        let mut cache = DocumentCache::default();
+        let mut reader = other.reader(&mut cache);
+
+        assert!(matches!(
+            navigation.advance(&mut reader, "cat"),
+            Err(TutError::Search(SearchError::SourceMismatch))
+        ));
+    }
+
+    #[test]
+    fn dense_navigation_reuses_one_compact_match_block() {
+        let text = "a ".repeat(SOURCE_WINDOW_BYTES / 2);
+        let (document, index) = complete(&text, "a");
+        let mut current = index.first_match.unwrap();
+        let mut block = None;
+        let mut forward_scans = 0;
+
+        for match_index in 1..=1024 {
+            let (selected, next_block, scans) =
+                navigate_with_block(&document, &index, "a", current, true, block);
+            current = selected.unwrap();
+            block = next_block;
+            forward_scans += scans;
+            assert_eq!(current.start(), SourceOffset::from_usize(match_index * 2));
+        }
+        assert_eq!(forward_scans, 1);
+
+        let mut backward_scans = 0;
+        for match_index in (0..1024).rev() {
+            let (selected, next_block, scans) =
+                navigate_with_block(&document, &index, "a", current, false, block);
+            current = selected.unwrap();
+            block = next_block;
+            backward_scans += scans;
+            assert_eq!(current.start(), SourceOffset::from_usize(match_index * 2));
+        }
+        assert_eq!(backward_scans, 0);
+    }
+
+    #[test]
+    fn cached_navigation_preserves_nonoverlapping_matches() {
+        let text = "a".repeat(4096);
+        let (document, index) = complete(&text, "aa");
+        let mut current = index.first_match.unwrap();
+        let mut block = None;
+        let mut scans = 0;
+
+        for match_index in 1..=512 {
+            let (selected, next_block, window_scans) =
+                navigate_with_block(&document, &index, "aa", current, true, block);
+            current = selected.unwrap();
+            block = next_block;
+            scans += window_scans;
+            assert_eq!(current.start(), SourceOffset::from_usize(match_index * 2));
+        }
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn cached_navigation_crosses_windows_with_utf8_queries() {
+        let needle = "é猫";
+        let mut text = needle.to_owned();
+        text.push_str(&"x".repeat(SOURCE_WINDOW_BYTES - 2));
+        let crossing = text.len();
+        text.push_str(needle);
+        text.push_str("--");
+        let following = text.len();
+        text.push_str(needle);
+        let (document, index) = complete(&text, needle);
+        let first = index.first_match.unwrap();
+
+        let (second, block, first_scans) =
+            navigate_with_block(&document, &index, needle, first, true, None);
+        let second = second.unwrap();
+        assert_eq!(second.start(), SourceOffset::from_usize(crossing));
+        assert_eq!(first_scans, 1);
+
+        let (third, _, second_scans) =
+            navigate_with_block(&document, &index, needle, second, true, block);
+        assert_eq!(third.unwrap().start(), SourceOffset::from_usize(following));
+        assert_eq!(second_scans, 1);
     }
 
     #[test]
@@ -743,6 +1273,49 @@ mod tests {
         );
         assert!(highlights.advance(&mut reader, "absent").unwrap());
         assert!(highlights.is_complete());
+    }
+
+    #[test]
+    fn display_highlights_use_visible_ranges_instead_of_dense_match_storage() {
+        let match_count = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>() + 1;
+        let text = "ab".repeat(match_count);
+        let source_end = SourceOffset::from_usize(text.len());
+        let target = SearchRange::new(SourceOffset::ZERO, source_end).unwrap();
+        let (document, index) = complete(&text, "a");
+        let mut highlights = index
+            .display_highlights(SourceOffset::ZERO..source_end, [target])
+            .unwrap()
+            .unwrap();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+
+        while !highlights.is_complete() {
+            highlights.advance(&mut reader, "a").unwrap();
+        }
+
+        assert_eq!(highlights.ranges(), &[target]);
+    }
+
+    #[test]
+    fn excessive_display_targets_disable_optional_highlights() {
+        let target_count = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>() + 1;
+        let text = "x".repeat(target_count);
+        let source_end = SourceOffset::from_usize(text.len());
+        let (_, index) = complete(&text, "z");
+        let targets = (0..target_count).map(|start| {
+            SearchRange::new(
+                SourceOffset::from_usize(start),
+                SourceOffset::from_usize(start + 1),
+            )
+            .unwrap()
+        });
+
+        assert!(
+            index
+                .display_highlights(SourceOffset::ZERO..source_end, targets)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -911,6 +1484,15 @@ mod tests {
         assert_eq!(
             navigate(&document, &index, "cat", first, false).unwrap(),
             index.last_match.unwrap()
+        );
+        let last = index.last_match.unwrap();
+        assert_eq!(
+            navigate(&document, &index, "cat", last, false)
+                .unwrap()
+                .start(),
+            SourceOffset::from_usize(
+                14 * (SOURCE_WINDOW_BYTES + "cat".len()) + SOURCE_WINDOW_BYTES
+            )
         );
     }
 }
