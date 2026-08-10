@@ -135,13 +135,11 @@ pub(super) struct RenderSpan {
     source: GraphemeRange,
     pub projection: RenderProjectionKind,
     pub cell_width: DisplayColumn,
-    pub highlight: Highlight,
 }
 
 impl RenderSpan {
     pub(super) fn from_projected(
         atom: ProjectedAtom<'_>,
-        highlight: Highlight,
         output: &mut String,
     ) -> Result<Self, TutError> {
         let cell_width = atom.width();
@@ -185,7 +183,6 @@ impl RenderSpan {
             source: atom.source(),
             projection,
             cell_width,
-            highlight,
         })
     }
 
@@ -194,9 +191,12 @@ impl RenderSpan {
             .expect("render spans retain valid row-text boundaries")
     }
 
-    fn merge(&mut self, next: &Self) -> bool {
+    pub(super) const fn source(&self) -> GraphemeRange {
+        self.source
+    }
+
+    pub(super) fn merge(&mut self, next: &Self) -> bool {
         if self.projection != next.projection
-            || self.highlight != next.highlight
             || self.text.end != next.text.start
             || self.source.end() != next.source.start()
         {
@@ -227,12 +227,18 @@ struct RenderRowRange {
     spans: Range<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, PartialEq, Eq, Default)]
 pub(super) struct RenderRows {
     text: String,
     spans: Vec<RenderSpan>,
     rows: Vec<RenderRowRange>,
 }
+
+static EMPTY_RENDER_ROWS: RenderRows = RenderRows {
+    text: String::new(),
+    spans: Vec::new(),
+    rows: Vec::new(),
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RenderRow<'a> {
@@ -267,43 +273,77 @@ impl RenderRows {
         self.rows.len()
     }
 
-    fn try_clone(&self) -> Result<Self, TutError> {
-        let mut text = String::new();
-        text.try_reserve_exact(self.text.len())
-            .map_err(|_| TutError::Allocation("cached visible row text"))?;
-        text.push_str(&self.text);
+    #[cfg(test)]
+    fn storage_identity(
+        &self,
+    ) -> (
+        *const Self,
+        *const u8,
+        *const RenderSpan,
+        *const RenderRowRange,
+    ) {
+        (
+            self,
+            self.text.as_ptr(),
+            self.spans.as_ptr(),
+            self.rows.as_ptr(),
+        )
+    }
+}
 
-        let mut spans = Vec::new();
-        spans
-            .try_reserve_exact(self.spans.len())
-            .map_err(|_| TutError::Allocation("cached visible row spans"))?;
-        spans.extend_from_slice(&self.spans);
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RenderRowsView<'a> {
+    rows: &'a RenderRows,
+    ranges: &'a [SearchRange],
+    current: Option<SearchRange>,
+}
 
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(self.rows.len())
-            .map_err(|_| TutError::Allocation("cached visible rows"))?;
-        rows.extend_from_slice(&self.rows);
-        Ok(Self { text, spans, rows })
+impl<'a> RenderRowsView<'a> {
+    const fn new(
+        rows: &'a RenderRows,
+        ranges: &'a [SearchRange],
+        current: Option<SearchRange>,
+    ) -> Self {
+        Self {
+            rows,
+            ranges,
+            current,
+        }
     }
 
-    fn apply_highlights(&mut self, ranges: &[SearchRange], current: Option<SearchRange>) {
-        let mut matches = MatchCursor::new(ranges, current);
-        let mut write = 0;
-        for row in &mut self.rows {
-            let source = row.spans.clone();
-            let row_start = write;
-            for read in source {
-                let mut span = self.spans[read].clone();
-                span.highlight = matches.role_for(span.source);
-                if write > row_start && self.spans[write - 1].merge(&span) {
-                    continue;
-                }
-                self.spans[write] = span;
-                write += 1;
-            }
-            row.spans = row_start..write;
-        }
-        self.spans.truncate(write);
+    #[cfg(test)]
+    pub(super) const fn empty() -> Self {
+        Self::new(&EMPTY_RENDER_ROWS, &[], None)
+    }
+
+    pub(super) fn iter(self) -> impl ExactSizeIterator<Item = RenderRow<'a>> + 'a {
+        self.rows.iter()
+    }
+
+    #[cfg(test)]
+    pub(super) fn get(self, index: usize) -> Option<RenderRow<'a>> {
+        self.rows.get(index)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn len(self) -> usize {
+        self.rows.len()
+    }
+
+    pub(super) const fn highlight_cursor(self) -> MatchCursor<'a> {
+        MatchCursor::new(self.ranges, self.current)
+    }
+
+    #[cfg(test)]
+    fn storage_identity(
+        self,
+    ) -> (
+        *const RenderRows,
+        *const u8,
+        *const RenderSpan,
+        *const RenderRowRange,
+    ) {
+        self.rows.storage_identity()
     }
 }
 
@@ -311,7 +351,7 @@ impl RenderRows {
 pub(super) struct RenderState<'a> {
     pub filename: &'a str,
     pub path: &'a str,
-    pub rows: RenderRows,
+    pub rows: RenderRowsView<'a>,
     pub progress: u8,
     pub current_line: Option<u64>,
     pub total_lines: Option<u64>,
@@ -500,23 +540,27 @@ impl App {
     }
 
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
-        let (viewport, mut rows) = self.build_render_viewport()?;
-        self.prepare_search_highlights(viewport, &rows)?;
+        let viewport = self.build_render_viewport()?;
+        self.prepare_search_highlights(viewport)?;
         let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
-        if let Some(viewport) = viewport {
+        let ranges = if let Some(viewport) = viewport {
             let visible = viewport.first_visible_start..viewport.visible_end;
-            let ranges = self
-                .highlights
+            self.highlights
                 .as_ref()
                 .filter(|highlights| highlights.covers(&visible))
-                .map_or(&[][..], SearchHighlights::ranges);
-            rows.apply_highlights(ranges, self.current_match);
-        }
+                .map_or(&[][..], SearchHighlights::ranges)
+        } else {
+            &[]
+        };
+        let rows = self
+            .render_cache
+            .as_ref()
+            .map_or(&EMPTY_RENDER_ROWS, |cached| &cached.rows);
         Ok(RenderState {
             filename: self.document.display_name(),
             path: self.document.display_path(),
-            rows,
+            rows: RenderRowsView::new(rows, ranges, self.current_match),
             progress,
             current_line: line.map(LinePosition::current),
             total_lines: line.and_then(LinePosition::total),
@@ -524,11 +568,7 @@ impl App {
         })
     }
 
-    fn prepare_search_highlights(
-        &mut self,
-        viewport: Option<Viewport>,
-        rows: &RenderRows,
-    ) -> Result<(), TutError> {
+    fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) -> Result<(), TutError> {
         let Some(viewport) = viewport else {
             self.highlights = None;
             return Ok(());
@@ -553,6 +593,11 @@ impl App {
         else {
             return Ok(());
         };
+        let rows = &self
+            .render_cache
+            .as_ref()
+            .expect("visible viewport retains rendered rows")
+            .rows;
         let targets = rows.spans.iter().map(|span| {
             SearchRange::new(span.source.start(), span.source.end())
                 .expect("render spans retain nonempty source ranges")
@@ -1112,10 +1157,10 @@ impl App {
         changed
     }
 
-    fn build_render_viewport(&mut self) -> Result<(Option<Viewport>, RenderRows), TutError> {
+    fn build_render_viewport(&mut self) -> Result<Option<Viewport>, TutError> {
         let Some(row_capacity) = self.geometry.body_height().map(BodyHeight::get) else {
             self.render_cache = None;
-            return Ok((None, RenderRows::default()));
+            return Ok(None);
         };
         if let Some(cached) = self
             .render_cache
@@ -1123,7 +1168,7 @@ impl App {
             .filter(|cached| cached.geometry == self.geometry && cached.anchor == self.anchor)
         {
             self.document.validate()?;
-            return Ok((Some(cached.viewport), cached.rows.try_clone()?));
+            return Ok(Some(cached.viewport));
         }
         self.render_cache = None;
         let layout = self.layout.as_ref().expect("viewport has a layout");
@@ -1142,9 +1187,9 @@ impl App {
             geometry: self.geometry,
             anchor: self.anchor,
             viewport,
-            rows: rows.try_clone()?,
+            rows,
         });
-        Ok((Some(viewport), rows))
+        Ok(Some(viewport))
     }
 }
 
@@ -1201,7 +1246,7 @@ impl ProjectedRowSink for RenderRowsBuilder {
                 .try_reserve(1)
                 .map_err(|_| TutError::Allocation("visible row spans"))?;
         }
-        let span = RenderSpan::from_projected(atom, Highlight::None, &mut self.text)?;
+        let span = RenderSpan::from_projected(atom, &mut self.text)?;
         self.spans.push(span);
         Ok(())
     }
@@ -1231,7 +1276,7 @@ impl ProjectedRowSink for RenderRowsBuilder {
     }
 }
 
-struct MatchCursor<'a> {
+pub(super) struct MatchCursor<'a> {
     ranges: &'a [SearchRange],
     next: usize,
     spanning: Option<SearchRange>,
@@ -1239,7 +1284,7 @@ struct MatchCursor<'a> {
 }
 
 impl<'a> MatchCursor<'a> {
-    fn new(ranges: &'a [SearchRange], current: Option<SearchRange>) -> Self {
+    const fn new(ranges: &'a [SearchRange], current: Option<SearchRange>) -> Self {
         Self {
             ranges,
             next: 0,
@@ -1248,7 +1293,7 @@ impl<'a> MatchCursor<'a> {
         }
     }
 
-    fn role_for(&mut self, atom: GraphemeRange) -> Highlight {
+    pub(super) fn role_for(&mut self, atom: GraphemeRange) -> Highlight {
         let mut role = self.current.map_or(Highlight::None, |current| {
             if intersects(current, atom) {
                 Highlight::Current
@@ -1312,6 +1357,26 @@ mod tests {
         app.update(Action::Resize(Geometry::new(columns, rows)))
             .unwrap();
         app
+    }
+
+    fn highlighted_row(state: &RenderState<'_>, index: usize) -> Vec<(String, Highlight)> {
+        let mut cursor = state.rows.highlight_cursor();
+        for (row_index, row) in state.rows.iter().enumerate() {
+            let spans = row
+                .spans
+                .iter()
+                .map(|span| {
+                    (
+                        span.text(row.text).to_owned(),
+                        cursor.role_for(span.source()),
+                    )
+                })
+                .collect();
+            if row_index == index {
+                return spans;
+            }
+        }
+        panic!("rendered row {index} is missing");
     }
 
     fn submit(app: &mut App, query: &str) {
@@ -1940,24 +2005,23 @@ mod tests {
     }
 
     #[test]
-    fn render_state_owns_rows_and_marks_all_matches() {
+    fn render_state_borrows_rows_and_marks_all_matches() {
         let mut app = reader("cat cat", 16, 4);
         commit(&mut app, "cat");
-        {
+        let storage = {
             let state = app.render_state().unwrap();
-            let row = state.rows.get(0).unwrap();
-            assert_eq!(row.spans[0].highlight, Highlight::Current);
-            assert_eq!(row.spans[0].text(row.text), "cat");
-            assert_eq!(row.spans[1].highlight, Highlight::None);
-            assert_eq!(row.spans[1].text(row.text), " cat");
-        }
+            let row = highlighted_row(&state, 0);
+            assert_eq!(row[0], ("c".to_owned(), Highlight::Current));
+            assert_eq!(row[3], (" ".to_owned(), Highlight::None));
+            assert_eq!(row[4], ("c".to_owned(), Highlight::None));
+            state.rows.storage_identity()
+        };
         settle(&mut app);
         let state = app.render_state().unwrap();
-        let row = state.rows.get(0).unwrap();
-        assert_eq!(row.spans[0].highlight, Highlight::Current);
-        assert_eq!(row.spans[0].text(row.text), "cat");
-        assert_eq!(row.spans[2].highlight, Highlight::Match);
-        assert_eq!(row.spans[2].text(row.text), "cat");
+        assert_eq!(state.rows.storage_identity(), storage);
+        let row = highlighted_row(&state, 0);
+        assert_eq!(row[0], ("c".to_owned(), Highlight::Current));
+        assert_eq!(row[4], ("c".to_owned(), Highlight::Match));
     }
 
     #[test]
@@ -1980,10 +2044,12 @@ mod tests {
     #[test]
     fn repeated_rendering_reuses_the_unchanged_visible_body() {
         let mut app = reader("a\nb\nc\nd\ne\noutside\n", 16, 8);
-        let first = app.render_state().unwrap().rows;
+        let first = app.render_state().unwrap().rows.storage_identity();
+        let cached = app.render_cache.as_ref().unwrap().rows.storage_identity();
+        assert_eq!(first, cached);
         app.document_cache.reset_metrics();
 
-        let second = app.render_state().unwrap().rows;
+        let second = app.render_state().unwrap().rows.storage_identity();
 
         assert_eq!(second, first);
         assert_eq!(app.document_cache.metrics().grapheme_emissions(), 0);
@@ -1991,7 +2057,7 @@ mod tests {
     }
 
     #[test]
-    fn rendering_reads_one_grapheme_frontier_and_compacts_ascii_spans() {
+    fn rendering_reads_one_grapheme_frontier_and_retains_atom_boundaries() {
         let mut app = reader(&"x".repeat(1024), 127, 4);
         app.document_cache = DocumentCache::with_window_bytes(128);
         app.document_cache.reset_metrics();
@@ -2000,8 +2066,8 @@ mod tests {
             let state = app.render_state().unwrap();
             let row = state.rows.get(0).unwrap();
             assert_eq!(row.text.len(), 127);
-            assert_eq!(row.spans.len(), 1);
-            assert_eq!(row.spans[0].cell_width, DisplayColumn::new(127));
+            assert_eq!(row.spans.len(), 127);
+            assert_eq!(row.spans[0].cell_width, DisplayColumn::new(1));
         }
 
         let metrics = app.document_cache.metrics();
@@ -2041,7 +2107,7 @@ mod tests {
         commit(&mut app, "cat");
         assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(6));
         assert_eq!(
-            app.render_state().unwrap().rows.get(1).unwrap().spans[0].highlight,
+            highlighted_row(&app.render_state().unwrap(), 1)[0].1,
             Highlight::Current
         );
 
@@ -2061,10 +2127,10 @@ mod tests {
         commit(&mut app, "needle");
         assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(9));
         let state = app.render_state().unwrap();
-        assert!(state.rows.iter().any(|row| {
-            row.spans
+        assert!((0..state.rows.len()).any(|index| {
+            highlighted_row(&state, index)
                 .iter()
-                .any(|span| span.highlight == Highlight::Current)
+                .any(|(_, highlight)| *highlight == Highlight::Current)
         }));
     }
 
