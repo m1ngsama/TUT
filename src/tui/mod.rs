@@ -5,7 +5,7 @@ use std::{
     io::{self, Stdout},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -27,8 +27,14 @@ use crate::{
 const MAX_POLL: Duration = Duration::from_millis(100);
 const BACKGROUND_POLL: Duration = Duration::from_millis(1);
 
+#[derive(Default)]
+struct PendingSignals {
+    termination: AtomicUsize,
+    suspend: AtomicBool,
+}
+
 #[derive(Clone, Default)]
-pub(super) struct SignalState(Arc<AtomicUsize>);
+pub(super) struct SignalState(Arc<PendingSignals>);
 
 impl SignalState {
     fn empty() -> Self {
@@ -36,7 +42,7 @@ impl SignalState {
     }
 
     pub(super) fn received(&self) -> Option<ExternalSignal> {
-        match self.0.load(Ordering::SeqCst) {
+        match self.0.termination.load(Ordering::SeqCst) {
             signal if signal == signal_hook::consts::signal::SIGHUP as usize => {
                 Some(ExternalSignal::Hangup)
             }
@@ -53,11 +59,30 @@ impl SignalState {
         }
     }
 
+    fn suspend_requested(&self) -> bool {
+        self.0.suspend.load(Ordering::SeqCst)
+    }
+
+    fn take_suspend(&self) -> bool {
+        self.0.suspend.swap(false, Ordering::SeqCst)
+    }
+
     #[cfg(test)]
     fn store_raw(&self, signal: usize) {
         let _ = self
             .0
+            .termination
             .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn store_suspend(&self) {
+        self.0.suspend.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn store_continue(&self) {
+        self.0.suspend.store(false, Ordering::SeqCst);
     }
 }
 
@@ -68,7 +93,7 @@ pub(super) struct SignalHandlers {
 
 impl SignalHandlers {
     fn install() -> io::Result<Self> {
-        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+        use signal_hook::consts::signal::{SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP};
 
         let state = SignalState::empty();
         let mut ids = Vec::new();
@@ -78,11 +103,34 @@ impl SignalHandlers {
             (SIGQUIT, SIGQUIT as usize),
             (SIGTERM, SIGTERM as usize),
         ] {
-            let slot = Arc::clone(&state.0);
+            let pending = Arc::clone(&state.0);
             // SAFETY: The handler performs only a non-panicking atomic compare-exchange.
             let registration = unsafe {
                 low_level::register(signal, move || {
-                    let _ = slot.compare_exchange(0, value, Ordering::SeqCst, Ordering::SeqCst);
+                    let _ = pending.termination.compare_exchange(
+                        0,
+                        value,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                })
+            };
+            match registration {
+                Ok(id) => ids.push(id),
+                Err(error) => {
+                    for id in ids {
+                        low_level::unregister(id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for (signal, suspended) in [(SIGTSTP, true), (SIGCONT, false)] {
+            let pending = Arc::clone(&state.0);
+            // SAFETY: The handler performs only a non-panicking atomic store.
+            let registration = unsafe {
+                low_level::register(signal, move || {
+                    pending.suspend.store(suspended, Ordering::SeqCst);
                 })
             };
             match registration {
@@ -126,6 +174,8 @@ trait TerminalDriver {
     fn draw(&mut self, app: &mut App) -> Result<(), TutError>;
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read(&mut self) -> io::Result<Event>;
+    fn force_redraw(&mut self) -> io::Result<()>;
+    fn suspend(&mut self) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
     fn disable_raw_mode(&mut self) -> io::Result<()>;
@@ -149,11 +199,11 @@ impl<'a, T: TerminalDriver> TerminalSession<'a, T> {
     }
 
     fn initialize(&mut self, signals: &SignalState) -> Result<(), Primary> {
-        check_signal(signals)?;
+        check_control(signals)?;
 
         self.raw_cleanup = true;
         let result = self.driver.enable_raw_mode();
-        check_signal(signals)?;
+        check_control(signals)?;
         result.map_err(|source| {
             Primary::Error(TutError::Io {
                 operation: "enable raw mode",
@@ -163,7 +213,7 @@ impl<'a, T: TerminalDriver> TerminalSession<'a, T> {
 
         self.alternate_cleanup = true;
         let result = self.driver.enter_alternate_screen();
-        check_signal(signals)?;
+        check_control(signals)?;
         result.map_err(|source| {
             Primary::Error(TutError::Io {
                 operation: "enter alternate screen",
@@ -173,7 +223,7 @@ impl<'a, T: TerminalDriver> TerminalSession<'a, T> {
 
         self.cursor_cleanup = true;
         let result = self.driver.hide_cursor();
-        check_signal(signals)?;
+        check_control(signals)?;
         result.map_err(|source| {
             Primary::Error(TutError::Io {
                 operation: "hide cursor",
@@ -219,15 +269,19 @@ impl<T: TerminalDriver> Drop for TerminalSession<'_, T> {
 #[derive(Debug)]
 enum Primary {
     Normal,
+    Suspend,
     Signal(ExternalSignal),
     Error(TutError),
 }
 
-fn check_signal(signals: &SignalState) -> Result<(), Primary> {
-    match signals.received() {
-        Some(signal) => Err(Primary::Signal(signal)),
-        None => Ok(()),
+fn check_control(signals: &SignalState) -> Result<(), Primary> {
+    if let Some(signal) = signals.received() {
+        return Err(Primary::Signal(signal));
     }
+    if signals.suspend_requested() {
+        return Err(Primary::Suspend);
+    }
+    Ok(())
 }
 
 fn retain_first(first: &mut Option<TutError>, operation: &'static str, result: io::Result<()>) {
@@ -238,9 +292,9 @@ fn retain_first(first: &mut Option<TutError>, operation: &'static str, result: i
     }
 }
 
-fn promote_normal_to_signal(primary: Primary, signals: &SignalState) -> Primary {
+fn promote_termination(primary: Primary, signals: &SignalState) -> Primary {
     match (primary, signals.received()) {
-        (Primary::Normal, Some(signal)) => Primary::Signal(signal),
+        (Primary::Normal | Primary::Suspend, Some(signal)) => Primary::Signal(signal),
         (primary, _) => primary,
     }
 }
@@ -259,7 +313,55 @@ fn finish(primary: Primary, restoration: Option<TutError>) -> Result<RunOutcome,
             primary: Box::new(primary),
             restoration: Box::new(restoration),
         }),
+        (Primary::Suspend, _) => unreachable!("suspension is handled before finishing"),
     }
+}
+
+fn refresh_geometry<T: TerminalDriver>(
+    app: &mut App,
+    driver: &mut T,
+    signals: &SignalState,
+) -> Result<(), Primary> {
+    check_control(signals)?;
+    let size_result = driver.size();
+    check_control(signals)?;
+    let (width, height) = size_result.map_err(|source| {
+        Primary::Error(TutError::Io {
+            operation: "query terminal size",
+            source,
+        })
+    })?;
+    let resize_result = app.update(Action::Resize(Geometry::new(width, height)));
+    check_control(signals)?;
+    resize_result.map_err(Primary::Error)?;
+    Ok(())
+}
+
+fn run_session<T: TerminalDriver>(
+    app: &mut App,
+    session: &mut TerminalSession<'_, T>,
+    signals: &SignalState,
+    force_redraw: bool,
+) -> Primary {
+    if let Err(primary) = refresh_geometry(app, session.driver, signals) {
+        return primary;
+    }
+    if let Err(primary) = session.initialize(signals) {
+        return primary;
+    }
+    if force_redraw {
+        let result = session.driver.force_redraw();
+        if let Err(primary) = check_control(signals) {
+            return primary;
+        }
+        if let Err(source) = result {
+            return Primary::Error(TutError::Io {
+                operation: "reset terminal for redraw",
+                source,
+            });
+        }
+    }
+    event_loop(app, session.driver, signals)
 }
 
 fn run_with_driver<T: TerminalDriver>(
@@ -267,45 +369,48 @@ fn run_with_driver<T: TerminalDriver>(
     driver: &mut T,
     signals: &SignalState,
 ) -> Result<RunOutcome, TutError> {
-    if let Some(signal) = signals.received() {
-        return Ok(RunOutcome::Signal(signal));
-    }
-
-    let size_result = driver.size();
-    if let Some(signal) = signals.received() {
-        return Ok(RunOutcome::Signal(signal));
-    }
-    let (width, height) = size_result.map_err(|source| TutError::Io {
-        operation: "query terminal size",
-        source,
-    })?;
-    let resize_result = app.update(Action::Resize(Geometry::new(width, height)));
-    if let Some(signal) = signals.received() {
-        return Ok(RunOutcome::Signal(signal));
-    }
-    resize_result?;
-
     let mut session = TerminalSession::new(driver);
-    let primary = match session.initialize(signals) {
-        Ok(()) => event_loop(app, session.driver, signals),
-        Err(primary) => primary,
-    };
-    let restoration = session.restore();
-    let primary = promote_normal_to_signal(primary, signals);
-    finish(primary, restoration)
+    let mut resumed = false;
+    loop {
+        let primary = run_session(app, &mut session, signals, resumed);
+        let restoration = session.restore();
+        let primary = promote_termination(primary, signals);
+        if !matches!(primary, Primary::Suspend) {
+            return finish(primary, restoration);
+        }
+        if let Some(restoration) = restoration {
+            return Err(restoration);
+        }
+        if !signals.take_suspend() {
+            resumed = true;
+            continue;
+        }
+        if let Some(signal) = signals.received() {
+            return Ok(RunOutcome::Signal(signal));
+        }
+        let result = session.driver.suspend();
+        if let Some(signal) = signals.received() {
+            return Ok(RunOutcome::Signal(signal));
+        }
+        result.map_err(|source| TutError::Io {
+            operation: "suspend process",
+            source,
+        })?;
+        resumed = true;
+    }
 }
 
 fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &SignalState) -> Primary {
     let mut redraw = true;
 
     loop {
-        if let Some(signal) = signals.received() {
-            return Primary::Signal(signal);
+        if let Err(primary) = check_control(signals) {
+            return primary;
         }
         if redraw {
             let result = driver.draw(app);
-            if let Some(signal) = signals.received() {
-                return Primary::Signal(signal);
+            if let Err(primary) = check_control(signals) {
+                return primary;
             }
             if let Err(error) = result {
                 return Primary::Error(error);
@@ -322,8 +427,8 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
         let ready = match driver.poll(timeout) {
             Ok(ready) => ready,
             Err(source) => {
-                if let Some(signal) = signals.received() {
-                    return Primary::Signal(signal);
+                if let Err(primary) = check_control(signals) {
+                    return primary;
                 }
                 return Primary::Error(TutError::Io {
                     operation: "poll terminal events",
@@ -331,8 +436,8 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
                 });
             }
         };
-        if let Some(signal) = signals.received() {
-            return Primary::Signal(signal);
+        if let Err(primary) = check_control(signals) {
+            return primary;
         }
         if !ready {
             if background_work {
@@ -347,8 +452,8 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
         let event = match driver.read() {
             Ok(event) => event,
             Err(source) => {
-                if let Some(signal) = signals.received() {
-                    return Primary::Signal(signal);
+                if let Err(primary) = check_control(signals) {
+                    return primary;
                 }
                 return Primary::Error(TutError::Io {
                     operation: "read terminal event",
@@ -356,8 +461,8 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
                 });
             }
         };
-        if let Some(signal) = signals.received() {
-            return Primary::Signal(signal);
+        if let Err(primary) = check_control(signals) {
+            return primary;
         }
 
         if let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) {
@@ -379,7 +484,7 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
 
 fn advance_background(app: &mut App, signals: &SignalState) -> Result<bool, Primary> {
     let result = app.advance_background();
-    check_signal(signals)?;
+    check_control(signals)?;
     result.map_err(Primary::Error)
 }
 
@@ -435,6 +540,15 @@ impl TerminalDriver for CrosstermDriver {
         event::read()
     }
 
+    fn force_redraw(&mut self) -> io::Result<()> {
+        let size = self.terminal.size()?;
+        self.terminal.resize(size.into())
+    }
+
+    fn suspend(&mut self) -> io::Result<()> {
+        low_level::emulate_default_handler(signal_hook::consts::signal::SIGTSTP)
+    }
+
     fn show_cursor(&mut self) -> io::Result<()> {
         execute!(self.terminal.backend_mut(), Show)
     }
@@ -480,6 +594,8 @@ mod tests {
         failures: Vec<&'static str>,
         events: VecDeque<Event>,
         inject_on: Option<&'static str>,
+        inject_suspend_on: Option<&'static str>,
+        inject_continue_on: Option<&'static str>,
         signals: SignalState,
         poll_timeouts: Vec<Duration>,
     }
@@ -491,6 +607,8 @@ mod tests {
                 failures: Vec::new(),
                 events: VecDeque::new(),
                 inject_on: None,
+                inject_suspend_on: None,
+                inject_continue_on: None,
                 signals: signals.clone(),
                 poll_timeouts: Vec::new(),
             }
@@ -500,6 +618,14 @@ mod tests {
             self.calls.push(name);
             if self.inject_on == Some(name) {
                 self.signals.store_raw(SIGTERM as usize);
+            }
+            if self.inject_suspend_on == Some(name) {
+                self.inject_suspend_on = None;
+                self.signals.store_suspend();
+            }
+            if self.inject_continue_on == Some(name) {
+                self.inject_continue_on = None;
+                self.signals.store_continue();
             }
             if self.failures.contains(&name) {
                 Err(io::Error::other(name))
@@ -545,6 +671,14 @@ mod tests {
             self.events
                 .pop_front()
                 .ok_or_else(|| io::Error::other("empty event queue"))
+        }
+
+        fn force_redraw(&mut self) -> io::Result<()> {
+            self.call("force_redraw")
+        }
+
+        fn suspend(&mut self) -> io::Result<()> {
+            self.call("suspend")
         }
 
         fn show_cursor(&mut self) -> io::Result<()> {
@@ -619,6 +753,92 @@ mod tests {
                 .calls
                 .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
         );
+    }
+
+    #[test]
+    fn suspension_restores_then_reinitializes_and_forces_a_redraw() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Normal
+        );
+        let transition = [
+            "poll",
+            "show_cursor",
+            "leave_alt",
+            "disable_raw",
+            "suspend",
+            "size",
+            "enable_raw",
+            "enter_alt",
+            "hide_cursor",
+            "force_redraw",
+            "draw",
+        ];
+        assert!(
+            driver
+                .calls
+                .windows(transition.len())
+                .any(|calls| calls == transition)
+        );
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn failed_suspension_restoration_does_not_stop_the_process() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+        driver.failures.push("show_cursor");
+
+        let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
+        assert_eq!(error.message(), "failed to show cursor: show_cursor");
+        assert!(!driver.calls.contains(&"suspend"));
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn continuation_during_restoration_cancels_the_pending_stop() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+        driver.inject_continue_on = Some("show_cursor");
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Normal
+        );
+        assert!(!driver.calls.contains(&"suspend"));
+        assert!(driver.calls.contains(&"force_redraw"));
+    }
+
+    #[test]
+    fn terminating_signal_during_suspension_restoration_prevents_the_stop() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+        driver.inject_on = Some("show_cursor");
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Signal(ExternalSignal::Terminate)
+        );
+        assert!(!driver.calls.contains(&"suspend"));
     }
 
     #[test]
