@@ -1,14 +1,15 @@
 use std::collections::VecDeque;
 
 use crate::{
-    document::{DocumentId, DocumentReader, SOURCE_WINDOW_BYTES},
+    document::{DocumentId, DocumentReader},
     error::TutError,
-    layout::{BodyHeight, ContentWidth, ViewportLayout},
+    layout::{
+        BodyHeight, ContentWidth, ProjectedRowsResult, ProjectedScanAdvance, ProjectedScanMeter,
+        ViewportLayout, VisualRowScanner,
+    },
     source::SourceOffset,
 };
 
-const ROW_BUDGET: usize = 1024;
-const BYTE_BUDGET: u64 = SOURCE_WINDOW_BYTES as u64;
 const INITIAL_ROW_NEIGHBORHOOD_CAPACITY: usize = 64;
 const ROW_NEIGHBORHOOD_CAPACITY: usize = 4096;
 
@@ -230,26 +231,9 @@ struct PrefixScan {
     cursor: SourceOffset,
 }
 
-struct Budget {
-    rows: usize,
-    bytes: u64,
-}
-
-impl Budget {
-    const fn new() -> Self {
-        Self { rows: 0, bytes: 0 }
-    }
-
-    fn charge(&mut self, start: SourceOffset, end: SourceOffset) {
-        self.rows += 1;
-        self.bytes = self
-            .bytes
-            .saturating_add(end.get().saturating_sub(start.get()));
-    }
-
-    const fn exhausted(&self) -> bool {
-        self.rows >= ROW_BUDGET || self.bytes >= BYTE_BUDGET
-    }
+struct PendingRowScan {
+    start: SourceOffset,
+    scanner: VisualRowScanner,
 }
 
 pub(super) struct ViewportLocator {
@@ -260,6 +244,7 @@ pub(super) struct ViewportLocator {
     history: VecDeque<SourceOffset>,
     prefix: Option<PrefixScan>,
     prefix_rows: VecDeque<SourceOffset>,
+    row_scan: Option<PendingRowScan>,
     capacity: usize,
 }
 
@@ -293,6 +278,7 @@ impl ViewportLocator {
             history,
             prefix: None,
             prefix_rows,
+            row_scan: None,
             capacity,
         })
     }
@@ -315,9 +301,9 @@ impl ViewportLocator {
         neighborhood: &mut RowNeighborhood,
     ) -> Result<Option<LocatedViewport>, TutError> {
         let row_key = layout.row_cache_key();
-        let mut budget = Budget::new();
+        let mut meter = ProjectedScanMeter::standard();
         loop {
-            if budget.exhausted() {
+            if meter.exhausted() {
                 return Ok(None);
             }
             match self.phase {
@@ -326,10 +312,12 @@ impl ViewportLocator {
                     self.phase = Phase::Locate { cursor };
                 }
                 Phase::Locate { cursor } => {
-                    self.push_history(cursor);
-                    let next = layout.next_row_start(reader, cursor)?;
+                    let Some(row) = self.advance_row(layout, reader, &mut meter, cursor)? else {
+                        return Ok(None);
+                    };
+                    let next = row.next;
                     neighborhood.observe(row_key, cursor, next)?;
-                    budget.charge(cursor, next.unwrap_or_else(|| reader.source_end()));
+                    self.push_history(cursor);
                     if let Some(next) = next.filter(|next| *next <= self.target) {
                         self.phase = Phase::Locate { cursor: next };
                     } else {
@@ -351,9 +339,11 @@ impl ViewportLocator {
                         self.begin_clamp(cursor);
                         continue;
                     }
-                    let next = layout.next_row_start(reader, cursor)?;
+                    let Some(row) = self.advance_row(layout, reader, &mut meter, cursor)? else {
+                        return Ok(None);
+                    };
+                    let next = row.next;
                     neighborhood.observe(row_key, cursor, next)?;
-                    budget.charge(cursor, next.unwrap_or_else(|| reader.source_end()));
                     if let Some(next) = next {
                         self.push_history(next);
                         self.phase = Phase::MoveForward {
@@ -369,9 +359,11 @@ impl ViewportLocator {
                     cursor,
                     visible,
                 } => {
-                    let next = layout.next_row_start(reader, cursor)?;
+                    let Some(row) = self.advance_row(layout, reader, &mut meter, cursor)? else {
+                        return Ok(None);
+                    };
+                    let next = row.next;
                     neighborhood.observe(row_key, cursor, next)?;
-                    budget.charge(cursor, next.unwrap_or_else(|| reader.source_end()));
                     let visible = visible + 1;
                     match next {
                         None => {
@@ -429,16 +421,16 @@ impl ViewportLocator {
 
                     let prefix = self.prefix.expect("prefix scans were initialized");
                     let remaining = required - self.history.len();
+                    let Some(row) = self.advance_row(layout, reader, &mut meter, prefix.cursor)?
+                    else {
+                        return Ok(None);
+                    };
+                    let next = row.next;
+                    neighborhood.observe(row_key, prefix.cursor, next)?;
                     if self.prefix_rows.len() == remaining {
                         self.prefix_rows.pop_front();
                     }
                     self.prefix_rows.push_back(prefix.cursor);
-                    let next = layout.next_row_start(reader, prefix.cursor)?;
-                    neighborhood.observe(row_key, prefix.cursor, next)?;
-                    let scan_end = next
-                        .unwrap_or_else(|| reader.source_end())
-                        .min(prefix.line_end);
-                    budget.charge(prefix.cursor, scan_end);
                     if let Some(next) = next.filter(|next| *next < prefix.line_end) {
                         self.prefix = Some(PrefixScan {
                             cursor: next,
@@ -459,6 +451,32 @@ impl ViewportLocator {
                         return Ok(Some(located));
                     }
                 }
+            }
+        }
+    }
+
+    fn advance_row(
+        &mut self,
+        layout: &ViewportLayout,
+        reader: &mut DocumentReader<'_>,
+        meter: &mut ProjectedScanMeter,
+        start: SourceOffset,
+    ) -> Result<Option<ProjectedRowsResult>, TutError> {
+        let scanner = if let Some(pending) = self.row_scan.take() {
+            debug_assert_eq!(pending.start, start);
+            pending.scanner
+        } else {
+            layout.start_row_scan(reader, start)?
+        };
+        match scanner.advance(reader, meter)? {
+            ProjectedScanAdvance::Pending(scanner) => {
+                self.row_scan = Some(PendingRowScan { start, scanner });
+                Ok(None)
+            }
+            ProjectedScanAdvance::Complete { result, sink } => {
+                let _ = sink;
+                debug_assert_eq!(result.rows, 1);
+                Ok(Some(result))
             }
         }
     }
@@ -544,10 +562,15 @@ impl ViewportLocator {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
+
+    use tempfile::tempdir;
 
     use super::*;
-    use crate::document::{Document, DocumentCache};
+    use crate::{
+        document::{Document, DocumentCache, SOURCE_WINDOW_BYTES, load},
+        layout::rebuild_viewport_layout,
+    };
 
     fn offset(value: u64) -> SourceOffset {
         SourceOffset::new(value)
@@ -558,6 +581,34 @@ mod tests {
         let mut cache = DocumentCache::default();
         let reader = document.reader(&mut cache);
         (reader.document_id(), ContentWidth::new(width).unwrap())
+    }
+
+    fn viewport_layout(
+        document: &Document,
+        cache: &mut DocumentCache,
+        width: u16,
+        height: u16,
+    ) -> ViewportLayout {
+        let reader = document.reader(cache);
+        let mut layout = None;
+        rebuild_viewport_layout(
+            &mut layout,
+            &reader,
+            ContentWidth::new(width).unwrap(),
+            BodyHeight::new(height).unwrap(),
+        );
+        layout.unwrap()
+    }
+
+    fn advance(
+        locator: &mut ViewportLocator,
+        layout: &ViewportLayout,
+        document: &Document,
+        cache: &mut DocumentCache,
+        rows: &mut RowNeighborhood,
+    ) -> Result<Option<LocatedViewport>, TutError> {
+        let mut reader = document.reader(cache);
+        locator.advance(layout, &mut reader, rows)
     }
 
     #[test]
@@ -882,5 +933,245 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn viewport_locator_preempts_long_rows_without_committing_partial_edges() {
+        let document = Document::from_text(Path::new("long-row.txt"), "x".repeat(2_048));
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, u16::MAX, 1);
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::ZERO,
+            RowDelta::Forward(0),
+            BodyHeight::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut rows = RowNeighborhood::default();
+
+        for _ in 0..2 {
+            cache.reset_metrics();
+            assert_eq!(
+                advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+                None
+            );
+            assert_eq!(cache.metrics().grapheme_emissions(), 1_024);
+            assert!(locator.row_scan.is_some());
+            assert_eq!(locator.history, VecDeque::from([SourceOffset::ZERO]));
+            assert!(rows.edges.is_empty());
+            assert_eq!(
+                locator.phase,
+                Phase::Clamp {
+                    candidate: SourceOffset::ZERO,
+                    cursor: SourceOffset::ZERO,
+                    visible: 0,
+                }
+            );
+        }
+
+        cache.reset_metrics();
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            Some(LocatedViewport {
+                anchor: SourceOffset::ZERO,
+                at_end: true,
+            })
+        );
+        assert_eq!(cache.metrics().grapheme_emissions(), 0);
+        assert!(locator.row_scan.is_none());
+        assert_eq!(
+            rows.edges.back().copied(),
+            Some(RowEdge {
+                start: SourceOffset::ZERO,
+                next: None,
+            })
+        );
+    }
+
+    #[test]
+    fn viewport_locator_preempts_after_one_oversized_byte_budget_emission() {
+        let mut cluster = String::from("a");
+        cluster.extend(std::iter::repeat_n(
+            '\u{301}',
+            SOURCE_WINDOW_BYTES / '\u{301}'.len_utf8() + 1,
+        ));
+        assert!(cluster.len() > SOURCE_WINDOW_BYTES);
+        let document = Document::from_text(Path::new("wide-clusters.txt"), cluster.repeat(3));
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, 4, 1);
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::ZERO,
+            RowDelta::Forward(0),
+            BodyHeight::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut rows = RowNeighborhood::default();
+
+        for _ in 0..3 {
+            cache.reset_metrics();
+            assert_eq!(
+                advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+                None
+            );
+            assert_eq!(cache.metrics().grapheme_emissions(), 1);
+            assert!(locator.row_scan.is_some());
+            assert!(rows.edges.is_empty());
+        }
+
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            Some(LocatedViewport {
+                anchor: SourceOffset::ZERO,
+                at_end: true,
+            })
+        );
+    }
+
+    #[test]
+    fn viewport_locator_shares_one_atom_budget_across_short_rows() {
+        let document = Document::from_text(Path::new("short-rows.txt"), "x\n".repeat(800));
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, 80, 1);
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::ZERO,
+            RowDelta::Forward(700),
+            BodyHeight::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut rows = RowNeighborhood::default();
+
+        cache.reset_metrics();
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            None
+        );
+        assert_eq!(cache.metrics().grapheme_emissions(), 1_024);
+        assert!(locator.row_scan.is_none());
+        assert_eq!(rows.edges.len(), 512);
+        assert!(matches!(
+            locator.phase,
+            Phase::MoveForward {
+                cursor,
+                remaining: 188,
+            } if cursor == SourceOffset::from_usize(1_024)
+        ));
+
+        for _ in 0..4 {
+            if let Some(located) =
+                advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap()
+            {
+                assert_eq!(
+                    located,
+                    LocatedViewport {
+                        anchor: SourceOffset::from_usize(1_400),
+                        at_end: false,
+                    }
+                );
+                return;
+            }
+        }
+        panic!("short-row locator did not complete within its bounded turns");
+    }
+
+    #[test]
+    fn locate_and_prepend_commit_state_only_after_complete_rows() {
+        let long = "x".repeat(2_048);
+        let document = Document::from_text(Path::new("phase-atomicity.txt"), long.clone());
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, u16::MAX, 1);
+        let mut locator = ViewportLocator::new(
+            SourceOffset::from_usize(1_500),
+            RowDelta::Forward(0),
+            BodyHeight::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut rows = RowNeighborhood::default();
+
+        for _ in 0..2 {
+            assert_eq!(
+                advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+                None
+            );
+            assert!(locator.history.is_empty());
+            assert!(rows.edges.is_empty());
+            assert_eq!(
+                locator.phase,
+                Phase::Locate {
+                    cursor: SourceOffset::ZERO,
+                }
+            );
+        }
+
+        let text = format!("{long}\nlast");
+        let document = Document::from_text(Path::new("prepend-atomicity.txt"), text);
+        let last_start = SourceOffset::from_usize(2_049);
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, u16::MAX, 2);
+        let mut locator = ViewportLocator::from_row_start(
+            last_start,
+            RowDelta::Forward(0),
+            BodyHeight::new(2).unwrap(),
+        )
+        .unwrap();
+        locator.phase = Phase::Prepend {
+            required: 2,
+            resume: PrefixResume::FinishAtEnd,
+        };
+        let mut rows = RowNeighborhood::default();
+
+        for _ in 0..2 {
+            assert_eq!(
+                advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+                None
+            );
+            assert_eq!(locator.history, VecDeque::from([last_start]));
+            assert!(locator.prefix.is_some());
+            assert!(locator.prefix_rows.is_empty());
+            assert!(rows.edges.is_empty());
+        }
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            Some(LocatedViewport {
+                anchor: SourceOffset::ZERO,
+                at_end: true,
+            })
+        );
+        assert_eq!(
+            locator.history,
+            VecDeque::from([SourceOffset::ZERO, last_start])
+        );
+        assert!(locator.prefix.is_none());
+    }
+
+    #[test]
+    fn pending_row_scans_reject_file_changes_before_committing_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-row.txt");
+        fs::write(&path, "x".repeat(2_048)).unwrap();
+        let document = load(path.clone()).unwrap();
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, u16::MAX, 1);
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::ZERO,
+            RowDelta::Forward(0),
+            BodyHeight::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut rows = RowNeighborhood::default();
+
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            None
+        );
+        assert!(locator.row_scan.is_some());
+        let history = locator.history.clone();
+        fs::write(path, "y".repeat(2_048)).unwrap();
+
+        assert!(matches!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows),
+            Err(TutError::Load(_))
+        ));
+        assert!(locator.row_scan.is_none());
+        assert_eq!(locator.history, history);
+        assert!(rows.edges.is_empty());
     }
 }

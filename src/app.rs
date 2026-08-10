@@ -2408,6 +2408,39 @@ mod tests {
     }
 
     #[test]
+    fn pending_viewport_row_scans_are_discarded_by_cancel_and_resize() {
+        let text = "x".repeat(2_048);
+        let mut canceled = reader(&text, u16::MAX, 4);
+        canceled.update(Action::LineDown).unwrap();
+        assert!(!canceled.advance_background().unwrap());
+        assert!(canceled.locator.is_some());
+
+        assert_eq!(
+            canceled.update(Action::DocumentStart).unwrap(),
+            Outcome::Changed
+        );
+        assert!(canceled.viewport_request.is_none());
+        assert!(canceled.locator.is_none());
+
+        let mut resized = reader(&text, u16::MAX, 4);
+        resized.update(Action::LineDown).unwrap();
+        assert!(!resized.advance_background().unwrap());
+        assert!(resized.locator.is_some());
+
+        assert_eq!(
+            resized
+                .update(Action::Resize(Geometry::new(u16::MAX - 1, 4)))
+                .unwrap(),
+            Outcome::Changed
+        );
+        assert!(resized.viewport_request.is_some());
+        assert!(resized.locator.is_none());
+        settle(&mut resized);
+        assert!(resized.viewport_request.is_none());
+        assert!(resized.locator.is_none());
+    }
+
+    #[test]
     fn tiny_geometry_freezes_state_except_for_control_and_resize() {
         let mut app = reader("line", 10, 3);
         assert!(app.terminal_too_small());
