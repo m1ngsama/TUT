@@ -11,8 +11,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     app::{
-        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, RenderProjectionKind, RenderRows,
-        RenderSpan, RenderState, SearchStatus,
+        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, RenderProjectionKind,
+        RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus,
     },
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
@@ -42,42 +42,97 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(
     let help = Rect::new(area.x, area.y + 2 + body_height, area.width, 1);
 
     render_projected_line(frame, header, &header_text)?;
-    render_body(frame, body, &state.rows);
+    render_body(frame, body, state.rows);
     render_projected_line(frame, status, &status_text)?;
     render_projected_line(frame, help, &help_text)?;
     Ok(())
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, rows: &RenderRows) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, rows: RenderRowsView<'_>) {
     frame.render_widget(ReaderBody { rows }, area);
 }
 
 struct ReaderBody<'a> {
-    rows: &'a RenderRows,
+    rows: RenderRowsView<'a>,
 }
 
 impl Widget for ReaderBody<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
+        let mut highlights = self.rows.highlight_cursor();
         for (relative_y, row) in self.rows.iter().take(usize::from(area.height)).enumerate() {
             let y =
                 area.y + u16::try_from(relative_y).expect("visible row count fits terminal height");
-            let mut x = area.x;
-            for span in row.spans {
-                let width = u16::try_from(span.cell_width.get())
-                    .expect("projected width fits the terminal width");
-                if width > area.right().saturating_sub(x) {
-                    break;
-                }
-                x += write_render_span(buffer, x, y, row.text, span);
-            }
+            write_render_row(buffer, area, y, row, &mut highlights);
         }
     }
 }
 
-fn write_render_span(buffer: &mut Buffer, x: u16, y: u16, row: &str, span: &RenderSpan) -> u16 {
+fn write_render_row(
+    buffer: &mut Buffer,
+    area: Rect,
+    y: u16,
+    row: RenderRow<'_>,
+    highlights: &mut MatchCursor<'_>,
+) {
+    let mut x = area.x;
+    let mut pending: Option<(RenderSpan, Highlight)> = None;
+    for span in row.spans {
+        let highlight = highlights.role_for(span.source());
+        if let Some((current, current_highlight)) = pending.as_mut()
+            && *current_highlight == highlight
+            && current.merge(span)
+        {
+            continue;
+        }
+        if let Some((current, current_highlight)) = pending.take()
+            && !write_render_run(
+                buffer,
+                area,
+                &mut x,
+                y,
+                row.text,
+                &current,
+                current_highlight,
+            )
+        {
+            return;
+        }
+        pending = Some((span.clone(), highlight));
+    }
+    if let Some((span, highlight)) = pending {
+        write_render_run(buffer, area, &mut x, y, row.text, &span, highlight);
+    }
+}
+
+fn write_render_run(
+    buffer: &mut Buffer,
+    area: Rect,
+    x: &mut u16,
+    y: u16,
+    row: &str,
+    span: &RenderSpan,
+    highlight: Highlight,
+) -> bool {
     let width =
         u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
-    let style = style_for(span.highlight);
+    if width > area.right().saturating_sub(*x) {
+        return false;
+    }
+    *x += write_render_span(buffer, *x, y, row, span, highlight);
+    true
+}
+
+fn write_render_span(
+    buffer: &mut Buffer,
+    x: u16,
+    y: u16,
+    row: &str,
+    span: &RenderSpan,
+    highlight: Highlight,
+) -> u16 {
+    let width =
+        u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
+    let style = style_for(highlight);
     let one = NonZeroU16::new(1).expect("one is nonzero");
 
     if span.projection == RenderProjectionKind::Spaces {
@@ -135,13 +190,13 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
         let Some(projected) = atom.project(column, content_width) else {
             continue;
         };
-        let span = RenderSpan::from_projected(projected, Highlight::None, &mut row)?;
+        let span = RenderSpan::from_projected(projected, &mut row)?;
         let width =
             u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
         if width > area.right().saturating_sub(x) {
             break;
         }
-        x += write_render_span(frame.buffer_mut(), x, area.y, &row, &span);
+        x += write_render_span(frame.buffer_mut(), x, area.y, &row, &span, Highlight::None);
         column = DisplayColumn::new(column.get() + u32::from(width));
     }
     Ok(())
@@ -322,13 +377,17 @@ mod tests {
     use super::*;
     use crate::app::{Action, Geometry, app_from_text};
 
-    fn draw(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn draw_into(terminal: &mut Terminal<TestBackend>, app: &mut crate::app::App) {
         let state = app.render_state().unwrap();
         terminal
             .draw(|frame| render(frame, &state).unwrap())
             .unwrap();
+    }
+
+    fn draw(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_into(&mut terminal, app);
         terminal.backend().buffer().clone()
     }
 
@@ -336,7 +395,7 @@ mod tests {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
         let state = app.render_state().unwrap();
-        ReaderBody { rows: &state.rows }.render(area, &mut buffer);
+        ReaderBody { rows: state.rows }.render(area, &mut buffer);
         buffer
     }
 
@@ -398,6 +457,35 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_terminal_frames_clear_shortened_body_cells() {
+        let backend = TestBackend::new(20, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "abcdef\nx".to_owned());
+        app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 1), "abcdef");
+
+        app.update(Action::LineDown).unwrap();
+        for _ in 0..16 {
+            if !app.has_background_work() {
+                break;
+            }
+            app.advance_background().unwrap();
+        }
+        assert!(!app.has_background_work());
+        draw_into(&mut terminal, &mut app);
+
+        assert_eq!(row_text(terminal.backend().buffer(), 1), "x");
+        for column in 1..6 {
+            let cell = terminal.backend().buffer().cell((column, 1)).unwrap();
+            assert_eq!(cell.symbol(), " ");
+            assert_eq!(cell.modifier, Modifier::empty());
+            assert_eq!(cell.diff_option, CellDiffOption::None);
+        }
+    }
+
+    #[test]
     fn long_queries_preserve_fixed_status_indicators() {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
         app.update(Action::Resize(Geometry::new(48, 4))).unwrap();
@@ -416,7 +504,7 @@ mod tests {
         let state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
-            rows: RenderRows::default(),
+            rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
             total_lines: None,
