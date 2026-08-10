@@ -416,6 +416,19 @@ struct RenderViewportCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinePositionCacheKey {
+    offset: SourceOffset,
+    covered: bool,
+    complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedLinePosition {
+    key: LinePositionCacheKey,
+    position: Option<LinePosition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FollowEndPolicy {
     Never,
     AtEnd,
@@ -498,6 +511,7 @@ pub(super) struct App {
     locator: Option<ViewportLocator>,
     row_neighborhood: RowNeighborhood,
     render_cache: Option<RenderViewportCache>,
+    line_position_cache: Option<CachedLinePosition>,
     queued_rows: i64,
     search_turn: bool,
 }
@@ -525,6 +539,7 @@ impl App {
             locator: None,
             row_neighborhood: RowNeighborhood::default(),
             render_cache: None,
+            line_position_cache: None,
             queued_rows: 0,
             search_turn: true,
         }
@@ -645,8 +660,21 @@ impl App {
         let offset = viewport.map_or(self.document.source_start(), |viewport| {
             viewport.first_visible_start
         });
+        let key = LinePositionCacheKey {
+            offset,
+            covered: self.document.line_index_covers(offset),
+            complete: self.document.line_index_complete(),
+        };
+        if let Some(cached) = self.line_position_cache
+            && cached.key == key
+        {
+            self.document.validate()?;
+            return Ok(cached.position);
+        }
         let mut reader = self.document.reader(&mut self.document_cache);
-        Ok(reader.line_position(offset)?)
+        let position = reader.line_position(offset)?;
+        self.line_position_cache = Some(CachedLinePosition { key, position });
+        Ok(position)
     }
 
     fn background_schedule(&self) -> Option<BackgroundSchedule> {
@@ -2531,6 +2559,56 @@ mod tests {
     }
 
     #[test]
+    fn search_input_redraws_reuse_the_cached_body_and_line_position() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("search-redraw.txt");
+        fs::write(&path, "x".repeat(SOURCE_WINDOW_BYTES * 2)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        let (rows, line) = {
+            let state = app.render_state().unwrap();
+            (state.rows.storage_identity(), state.current_line)
+        };
+        app.document_cache.reset_metrics();
+
+        app.update(Action::BeginSearch).unwrap();
+        assert_eq!(app.render_state().unwrap().rows.storage_identity(), rows);
+        for character in "query".chars() {
+            app.update(Action::SearchInsert(character)).unwrap();
+            let state = app.render_state().unwrap();
+            assert_eq!(state.rows.storage_identity(), rows);
+            assert_eq!(state.current_line, line);
+        }
+
+        let metrics = app.document_cache.metrics();
+        assert_eq!(metrics.byte_window_calls(), 0);
+        assert_eq!(metrics.window_calls(), 0);
+        assert_eq!(metrics.grapheme_window_calls(), 0);
+        assert_eq!(metrics.grapheme_emissions(), 0);
+    }
+
+    #[test]
+    fn empty_tiny_views_reuse_complete_line_coordinates_without_reads() {
+        let mut app = app_from_text(Path::new("empty.txt"), String::new());
+        let first = app.render_state().unwrap();
+        assert_eq!((first.current_line, first.total_lines), (Some(1), Some(1)));
+        app.document_cache.reset_metrics();
+
+        let second = app.render_state().unwrap();
+
+        assert_eq!(
+            (second.current_line, second.total_lines),
+            (Some(1), Some(1))
+        );
+        let metrics = app.document_cache.metrics();
+        assert_eq!(metrics.byte_window_calls(), 0);
+        assert_eq!(metrics.window_calls(), 0);
+        assert_eq!(metrics.grapheme_window_calls(), 0);
+    }
+
+    #[test]
     fn rendering_reads_one_grapheme_frontier_and_retains_atom_boundaries() {
         let mut app = reader(&"x".repeat(1024), 127, 4);
         app.document_cache = DocumentCache::with_window_bytes(128);
@@ -2620,6 +2698,92 @@ mod tests {
         fs::write(&path, "other").unwrap();
 
         assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+    }
+
+    #[test]
+    fn cached_line_positions_reject_file_changes_without_source_reads() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-line-position.txt");
+        fs::write(&path, "first\nsecond").unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        let viewport = {
+            let state = app.render_state().unwrap();
+            assert_eq!(state.current_line, Some(1));
+            app.render_cache.as_ref().unwrap().viewport
+        };
+        app.document_cache.reset_metrics();
+
+        fs::write(path, "changed contents").unwrap();
+
+        assert!(matches!(
+            app.line_position_for(Some(viewport)),
+            Err(TutError::Load(_))
+        ));
+        let metrics = app.document_cache.metrics();
+        assert_eq!(metrics.byte_window_calls(), 0);
+        assert_eq!(metrics.window_calls(), 0);
+    }
+
+    #[test]
+    fn line_position_cache_tracks_partial_coverage_and_index_completion() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("partial-line-position.txt");
+        fs::write(&path, "a\n".repeat(40_000)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        let offset = SourceOffset::new(2);
+        let viewport = Some(Viewport {
+            visible_rows: 1,
+            first_visible_start: offset,
+            visible_end: offset.checked_add(1).unwrap(),
+        });
+
+        assert!(!app.document.line_index_covers(offset));
+        assert!(!app.document.line_index_complete());
+        assert_eq!(app.line_position_for(viewport).unwrap(), None);
+        assert_eq!(
+            app.line_position_cache.unwrap().key,
+            LinePositionCacheKey {
+                offset,
+                covered: false,
+                complete: false,
+            }
+        );
+
+        assert!(
+            app.document
+                .advance_line_index(&mut app.document_cache)
+                .unwrap()
+        );
+        assert!(app.document.line_index_covers(offset));
+        assert!(!app.document.line_index_complete());
+        let covered = app.line_position_for(viewport).unwrap().unwrap();
+        assert_eq!((covered.current(), covered.total()), (2, None));
+        assert_eq!(
+            app.line_position_cache.unwrap().key,
+            LinePositionCacheKey {
+                offset,
+                covered: true,
+                complete: false,
+            }
+        );
+
+        while app
+            .document
+            .advance_line_index(&mut app.document_cache)
+            .unwrap()
+        {}
+        assert!(app.document.line_index_complete());
+        let complete = app.line_position_for(viewport).unwrap().unwrap();
+        assert_eq!((complete.current(), complete.total()), (2, Some(40_001)));
+        assert_eq!(
+            app.line_position_cache.unwrap().key,
+            LinePositionCacheKey {
+                offset,
+                covered: true,
+                complete: true,
+            }
+        );
     }
 
     #[test]
