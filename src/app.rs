@@ -91,6 +91,13 @@ pub(super) enum Outcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackgroundWork {
+    LineIndex,
+    Viewport,
+    Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Viewport {
     pub visible_rows: usize,
     pub first_visible_start: SourceOffset,
@@ -385,6 +392,12 @@ enum ViewportRequest {
     End,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundSchedule {
+    work: BackgroundWork,
+    next_search_turn: Option<bool>,
+}
+
 impl ViewportRequest {
     const fn target(self, source_end: SourceOffset) -> SourceOffset {
         match self {
@@ -589,17 +602,7 @@ impl App {
         Ok(reader.line_position(offset)?)
     }
 
-    pub(super) fn has_background_work(&self) -> bool {
-        !self.document.line_index_complete()
-            || (matches!(self.mode, Mode::Reading)
-                && self.geometry.is_usable()
-                && self.viewport_request.is_some())
-            || (matches!(self.mode, Mode::Reading)
-                && self.geometry.is_usable()
-                && self.search.as_ref().is_some_and(SearchSession::has_work))
-    }
-
-    pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
+    fn background_schedule(&self) -> Option<BackgroundSchedule> {
         let viewport_pending = matches!(self.mode, Mode::Reading)
             && self.geometry.is_usable()
             && self.viewport_request.is_some();
@@ -613,24 +616,53 @@ impl App {
                     .document
                     .line_index_covers(request.target(self.document.source_end())),
             };
-            if !index_ready {
-                return self.advance_line_index();
-            }
-            return self.advance_viewport_locator();
+            return Some(BackgroundSchedule {
+                work: if index_ready {
+                    BackgroundWork::Viewport
+                } else {
+                    BackgroundWork::LineIndex
+                },
+                next_search_turn: None,
+            });
         }
+
         let search_pending = matches!(self.mode, Mode::Reading)
             && self.geometry.is_usable()
             && self.search.as_ref().is_some_and(SearchSession::has_work);
         let line_pending = !self.document.line_index_complete();
         if search_pending && (!line_pending || self.search_turn) {
-            self.search_turn = false;
-            return self.advance_search();
+            return Some(BackgroundSchedule {
+                work: BackgroundWork::Search,
+                next_search_turn: Some(false),
+            });
         }
-        if line_pending {
-            self.search_turn = true;
-            return self.advance_line_index();
+        line_pending.then_some(BackgroundSchedule {
+            work: BackgroundWork::LineIndex,
+            next_search_turn: Some(true),
+        })
+    }
+
+    pub(super) fn background_work(&self) -> Option<BackgroundWork> {
+        self.background_schedule().map(|schedule| schedule.work)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_background_work(&self) -> bool {
+        self.background_work().is_some()
+    }
+
+    pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
+        let Some(schedule) = self.background_schedule() else {
+            return Ok(false);
+        };
+        if let Some(search_turn) = schedule.next_search_turn {
+            self.search_turn = search_turn;
         }
-        Ok(false)
+        match schedule.work {
+            BackgroundWork::LineIndex => self.advance_line_index(),
+            BackgroundWork::Viewport => self.advance_viewport_locator(),
+            BackgroundWork::Search => self.advance_search(),
+        }
     }
 
     fn advance_viewport_locator(&mut self) -> Result<bool, TutError> {
@@ -2179,8 +2211,10 @@ mod tests {
 
         assert!(!app.document.line_index_covers(first_frontier));
         assert!(!app.search.as_ref().unwrap().index_complete());
+        assert_eq!(app.background_work(), Some(BackgroundWork::Search));
         assert!(!app.advance_background().unwrap());
         assert!(!app.document.line_index_covers(first_frontier));
+        assert_eq!(app.background_work(), Some(BackgroundWork::LineIndex));
         assert!(!app.advance_background().unwrap());
         assert!(app.document.line_index_covers(first_frontier));
         assert!(!app.search.as_ref().unwrap().index_complete());
