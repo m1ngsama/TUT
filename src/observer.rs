@@ -11,8 +11,9 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::{
     app::BackgroundWork,
-    document::FileIdentity,
+    document::InputIdentity,
     error::{ExternalSignal, LogError},
+    path_binding::BoundPath,
 };
 
 const EVENT_BUFFER_BYTES: usize = 512;
@@ -201,7 +202,7 @@ impl Observer {
         &mut self,
         input: InputKind,
         source_bytes: u64,
-        input_identity: Option<FileIdentity>,
+        input_identity: Option<InputIdentity<'_>>,
     ) -> Result<(), LogError> {
         let state = std::mem::replace(&mut self.state, State::Finished);
         let State::Pending { path, started } = state else {
@@ -235,13 +236,20 @@ impl ActiveObserver {
     fn open(
         path: PathBuf,
         started: Instant,
-        input_identity: Option<FileIdentity>,
+        input_identity: Option<InputIdentity<'_>>,
     ) -> Result<Self, LogError> {
         if path == Path::new("-") {
             return Err(LogError::StandardStream);
         }
+        let bound = BoundPath::capture(&path).map_err(|source| LogError::Open {
+            path: path.clone(),
+            source,
+        })?;
+        if input_identity.is_some_and(|input| input.pathname_matches(bound.identity())) {
+            return Err(LogError::InputConflict(path));
+        }
         let descriptor = rustix::fs::open(
-            &path,
+            bound.open_path(),
             OFlags::WRONLY
                 | OFlags::APPEND
                 | OFlags::CREATE
@@ -262,7 +270,7 @@ impl ActiveObserver {
         if !metadata.is_file() {
             return Err(LogError::NotRegular(path));
         }
-        if input_identity == Some(FileIdentity::from_metadata(&metadata)) {
+        if input_identity.is_some_and(|input| input.file_matches(&metadata)) {
             return Err(LogError::InputConflict(path));
         }
         if metadata.mode() & 0o077 != 0 {
@@ -397,7 +405,10 @@ impl fmt::Write for EventBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    };
 
     use tempfile::tempdir;
 
@@ -474,10 +485,11 @@ mod tests {
 
         let input = directory.path().join("input.txt");
         fs::write(&input, "text").unwrap();
-        let identity = FileIdentity::from_metadata(&fs::metadata(&input).unwrap());
+        let document = crate::document::load(input.clone()).unwrap();
+        let identity = document.input_identity();
         let mut conflict = Observer::new(Some(input.clone()));
         assert!(matches!(
-            conflict.start(InputKind::Path, 4, Some(identity)),
+            conflict.start(InputKind::Path, 4, identity),
             Err(LogError::InputConflict(path)) if path == input
         ));
 
@@ -485,7 +497,7 @@ mod tests {
         fs::hard_link(&input, &hardlink).unwrap();
         let mut linked = Observer::new(Some(hardlink.clone()));
         assert!(matches!(
-            linked.start(InputKind::Path, 4, Some(identity)),
+            linked.start(InputKind::Path, 4, identity),
             Err(LogError::InputConflict(path)) if path == hardlink
         ));
 
@@ -493,7 +505,7 @@ mod tests {
         std::os::unix::fs::symlink(&input, &symlink).unwrap();
         let mut linked = Observer::new(Some(symlink));
         assert!(matches!(
-            linked.start(InputKind::Path, 4, Some(identity)),
+            linked.start(InputKind::Path, 4, identity),
             Err(LogError::Open { .. })
         ));
 
@@ -502,6 +514,85 @@ mod tests {
             standard_stream.start(InputKind::Path, 0, None),
             Err(LogError::StandardStream)
         ));
+    }
+
+    #[test]
+    fn replacing_the_input_path_cannot_turn_the_replacement_into_a_log() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        let replacement = directory.path().join("replacement.txt");
+        fs::write(&input, "original input").unwrap();
+        fs::write(&replacement, "replacement must remain unchanged").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        let original_metadata = fs::metadata(&input).unwrap();
+        let replacement_metadata = fs::metadata(&replacement).unwrap();
+        assert_ne!(
+            (original_metadata.dev(), original_metadata.ino()),
+            (replacement_metadata.dev(), replacement_metadata.ino())
+        );
+
+        let document = crate::document::load(input.clone()).unwrap();
+        fs::rename(&replacement, &input).unwrap();
+        let expected = fs::read(&input).unwrap();
+        let mut observer = Observer::new(Some(input.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity()
+            ),
+            Err(LogError::InputConflict(path)) if path == input
+        ));
+        assert_eq!(fs::read(&input).unwrap(), expected);
+    }
+
+    #[test]
+    fn removed_input_path_is_rejected_before_log_creation() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        fs::write(&input, "original input").unwrap();
+        let document = crate::document::load(input.clone()).unwrap();
+        fs::remove_file(&input).unwrap();
+        let mut observer = Observer::new(Some(input.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity()
+            ),
+            Err(LogError::InputConflict(path)) if path == input
+        ));
+        assert!(!input.exists());
+    }
+
+    #[test]
+    fn lexical_aliases_retain_the_input_path_binding_after_replacement() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        let alias_directory = directory.path().join("alias-component");
+        let input_alias = alias_directory.join("..").join("input.txt");
+        let replacement = directory.path().join("replacement.txt");
+        fs::create_dir(&alias_directory).unwrap();
+        fs::write(&input, "original input").unwrap();
+        fs::write(&replacement, "replacement through lexical alias").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let document = crate::document::load(input_alias).unwrap();
+        fs::rename(&replacement, &input).unwrap();
+        let expected = fs::read(&input).unwrap();
+        let mut observer = Observer::new(Some(input.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity()
+            ),
+            Err(LogError::InputConflict(path)) if path == input
+        ));
+        assert_eq!(fs::read(&input).unwrap(), expected);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 use crate::{
     error::{LoadError, sanitize_os},
     line_index::{LineIndex, LineIndexError, LinePosition, LineScan},
+    path_binding::{BoundPath, PathIdentity},
     source::{BackwardWindowRequest, SourceOffset, SourceText, WindowRequest},
 };
 
@@ -91,8 +92,8 @@ impl Document {
         self.store.validate()
     }
 
-    pub(super) fn file_identity(&self) -> Option<FileIdentity> {
-        self.store.file_identity()
+    pub(super) fn input_identity(&self) -> Option<InputIdentity<'_>> {
+        self.store.input_identity()
     }
 
     pub(super) const fn content_len(&self) -> u64 {
@@ -851,9 +852,9 @@ impl DocumentStore {
         }
     }
 
-    fn file_identity(&self) -> Option<FileIdentity> {
+    fn input_identity(&self) -> Option<InputIdentity<'_>> {
         match self {
-            Self::File(store) => store.file_identity(),
+            Self::File(store) => store.input_identity(),
             #[cfg(test)]
             Self::InMemory(_) => None,
         }
@@ -1165,6 +1166,7 @@ fn map_line_index_error(path: &Path, error: LineIndexError) -> LoadError {
 struct FileStore {
     file: File,
     path: PathBuf,
+    path_identity: Option<PathIdentity>,
     source_start: SourceOffset,
     source_end: SourceOffset,
     stability: FileStability,
@@ -1184,13 +1186,29 @@ struct FileFingerprint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FileIdentity {
+struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InputIdentity<'a> {
+    pathname: &'a PathIdentity,
+    file: FileIdentity,
+}
+
+impl InputIdentity<'_> {
+    pub(super) fn pathname_matches(self, pathname: &PathIdentity) -> bool {
+        self.pathname == pathname
+    }
+
+    pub(super) fn file_matches(self, metadata: &std::fs::Metadata) -> bool {
+        self.file == FileIdentity::from_metadata(metadata)
+    }
+}
+
 impl FileIdentity {
-    pub(super) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -1227,8 +1245,12 @@ impl FileFingerprint {
 
 impl FileStore {
     fn open(path: PathBuf, limit: u64) -> Result<Self, LoadError> {
+        let bound = BoundPath::capture(&path).map_err(|source| LoadError::Open {
+            path: path.clone(),
+            source,
+        })?;
         let descriptor = rustix::fs::open(
-            &path,
+            bound.open_path(),
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
@@ -1237,10 +1259,20 @@ impl FileStore {
             source: io::Error::from(source),
         })?;
 
-        Self::from_tracked_file(File::from(descriptor), path, limit)
+        Self::from_tracked_file_with_identity(
+            File::from(descriptor),
+            path,
+            bound.into_identity(),
+            limit,
+        )
     }
 
-    fn from_tracked_file(file: File, path: PathBuf, limit: u64) -> Result<Self, LoadError> {
+    fn from_tracked_file_with_identity(
+        file: File,
+        path: PathBuf,
+        path_identity: PathIdentity,
+        limit: u64,
+    ) -> Result<Self, LoadError> {
         let metadata = file.metadata().map_err(|source| LoadError::Read {
             path: path.clone(),
             source,
@@ -1257,6 +1289,7 @@ impl FileStore {
             path,
             metadata.len(),
             FileStability::Tracked(FileFingerprint::from_metadata(&metadata)),
+            Some(path_identity),
         )
     }
 
@@ -1265,14 +1298,18 @@ impl FileStore {
         path: PathBuf,
         source_len: u64,
     ) -> Result<Self, LoadError> {
-        Self::new(file, path, source_len, FileStability::PrivateSnapshot)
+        Self::new(file, path, source_len, FileStability::PrivateSnapshot, None)
     }
 
-    const fn file_identity(&self) -> Option<FileIdentity> {
-        match self.stability {
-            FileStability::Tracked(fingerprint) => Some(fingerprint.identity()),
-            FileStability::PrivateSnapshot => None,
-        }
+    fn input_identity(&self) -> Option<InputIdentity<'_>> {
+        let pathname = self.path_identity.as_ref()?;
+        let FileStability::Tracked(fingerprint) = self.stability else {
+            return None;
+        };
+        Some(InputIdentity {
+            pathname,
+            file: fingerprint.identity(),
+        })
     }
 
     fn new(
@@ -1280,10 +1317,16 @@ impl FileStore {
         path: PathBuf,
         source_len: u64,
         stability: FileStability,
+        path_identity: Option<PathIdentity>,
     ) -> Result<Self, LoadError> {
+        debug_assert_eq!(
+            path_identity.is_some(),
+            matches!(stability, FileStability::Tracked(_))
+        );
         let mut store = Self {
             file,
             path,
+            path_identity,
             source_start: SourceOffset::ZERO,
             source_end: SourceOffset::new(source_len),
             stability,
@@ -1731,6 +1774,7 @@ mod tests {
             file_store(&document).stability,
             FileStability::PrivateSnapshot
         );
+        assert!(document.input_identity().is_none());
         assert_eq!(file_store(&document).stability_checks.get(), 0);
 
         document.validate().unwrap();
