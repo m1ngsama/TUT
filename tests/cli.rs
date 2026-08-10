@@ -110,7 +110,7 @@ mod pty {
 
     use rustix::{
         fs::{self, Mode, OFlags},
-        process::{Pid, Signal, kill_process, setsid},
+        process::{Pid, Signal, WaitOptions, kill_process, setsid, waitpid},
         pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt},
         termios::{self, SpecialCodeIndex, Termios, Winsize},
     };
@@ -210,11 +210,17 @@ mod pty {
         }
 
         fn wait_for(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.wait_for_after(0, bytes)
+        }
+
+        fn wait_for_after(&mut self, start: usize, bytes: &[u8]) -> io::Result<()> {
             let deadline = Instant::now() + TIMEOUT;
             loop {
                 self.pump()?;
                 if self
                     .output
+                    .get(start..)
+                    .unwrap_or_default()
                     .windows(bytes.len())
                     .any(|window| window == bytes)
                 {
@@ -232,6 +238,36 @@ mod pty {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "PTY output timeout",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_until_stopped(&mut self) -> io::Result<()> {
+            let pid = self.pid()?;
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                self.pump()?;
+                match waitpid(Some(pid), WaitOptions::NOHANG | WaitOptions::UNTRACED)
+                    .map_err(io::Error::from)?
+                {
+                    Some((_, status)) if status.stopped() => {
+                        self.pump()?;
+                        return Ok(());
+                    }
+                    Some(_) => {
+                        self.reaped = true;
+                        self.read_stderr()?;
+                        return Err(io::Error::other("child exited before suspension"));
+                    }
+                    None => {}
+                }
+                if Instant::now() >= deadline {
+                    self.terminate_and_reap();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "PTY suspension timeout",
                     ));
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -263,13 +299,16 @@ mod pty {
             Ok(())
         }
 
-        fn signal(&self, signal: Signal) -> io::Result<()> {
-            let pid = Pid::from_raw(
+        fn pid(&self) -> io::Result<Pid> {
+            Pid::from_raw(
                 i32::try_from(self.child.id())
                     .map_err(|_| io::Error::other("child pid overflow"))?,
             )
-            .ok_or_else(|| io::Error::other("invalid child pid"))?;
-            kill_process(pid, signal).map_err(io::Error::from)
+            .ok_or_else(|| io::Error::other("invalid child pid"))
+        }
+
+        fn signal(&self, signal: Signal) -> io::Result<()> {
+            kill_process(self.pid()?, signal).map_err(io::Error::from)
         }
 
         fn assert_restored(&self) {
@@ -413,6 +452,34 @@ mod pty {
             );
             pty.assert_restored();
         }
+    }
+
+    #[test]
+    fn suspension_restores_and_continuation_reenters_the_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "SUSPEND_SENTINEL\n").unwrap();
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(b"SUSPEND_SENTINEL").unwrap();
+
+        let suspension_start = pty.output.len();
+        pty.signal(Signal::TSTP).unwrap();
+        pty.wait_until_stopped().unwrap();
+        pty.wait_for_after(suspension_start, SHOW_CURSOR).unwrap();
+        pty.wait_for_after(suspension_start, LEAVE_ALT).unwrap();
+        pty.assert_restored();
+
+        let continuation_start = pty.output.len();
+        pty.signal(Signal::CONT).unwrap();
+        pty.wait_for_after(continuation_start, ENTER_ALT).unwrap();
+        pty.wait_for_after(continuation_start, HIDE_CURSOR).unwrap();
+        pty.wait_for_after(continuation_start, b"SUSPEND_SENTINEL")
+            .unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
     }
 
     #[test]
