@@ -166,6 +166,8 @@ pub(super) struct LineIndex {
     max_checkpoints: usize,
     pending_cr: bool,
     finished: bool,
+    #[cfg(test)]
+    checkpoint_reserve_attempts: usize,
 }
 
 impl LineIndex {
@@ -186,8 +188,9 @@ impl LineIndex {
         }
 
         let mut checkpoints = Vec::new();
+        let initial_reservation = initial_checkpoint_reservation(source_start, source_end, limits);
         checkpoints
-            .try_reserve_exact(INITIAL_CHECKPOINT_RESERVATION.min(limits.max_checkpoints))
+            .try_reserve_exact(initial_reservation)
             .map_err(|_| LineIndexError::Allocation)?;
         checkpoints.push(LineCheckpoint {
             scan_at: source_start,
@@ -210,6 +213,8 @@ impl LineIndex {
             max_checkpoints: limits.max_checkpoints,
             pending_cr: false,
             finished: false,
+            #[cfg(test)]
+            checkpoint_reserve_attempts: 1,
         })
     }
 
@@ -510,6 +515,10 @@ impl LineIndex {
         }
         let remaining = self.max_checkpoints - self.checkpoints.len();
         let additional = self.checkpoints.capacity().max(1).min(remaining);
+        #[cfg(test)]
+        {
+            self.checkpoint_reserve_attempts += 1;
+        }
         self.checkpoints
             .try_reserve_exact(additional)
             .map_err(|_| LineIndexError::Allocation)
@@ -521,6 +530,21 @@ impl LineIndex {
             .partition_point(|checkpoint| checkpoint.scan_at <= offset);
         self.checkpoints[insertion.saturating_sub(1)]
     }
+}
+
+fn initial_checkpoint_reservation(
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+    limits: LineIndexLimits,
+) -> usize {
+    let checkpoints = source_end
+        .get()
+        .saturating_sub(source_start.get())
+        .saturating_add(1);
+    usize::try_from(checkpoints)
+        .unwrap_or(usize::MAX)
+        .min(INITIAL_CHECKPOINT_RESERVATION)
+        .min(limits.max_checkpoints)
 }
 
 #[cfg(test)]
@@ -737,6 +761,50 @@ mod tests {
             LinePosition {
                 current: 1,
                 total: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn initial_checkpoint_capacity_follows_the_immutable_source_range() {
+        let limits = LineIndexLimits::DEFAULT;
+        let start = SourceOffset::new(3);
+        let reservation = |source_len| {
+            initial_checkpoint_reservation(
+                start,
+                SourceOffset::new(start.get() + source_len),
+                limits,
+            )
+        };
+
+        assert_eq!(reservation(0), 1);
+        assert_eq!(reservation(1), 2);
+        assert_eq!(reservation(1022), 1023);
+        assert_eq!(reservation(1023), 1024);
+        assert_eq!(reservation(1024), 1024);
+        assert_eq!(
+            initial_checkpoint_reservation(
+                SourceOffset::ZERO,
+                SourceOffset::new(100),
+                LineIndexLimits::new(1, 4).unwrap(),
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn dense_small_sources_complete_without_growing_the_checkpoint_allocation() {
+        let text = "\n".repeat(63);
+        let source = SourceText::with_start(&text, SourceOffset::new(3)).unwrap();
+        let index = build_in_chunks(source, 1);
+
+        assert_eq!(index.checkpoints.len(), 64);
+        assert_eq!(index.checkpoint_reserve_attempts, 1);
+        assert_eq!(
+            index.position(source, source.end()).unwrap(),
+            LinePosition {
+                current: 64,
+                total: Some(64),
             }
         );
     }
