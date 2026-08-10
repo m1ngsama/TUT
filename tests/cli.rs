@@ -385,6 +385,11 @@ mod pty {
             (Signal::HUP, 129, b"tut: interrupted by SIGHUP\n".as_slice()),
             (Signal::INT, 130, b"tut: interrupted by SIGINT\n".as_slice()),
             (
+                Signal::QUIT,
+                131,
+                b"tut: interrupted by SIGQUIT\n".as_slice(),
+            ),
+            (
                 Signal::TERM,
                 143,
                 b"tut: interrupted by SIGTERM\n".as_slice(),

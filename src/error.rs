@@ -49,6 +49,7 @@ pub enum SearchError {
 pub enum ExternalSignal {
     Hangup,
     Interrupt,
+    Quit,
     Terminate,
 }
 
@@ -58,6 +59,7 @@ impl ExternalSignal {
         match self {
             Self::Hangup => "SIGHUP",
             Self::Interrupt => "SIGINT",
+            Self::Quit => "SIGQUIT",
             Self::Terminate => "SIGTERM",
         }
     }
@@ -67,6 +69,7 @@ impl ExternalSignal {
         match self {
             Self::Hangup => 129,
             Self::Interrupt => 130,
+            Self::Quit => 131,
             Self::Terminate => 143,
         }
     }

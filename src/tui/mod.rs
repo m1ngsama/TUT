@@ -43,6 +43,9 @@ impl SignalState {
             signal if signal == signal_hook::consts::signal::SIGINT as usize => {
                 Some(ExternalSignal::Interrupt)
             }
+            signal if signal == signal_hook::consts::signal::SIGQUIT as usize => {
+                Some(ExternalSignal::Quit)
+            }
             signal if signal == signal_hook::consts::signal::SIGTERM as usize => {
                 Some(ExternalSignal::Terminate)
             }
@@ -65,13 +68,14 @@ pub(super) struct SignalHandlers {
 
 impl SignalHandlers {
     fn install() -> io::Result<Self> {
-        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
         let state = SignalState::empty();
         let mut ids = Vec::new();
         for (signal, value) in [
             (SIGHUP, SIGHUP as usize),
             (SIGINT, SIGINT as usize),
+            (SIGQUIT, SIGQUIT as usize),
             (SIGTERM, SIGTERM as usize),
         ] {
             let slot = Arc::clone(&state.0);
