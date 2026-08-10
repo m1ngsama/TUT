@@ -92,6 +92,14 @@ impl Document {
         self.store.validate()
     }
 
+    #[cfg(test)]
+    pub(super) fn stability_checks(&self) -> usize {
+        match &self.store {
+            DocumentStore::File(store) => store.stability_checks(),
+            DocumentStore::InMemory(_) => 0,
+        }
+    }
+
     pub(super) fn input_identity(&self) -> Option<InputIdentity<'_>> {
         self.store.input_identity()
     }
@@ -1638,6 +1646,11 @@ impl FileStore {
             return Err(self.changed());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn stability_checks(&self) -> usize {
+        self.stability_checks.get()
     }
 }
 

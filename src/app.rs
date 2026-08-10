@@ -729,7 +729,11 @@ impl App {
             self.document.validate()?;
         }
         self.prepare_search_highlights(viewport)?;
-        let line = self.line_position_for(viewport)?;
+        let line = if viewport.is_some() {
+            self.validated_line_position_for(viewport)?
+        } else {
+            self.line_position_for(viewport)?
+        };
         let progress = self.progress_for(viewport);
         let (ranges, current) = if let Some(viewport) = viewport {
             let visible = viewport.first_visible_start..viewport.visible_end;
@@ -792,22 +796,46 @@ impl App {
         &mut self,
         viewport: Option<Viewport>,
     ) -> Result<Option<LinePosition>, TutError> {
-        let offset = viewport.map_or(self.document.source_start(), |viewport| {
-            viewport.first_visible_start
-        });
-        let key = LinePositionCacheKey {
-            offset,
-            covered: self.document.line_index_covers(offset),
-            complete: self.document.line_index_complete(),
-        };
-        if let Some(cached) = self.line_position_cache
-            && cached.key == key
-        {
+        let key = self.line_position_cache_key(viewport);
+        if let Some(cached) = self.cached_line_position(key) {
             self.document.validate()?;
             return Ok(cached.position);
         }
+        self.read_line_position(key)
+    }
+
+    fn validated_line_position_for(
+        &mut self,
+        viewport: Option<Viewport>,
+    ) -> Result<Option<LinePosition>, TutError> {
+        let key = self.line_position_cache_key(viewport);
+        if let Some(cached) = self.cached_line_position(key) {
+            return Ok(cached.position);
+        }
+        self.read_line_position(key)
+    }
+
+    fn line_position_cache_key(&self, viewport: Option<Viewport>) -> LinePositionCacheKey {
+        let offset = viewport.map_or(self.document.source_start(), |viewport| {
+            viewport.first_visible_start
+        });
+        LinePositionCacheKey {
+            offset,
+            covered: self.document.line_index_covers(offset),
+            complete: self.document.line_index_complete(),
+        }
+    }
+
+    fn cached_line_position(&self, key: LinePositionCacheKey) -> Option<CachedLinePosition> {
+        self.line_position_cache.filter(|cached| cached.key == key)
+    }
+
+    fn read_line_position(
+        &mut self,
+        key: LinePositionCacheKey,
+    ) -> Result<Option<LinePosition>, TutError> {
         let mut reader = self.document.reader(&mut self.document_cache);
-        let position = reader.line_position(offset)?;
+        let position = reader.line_position(key.offset)?;
         self.line_position_cache = Some(CachedLinePosition { key, position });
         Ok(position)
     }
@@ -1851,7 +1879,7 @@ fn promote(current_role: Highlight, range: SearchRange, current: Option<SearchRa
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, io::Cursor, path::Path};
 
     use tempfile::tempdir;
 
@@ -3732,6 +3760,89 @@ mod tests {
         fs::write(&path, "other").unwrap();
 
         assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+    }
+
+    #[test]
+    fn cached_file_frames_use_one_freshness_barrier_without_source_reads() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("stable-cached-frame.txt");
+        fs::write(&path, "first\nsecond").unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle_frame(&mut app);
+        app.render_state().unwrap();
+        app.document_cache.reset_metrics();
+
+        let before = app.document.stability_checks();
+        app.render_state().unwrap();
+        assert_eq!(app.document.stability_checks(), before + 1);
+        assert_eq!(
+            app.document_cache.metrics(),
+            crate::document::DocumentMetrics::default()
+        );
+
+        fs::write(path, "other\ncontent").unwrap();
+        let before = app.document.stability_checks();
+        assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+        assert_eq!(app.document.stability_checks(), before + 1);
+    }
+
+    #[test]
+    fn standalone_line_position_cache_hits_validate_the_document() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("standalone-line-position.txt");
+        fs::write(&path, "first\nsecond").unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle_frame(&mut app);
+        app.render_state().unwrap();
+        let viewport = app.render_cache().unwrap().viewport;
+        app.document_cache.reset_metrics();
+
+        let before = app.document.stability_checks();
+        assert_eq!(
+            app.line_position_for(Some(viewport))
+                .unwrap()
+                .unwrap()
+                .current(),
+            1
+        );
+        assert_eq!(app.document.stability_checks(), before + 1);
+        assert_eq!(
+            app.document_cache.metrics(),
+            crate::document::DocumentMetrics::default()
+        );
+    }
+
+    #[test]
+    fn standalone_line_position_misses_use_only_source_read_barriers() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("uncached-line-position.txt");
+        fs::write(&path, "first\nsecond").unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        assert!(app.line_position_cache.is_none());
+
+        let before = app.document.stability_checks();
+        assert_eq!(app.line_position_for(None).unwrap().unwrap().current(), 1);
+
+        assert_eq!(app.document.stability_checks(), before + 4);
+        let metrics = app.document_cache.metrics();
+        assert_eq!(metrics.byte_window_calls(), 1);
+        assert_eq!(metrics.window_calls(), 1);
+    }
+
+    #[test]
+    fn standard_input_cached_frames_do_not_check_file_stability() {
+        let mut input = Cursor::new("first\nsecond");
+        let document = crate::document::load_standard_input(&mut input).unwrap();
+        let mut app = App::new(document);
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle_frame(&mut app);
+
+        app.render_state().unwrap();
+        app.render_state().unwrap();
+
+        assert_eq!(app.document.stability_checks(), 0);
     }
 
     #[test]
