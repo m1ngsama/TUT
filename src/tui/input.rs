@@ -20,7 +20,7 @@ pub(super) fn map_event(mode: &Mode, terminal_too_small: bool, event: Event) -> 
         return None;
     }
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-        return Some(Action::Quit);
+        return Some(Action::Interrupt);
     }
     if terminal_too_small {
         return (key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE)
@@ -125,6 +125,10 @@ mod tests {
                 Action::PreviousMatch,
             ),
             (key(KeyCode::Esc, KeyModifiers::NONE), Action::SearchCancel),
+            (
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Action::Interrupt,
+            ),
             (key(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit),
         ] {
             assert_eq!(map_event(&Mode::Reading, false, event), Some(action));
@@ -188,6 +192,14 @@ mod tests {
         assert_eq!(
             map_event(&search, true, key(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::Quit)
+        );
+        assert_eq!(
+            map_event(
+                &search,
+                true,
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::Interrupt)
         );
     }
 
