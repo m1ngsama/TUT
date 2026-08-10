@@ -7,6 +7,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use rustix::fs::{Mode, OFlags};
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
@@ -808,7 +811,7 @@ impl DocumentStore {
 
     fn file_identity(&self) -> Option<FileIdentity> {
         match self {
-            Self::File(store) => Some(store.fingerprint.identity()),
+            Self::File(store) => store.file_identity(),
             #[cfg(test)]
             Self::InMemory(_) => None,
         }
@@ -999,7 +1002,7 @@ fn load_standard_input_with_limit(
     }
 
     let path = PathBuf::from(STANDARD_INPUT_NAME);
-    let store = FileStore::from_file(file, path.clone(), limit)?;
+    let store = FileStore::from_private_snapshot(file, path.clone(), total)?;
     let line_index = LineIndex::new(store.source_start, store.source_end)
         .map_err(|error| map_line_index_error(&path, error))?;
     Ok(Document::from_standard_input(
@@ -1122,7 +1125,9 @@ struct FileStore {
     path: PathBuf,
     source_start: SourceOffset,
     source_end: SourceOffset,
-    fingerprint: FileFingerprint,
+    stability: FileStability,
+    #[cfg(test)]
+    stability_checks: Cell<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1149,6 +1154,12 @@ impl FileIdentity {
             inode: metadata.ino(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStability {
+    Tracked(FileFingerprint),
+    PrivateSnapshot,
 }
 
 impl FileFingerprint {
@@ -1184,10 +1195,10 @@ impl FileStore {
             source: io::Error::from(source),
         })?;
 
-        Self::from_file(File::from(descriptor), path, limit)
+        Self::from_tracked_file(File::from(descriptor), path, limit)
     }
 
-    fn from_file(file: File, path: PathBuf, limit: u64) -> Result<Self, LoadError> {
+    fn from_tracked_file(file: File, path: PathBuf, limit: u64) -> Result<Self, LoadError> {
         let metadata = file.metadata().map_err(|source| LoadError::Read {
             path: path.clone(),
             source,
@@ -1199,13 +1210,43 @@ impl FileStore {
             return Err(LoadError::TooLarge { path, limit });
         }
 
-        let source_len = metadata.len();
+        Self::new(
+            file,
+            path,
+            metadata.len(),
+            FileStability::Tracked(FileFingerprint::from_metadata(&metadata)),
+        )
+    }
+
+    fn from_private_snapshot(
+        file: File,
+        path: PathBuf,
+        source_len: u64,
+    ) -> Result<Self, LoadError> {
+        Self::new(file, path, source_len, FileStability::PrivateSnapshot)
+    }
+
+    const fn file_identity(&self) -> Option<FileIdentity> {
+        match self.stability {
+            FileStability::Tracked(fingerprint) => Some(fingerprint.identity()),
+            FileStability::PrivateSnapshot => None,
+        }
+    }
+
+    fn new(
+        file: File,
+        path: PathBuf,
+        source_len: u64,
+        stability: FileStability,
+    ) -> Result<Self, LoadError> {
         let mut store = Self {
             file,
             path,
             source_start: SourceOffset::ZERO,
             source_end: SourceOffset::new(source_len),
-            fingerprint: FileFingerprint::from_metadata(&metadata),
+            stability,
+            #[cfg(test)]
+            stability_checks: Cell::new(0),
         };
         store.source_start = SourceOffset::new(store.content_start(source_len)?);
         Ok(store)
@@ -1494,11 +1535,21 @@ impl FileStore {
     }
 
     fn require_unchanged(&self) -> Result<(), LoadError> {
+        let FileStability::Tracked(fingerprint) = self.stability else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        self.stability_checks.set(
+            self.stability_checks
+                .get()
+                .checked_add(1)
+                .expect("stability check count overflow"),
+        );
         let metadata = self.file.metadata().map_err(|source| LoadError::Read {
             path: self.path.clone(),
             source,
         })?;
-        if FileFingerprint::from_metadata(&metadata) != self.fingerprint {
+        if FileFingerprint::from_metadata(&metadata) != fingerprint {
             return Err(self.changed());
         }
         Ok(())
@@ -1541,6 +1592,13 @@ mod tests {
             cursor = window.end();
         }
         output
+    }
+
+    fn file_store(document: &Document) -> &FileStore {
+        match &document.store {
+            DocumentStore::File(store) => store,
+            DocumentStore::InMemory(_) => panic!("expected file-backed document"),
+        }
     }
 
     struct ChunkedReader {
@@ -1621,6 +1679,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((position.current(), position.total()), (3, Some(3)));
+    }
+
+    #[test]
+    fn standard_input_uses_a_private_snapshot_without_stability_checks() {
+        let mut source = Cursor::new("one\n🙂\n");
+        let mut document = load_standard_input(&mut source).unwrap();
+        assert_eq!(
+            file_store(&document).stability,
+            FileStability::PrivateSnapshot
+        );
+        assert_eq!(file_store(&document).stability_checks.get(), 0);
+
+        document.validate().unwrap();
+        assert_eq!(read_all(&document), "one\n🙂\n");
+        finish_index(&mut document).unwrap();
+
+        assert_eq!(file_store(&document).stability_checks.get(), 0);
+    }
+
+    #[test]
+    fn tracked_files_count_stability_checks_per_read() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("tracked.txt");
+        fs::write(&path, "stable").unwrap();
+        let document = load(path).unwrap();
+        assert!(matches!(
+            file_store(&document).stability,
+            FileStability::Tracked(_)
+        ));
+        assert_eq!(file_store(&document).stability_checks.get(), 0);
+
+        document.validate().unwrap();
+        assert_eq!(read_all(&document), "stable");
+
+        assert_eq!(file_store(&document).stability_checks.get(), 3);
+    }
+
+    #[test]
+    fn private_snapshot_windows_preserve_utf8_validation() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"valid").unwrap();
+        let alias = file.try_clone().unwrap();
+        let store =
+            FileStore::from_private_snapshot(file, PathBuf::from(STANDARD_INPUT_NAME), 5).unwrap();
+        assert_eq!(
+            std::os::unix::fs::FileExt::write_at(&alias, b"\xff", 0).unwrap(),
+            1
+        );
+
+        let mut output = Vec::new();
+        let error = store
+            .copy_window(
+                WindowRequest::new(SourceOffset::ZERO, NonZeroUsize::new(1).unwrap()),
+                &mut output,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, LoadError::InvalidUtf8 { offset: 0, .. }));
+        assert_eq!(store.stability_checks.get(), 0);
     }
 
     #[test]
