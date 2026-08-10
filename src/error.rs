@@ -9,6 +9,8 @@ use std::{
 pub enum InvocationError {
     MissingPath,
     MissingPathAfterDoubleDash,
+    MissingLogFile,
+    EmptyLogFile,
     UnknownOption(OsString),
     UnexpectedArgument(OsString),
 }
@@ -25,6 +27,18 @@ pub enum LoadError {
     BufferStandardInput { source: io::Error },
     Allocation(&'static str),
     Read { path: PathBuf, source: io::Error },
+}
+
+#[derive(Debug)]
+pub enum LogError {
+    Open { path: PathBuf, source: io::Error },
+    Inspect { path: PathBuf, source: io::Error },
+    NotRegular(PathBuf),
+    InsecurePermissions(PathBuf),
+    StandardStream,
+    InputConflict(PathBuf),
+    Write { path: PathBuf, source: io::Error },
+    EventTooLarge(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +108,7 @@ pub enum TutError {
     NotATerminal,
     Layout(LayoutError),
     Search(SearchError),
+    Log(LogError),
     Io {
         operation: &'static str,
         source: io::Error,
@@ -106,6 +121,14 @@ pub enum TutError {
     SignalAndRestoration {
         signal: ExternalSignal,
         restoration: Box<Self>,
+    },
+    PrimaryAndLog {
+        primary: Box<Self>,
+        logging: Box<Self>,
+    },
+    SignalAndLog {
+        signal: ExternalSignal,
+        logging: Box<Self>,
     },
 }
 
@@ -130,6 +153,12 @@ impl TutError {
                 InvocationError::MissingPath => "missing file operand".to_owned(),
                 InvocationError::MissingPathAfterDoubleDash => {
                     "missing file operand after '--'".to_owned()
+                }
+                InvocationError::MissingLogFile => {
+                    "option '--log-file' requires an argument".to_owned()
+                }
+                InvocationError::EmptyLogFile => {
+                    "option '--log-file' does not allow an empty argument".to_owned()
                 }
                 InvocationError::UnknownOption(option) => {
                     format!("unrecognized option '{}'", sanitize_os(option))
@@ -171,6 +200,7 @@ impl TutError {
             Self::Search(SearchError::SourceMismatch) => {
                 "search state belongs to another document".to_owned()
             }
+            Self::Log(error) => log_message(error),
             Self::Io { operation, source } => format!("failed to {operation}: {source}"),
             Self::Allocation(context) => format!("could not allocate {context}"),
             Self::PrimaryAndRestoration {
@@ -189,8 +219,54 @@ impl TutError {
                 signal.name(),
                 restoration.message()
             ),
+            Self::PrimaryAndLog { primary, logging } => {
+                format!(
+                    "{}; session log failed: {}",
+                    primary.message(),
+                    logging.message()
+                )
+            }
+            Self::SignalAndLog { signal, logging } => format!(
+                "interrupted by {}; session log failed: {}",
+                signal.name(),
+                logging.message()
+            ),
         };
         sanitize_text(&message)
+    }
+}
+
+fn log_message(error: &LogError) -> String {
+    match error {
+        LogError::Open { path, source } => format!(
+            "cannot open session log '{}': {source}",
+            sanitize_os(path.as_os_str())
+        ),
+        LogError::Inspect { path, source } => format!(
+            "cannot inspect session log '{}': {source}",
+            sanitize_os(path.as_os_str())
+        ),
+        LogError::NotRegular(path) => format!(
+            "session log is not a regular file: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LogError::InsecurePermissions(path) => format!(
+            "session log is accessible by group or other users: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LogError::StandardStream => "session log must not use a standard stream".to_owned(),
+        LogError::InputConflict(path) => format!(
+            "session log is the input document: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LogError::Write { path, source } => format!(
+            "cannot write session log '{}': {source}",
+            sanitize_os(path.as_os_str())
+        ),
+        LogError::EventTooLarge(path) => format!(
+            "session log event exceeds its fixed buffer: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
     }
 }
 
@@ -278,9 +354,16 @@ impl Error for TutError {
                 | LoadError::ReadStandardInput { source }
                 | LoadError::BufferStandardInput { source },
             )
+            | Self::Log(
+                LogError::Open { source, .. }
+                | LogError::Inspect { source, .. }
+                | LogError::Write { source, .. },
+            )
             | Self::Io { source, .. } => Some(source),
             Self::PrimaryAndRestoration { primary, .. } => Some(primary.as_ref()),
             Self::SignalAndRestoration { restoration, .. } => Some(restoration.as_ref()),
+            Self::PrimaryAndLog { primary, .. } => Some(primary.as_ref()),
+            Self::SignalAndLog { logging, .. } => Some(logging.as_ref()),
             _ => None,
         }
     }
@@ -307,6 +390,12 @@ impl From<LayoutError> for TutError {
 impl From<SearchError> for TutError {
     fn from(error: SearchError) -> Self {
         Self::Search(error)
+    }
+}
+
+impl From<LogError> for TutError {
+    fn from(error: LogError) -> Self {
+        Self::Log(error)
     }
 }
 
@@ -344,6 +433,12 @@ mod tests {
             stdin.message(),
             "invalid UTF-8 in standard input at byte 16"
         );
+
+        let log = TutError::Log(LogError::InputConflict(PathBuf::from("bad\n.log")));
+        assert_eq!(
+            log.message(),
+            "session log is the input document: 'bad\\x0a.log'"
+        );
     }
 
     #[test]
@@ -365,6 +460,20 @@ mod tests {
         assert_eq!(
             error.source().unwrap().to_string(),
             "failed to draw terminal frame: draw failed"
+        );
+
+        let logging = TutError::PrimaryAndLog {
+            primary: Box::new(error),
+            logging: Box::new(TutError::Log(LogError::Write {
+                path: PathBuf::from("session.log"),
+                source: io::Error::other("disk full"),
+            })),
+        };
+        assert!(logging.message().contains("terminal restoration failed"));
+        assert!(
+            logging
+                .message()
+                .ends_with("session log failed: cannot write session log 'session.log': disk full")
         );
     }
 }

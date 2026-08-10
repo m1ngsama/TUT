@@ -88,6 +88,14 @@ impl Document {
         self.store.validate()
     }
 
+    pub(super) fn file_identity(&self) -> Option<FileIdentity> {
+        self.store.file_identity()
+    }
+
+    pub(super) const fn content_len(&self) -> u64 {
+        self.source_end.get() - self.source_start.get()
+    }
+
     pub(super) fn reader<'a>(&'a self, cache: &'a mut DocumentCache) -> DocumentReader<'a> {
         DocumentReader {
             document: self,
@@ -798,6 +806,14 @@ impl DocumentStore {
         }
     }
 
+    fn file_identity(&self) -> Option<FileIdentity> {
+        match self {
+            Self::File(store) => Some(store.fingerprint.identity()),
+            #[cfg(test)]
+            Self::InMemory(_) => None,
+        }
+    }
+
     #[cfg(test)]
     fn contiguous_source(&self) -> Option<SourceText<'_>> {
         match self {
@@ -1120,6 +1136,21 @@ struct FileFingerprint {
     changed_nanoseconds: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    pub(super) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
 impl FileFingerprint {
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         Self {
@@ -1130,6 +1161,13 @@ impl FileFingerprint {
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+
+    const fn identity(self) -> FileIdentity {
+        FileIdentity {
+            device: self.device,
+            inode: self.inode,
         }
     }
 }
