@@ -8,15 +8,20 @@ fn tut() -> Command {
 
 #[test]
 fn help_and_version_bypass_terminal_checks() {
-    let help = tut().arg("--help").output().unwrap();
-    assert!(help.status.success());
-    assert_eq!(help.stdout, tut::HELP.as_bytes());
-    assert!(help.stderr.is_empty());
-
-    let version = tut().arg("--version").output().unwrap();
-    assert!(version.status.success());
-    assert_eq!(version.stdout, tut::VERSION_OUTPUT.as_bytes());
-    assert!(version.stderr.is_empty());
+    for (arguments, expected) in [
+        (vec!["--help"], tut::HELP),
+        (vec!["book.txt", "--unknown", "--help", "extra"], tut::HELP),
+        (vec!["--version"], tut::VERSION_OUTPUT),
+        (
+            vec!["--unknown", "book.txt", "--version", "extra"],
+            tut::VERSION_OUTPUT,
+        ),
+    ] {
+        let output = tut().args(arguments).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, expected.as_bytes());
+        assert!(output.stderr.is_empty());
+    }
 }
 
 #[test]
@@ -342,12 +347,48 @@ mod pty {
     }
 
     #[test]
+    fn navigation_and_search_work_through_a_real_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        let mut text = String::new();
+        for line in 0..100 {
+            match line {
+                0 => text.push_str("START_SENTINEL\n"),
+                30 => text.push_str("hit ALPHA_SENTINEL\n"),
+                70 => text.push_str("hit BETA_SENTINEL\n"),
+                99 => text.push_str("END_SENTINEL\n"),
+                _ => text.push_str("ordinary line\n"),
+            }
+        }
+        std::fs::write(file.path(), text).unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(b"START_SENTINEL").unwrap();
+        pty.master.write_all(b"G").unwrap();
+        pty.wait_for(b"END_SENTINEL").unwrap();
+        pty.master.write_all(b"/hit\r").unwrap();
+        pty.wait_for(b"ALPHA_SENTINEL").unwrap();
+        pty.master.write_all(b"n").unwrap();
+        pty.wait_for(b"BETA_SENTINEL").unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
     fn external_signals_restore_before_reporting_the_signal() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "text").unwrap();
         for (signal, code, diagnostic) in [
             (Signal::HUP, 129, b"tut: interrupted by SIGHUP\n".as_slice()),
             (Signal::INT, 130, b"tut: interrupted by SIGINT\n".as_slice()),
+            (
+                Signal::QUIT,
+                131,
+                b"tut: interrupted by SIGQUIT\n".as_slice(),
+            ),
             (
                 Signal::TERM,
                 143,
@@ -377,16 +418,14 @@ mod pty {
     #[test]
     fn file_errors_happen_before_terminal_mutation() {
         let directory = tempdir().unwrap();
-        let invalid = directory.path().join("invalid.txt");
-        std::fs::write(&invalid, b"ok\xffbad").unwrap();
         let oversize = directory.path().join("oversize.txt");
         File::create(&oversize)
             .unwrap()
-            .set_len((tut::MAX_FILE_BYTES + 1) as u64)
+            .set_len(tut::MAX_FILE_BYTES + 1)
             .unwrap();
         let missing = directory.path().join("missing.txt");
 
-        for path in [&missing, &invalid, &oversize] {
+        for path in [&missing, &oversize] {
             let mut pty = PtyChild::spawn(path).unwrap();
             let status = pty.wait().unwrap();
             assert_eq!(status.code(), Some(1));
@@ -398,5 +437,30 @@ mod pty {
             );
             pty.assert_restored();
         }
+    }
+
+    #[test]
+    fn deferred_validation_errors_restore_the_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        let invalid_offset = tut::MAX_FILE_BYTES.min(2 * 64 * 1024) + 10;
+        let mut bytes = vec![b'a'; usize::try_from(invalid_offset).unwrap()];
+        bytes.push(0xff);
+        std::fs::write(file.path(), bytes).unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&pty.stderr_output)
+                .contains(&format!("invalid UTF-8 at byte {invalid_offset}"))
+        );
+        for sequence in [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT] {
+            assert!(
+                pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
     }
 }

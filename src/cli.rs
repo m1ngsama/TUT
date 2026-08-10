@@ -18,7 +18,7 @@ TUT home page: https://github.com/m1ngsama/TUT
 pub const VERSION_OUTPUT: &str = concat!(
     "tut (TUT) ",
     env!("CARGO_PKG_VERSION"),
-    "\nCopyright (C) 2024 m1ngsama\n",
+    "\nCopyright (C) 2024-2026 m1ngsama\n",
     "License MIT: <https://opensource.org/license/mit>.\n",
     "This is free software: you are free to change and redistribute it.\n",
     "There is NO WARRANTY, to the extent permitted by law.\n",
@@ -36,46 +36,43 @@ pub(super) fn parse_args<I>(args: I) -> Result<Command, InvocationError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args = args.into_iter();
-    let first = args.next().ok_or(InvocationError::MissingPath)?;
+    let mut path = None;
+    let mut error = None;
+    let mut options = true;
+    let mut saw_double_dash = false;
 
-    if first == "-h" || first == "--help" {
-        return finish_flag(args, Command::Help);
-    }
-    if first == "-V" || first == "--version" {
-        return finish_flag(args, Command::Version);
-    }
-    if first == "--" {
-        let path = args
-            .next()
-            .ok_or(InvocationError::MissingPathAfterDoubleDash)?;
-        return finish_path(args, path);
-    }
-    if first.to_string_lossy().starts_with('-') {
-        return Err(InvocationError::UnknownOption(first));
+    for argument in args {
+        if options && argument == "--" {
+            options = false;
+            saw_double_dash = true;
+            continue;
+        }
+        if options && (argument == "-h" || argument == "--help") {
+            return Ok(Command::Help);
+        }
+        if options && (argument == "-V" || argument == "--version") {
+            return Ok(Command::Version);
+        }
+        if error.is_some() {
+            continue;
+        }
+        if options && argument.to_string_lossy().starts_with('-') {
+            error = Some(InvocationError::UnknownOption(argument));
+        } else if path.is_none() {
+            path = Some(argument);
+        } else {
+            error = Some(InvocationError::UnexpectedArgument(argument));
+        }
     }
 
-    finish_path(args, first)
-}
-
-fn finish_flag(
-    mut args: impl Iterator<Item = OsString>,
-    command: Command,
-) -> Result<Command, InvocationError> {
-    match args.next() {
-        None => Ok(command),
-        Some(extra) => Err(InvocationError::UnexpectedArgument(extra)),
-    }
-}
-
-fn finish_path(
-    mut args: impl Iterator<Item = OsString>,
-    path: OsString,
-) -> Result<Command, InvocationError> {
-    match args.next() {
-        None => Ok(Command::Open(PathBuf::from(path))),
-        Some(extra) => Err(InvocationError::UnexpectedArgument(extra)),
-    }
+    error.map_or_else(
+        || match path {
+            Some(path) => Ok(Command::Open(PathBuf::from(path))),
+            None if saw_double_dash => Err(InvocationError::MissingPathAfterDoubleDash),
+            None => Err(InvocationError::MissingPath),
+        },
+        Err,
+    )
 }
 
 #[cfg(test)]
@@ -102,6 +99,26 @@ mod tests {
             parse(&["--", "-book.txt"]),
             Ok(Command::Open(PathBuf::from("-book.txt")))
         );
+        assert_eq!(
+            parse(&["book.txt", "--"]),
+            Ok(Command::Open(PathBuf::from("book.txt")))
+        );
+        assert_eq!(
+            parse(&["--", "--help"]),
+            Ok(Command::Open(PathBuf::from("--help")))
+        );
+    }
+
+    #[test]
+    fn information_options_short_circuit_earlier_and_later_errors() {
+        assert_eq!(parse(&["book.txt", "extra", "--help"]), Ok(Command::Help));
+        assert_eq!(parse(&["--unknown", "-h"]), Ok(Command::Help));
+        assert_eq!(
+            parse(&["book.txt", "--unknown", "--version", "extra"]),
+            Ok(Command::Version)
+        );
+        assert_eq!(parse(&["--version", "--help"]), Ok(Command::Version));
+        assert_eq!(parse(&["--help", "--version"]), Ok(Command::Help));
     }
 
     #[test]
@@ -126,6 +143,7 @@ mod tests {
         assert!(HELP.starts_with("Usage: tut "));
         assert!(HELP.ends_with('\n'));
         assert!(VERSION_OUTPUT.starts_with(concat!("tut (TUT) ", env!("CARGO_PKG_VERSION"), "\n")));
+        assert!(VERSION_OUTPUT.contains("Copyright (C) 2024-2026 m1ngsama"));
         assert!(VERSION_OUTPUT.contains("License MIT"));
         assert!(VERSION_OUTPUT.ends_with('\n'));
     }

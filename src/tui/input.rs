@@ -50,6 +50,7 @@ fn map_reading_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Char('/'), KeyModifiers::NONE) => Some(Action::BeginSearch),
         (KeyCode::Char('n'), KeyModifiers::NONE) => Some(Action::NextMatch),
         (KeyCode::Char('N'), KeyModifiers::SHIFT) => Some(Action::PreviousMatch),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(Action::SearchCancel),
         (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Action::Quit),
         _ => None,
     }
@@ -123,6 +124,7 @@ mod tests {
                 key(KeyCode::Char('N'), KeyModifiers::SHIFT),
                 Action::PreviousMatch,
             ),
+            (key(KeyCode::Esc, KeyModifiers::NONE), Action::SearchCancel),
             (key(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit),
         ] {
             assert_eq!(map_event(&Mode::Reading, false, event), Some(action));

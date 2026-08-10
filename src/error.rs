@@ -17,29 +17,41 @@ pub enum InvocationError {
 pub enum LoadError {
     Open { path: PathBuf, source: io::Error },
     NotRegular(PathBuf),
-    TooLarge { path: PathBuf, limit: usize },
-    InvalidUtf8 { path: PathBuf, offset: usize },
+    TooLarge { path: PathBuf, limit: u64 },
+    InvalidUtf8 { path: PathBuf, offset: u64 },
     Allocation(&'static str),
     Read { path: PathBuf, source: io::Error },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutError {
-    NormalizedTextTooLong { bytes: usize },
-    Allocation,
-    NonIncreasingRowStart { previous: u32, next: u32 },
+    DocumentMismatch,
+    NonIncreasingRowStart {
+        previous: u64,
+        next: u64,
+    },
+    SourceRangeMismatch {
+        expected_start: u64,
+        expected_end: u64,
+        actual_start: u64,
+        actual_end: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchError {
     Allocation,
-    TextTooLong { bytes: usize },
+    CoordinateOverflow,
+    NonIncreasingCursor { at: u64 },
+    QueryTooLong { limit: usize },
+    SourceMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalSignal {
     Hangup,
     Interrupt,
+    Quit,
     Terminate,
 }
 
@@ -49,6 +61,7 @@ impl ExternalSignal {
         match self {
             Self::Hangup => "SIGHUP",
             Self::Interrupt => "SIGINT",
+            Self::Quit => "SIGQUIT",
             Self::Terminate => "SIGTERM",
         }
     }
@@ -58,6 +71,7 @@ impl ExternalSignal {
         match self {
             Self::Hangup => 129,
             Self::Interrupt => 130,
+            Self::Quit => 131,
             Self::Terminate => 143,
         }
     }
@@ -124,20 +138,34 @@ impl TutError {
             Self::NotATerminal => {
                 "interactive reading requires terminal stdin and stdout".to_owned()
             }
-            Self::Layout(LayoutError::NormalizedTextTooLong { bytes }) => {
-                format!("normalized text exceeds u32 coordinates: {bytes} bytes")
-            }
-            Self::Layout(LayoutError::Allocation) => {
-                "could not allocate the visual-row index".to_owned()
+            Self::Layout(LayoutError::DocumentMismatch) => {
+                "layout state belongs to another document".to_owned()
             }
             Self::Layout(LayoutError::NonIncreasingRowStart { previous, next }) => {
                 format!("visual-row starts are not strictly increasing: {previous} then {next}")
             }
+            Self::Layout(LayoutError::SourceRangeMismatch {
+                expected_start,
+                expected_end,
+                actual_start,
+                actual_end,
+            }) => format!(
+                "layout source range {expected_start}..{expected_end} does not match {actual_start}..{actual_end}"
+            ),
             Self::Search(SearchError::Allocation) => {
-                "could not allocate the search index".to_owned()
+                "could not allocate search working memory".to_owned()
             }
-            Self::Search(SearchError::TextTooLong { bytes }) => {
-                format!("search source exceeds u32 coordinates: {bytes} bytes")
+            Self::Search(SearchError::CoordinateOverflow) => {
+                "search source coordinates overflowed".to_owned()
+            }
+            Self::Search(SearchError::NonIncreasingCursor { at }) => {
+                format!("search did not advance from byte {at}")
+            }
+            Self::Search(SearchError::QueryTooLong { limit }) => {
+                format!("search query exceeds the {limit}-byte limit")
+            }
+            Self::Search(SearchError::SourceMismatch) => {
+                "search state belongs to another document".to_owned()
             }
             Self::Io { operation, source } => format!("failed to {operation}: {source}"),
             Self::Allocation(context) => format!("could not allocate {context}"),
@@ -193,7 +221,7 @@ pub(super) fn sanitize_text(input: &str) -> String {
                 use fmt::Write as _;
                 let _ = write!(output, "\\x{:02x}", character as u32);
             }
-            '\u{0080}'..='\u{009f}' => {
+            character if is_terminal_control(character) => {
                 use fmt::Write as _;
                 let _ = write!(output, "\\u{{{:04x}}}", character as u32);
             }
@@ -201,6 +229,18 @@ pub(super) fn sanitize_text(input: &str) -> String {
         }
     }
     output
+}
+
+pub(super) const fn is_terminal_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0000}'..='\u{001f}'
+            | '\u{007f}'..='\u{009f}'
+            | '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 pub(super) fn sanitize_os(input: &OsStr) -> String {
@@ -258,8 +298,8 @@ mod tests {
     #[test]
     fn sanitization_is_single_line_and_control_safe() {
         assert_eq!(
-            sanitize_text("a\0\n\u{001b}\u{007f}\u{0085}z"),
-            "a\\x00\\x0a\\x1b\\x7f\\u{0085}z"
+            sanitize_text("a\0\n\u{001b}\u{007f}\u{0085}\u{061c}\u{200e}\u{202e}\u{2066}z"),
+            "a\\x00\\x0a\\x1b\\x7f\\u{0085}\\u{061c}\\u{200e}\\u{202e}\\u{2066}z"
         );
         assert_eq!(sanitize_os(OsStr::new("safe")), "safe");
     }

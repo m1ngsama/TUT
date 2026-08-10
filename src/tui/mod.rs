@@ -25,6 +25,7 @@ use crate::{
 };
 
 const MAX_POLL: Duration = Duration::from_millis(100);
+const BACKGROUND_POLL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Default)]
 pub(super) struct SignalState(Arc<AtomicUsize>);
@@ -41,6 +42,9 @@ impl SignalState {
             }
             signal if signal == signal_hook::consts::signal::SIGINT as usize => {
                 Some(ExternalSignal::Interrupt)
+            }
+            signal if signal == signal_hook::consts::signal::SIGQUIT as usize => {
+                Some(ExternalSignal::Quit)
             }
             signal if signal == signal_hook::consts::signal::SIGTERM as usize => {
                 Some(ExternalSignal::Terminate)
@@ -64,17 +68,18 @@ pub(super) struct SignalHandlers {
 
 impl SignalHandlers {
     fn install() -> io::Result<Self> {
-        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
         let state = SignalState::empty();
         let mut ids = Vec::new();
         for (signal, value) in [
             (SIGHUP, SIGHUP as usize),
             (SIGINT, SIGINT as usize),
+            (SIGQUIT, SIGQUIT as usize),
             (SIGTERM, SIGTERM as usize),
         ] {
             let slot = Arc::clone(&state.0);
-            // The handler performs only a lock-free atomic operation.
+            // SAFETY: The handler performs only a non-panicking atomic compare-exchange.
             let registration = unsafe {
                 low_level::register(signal, move || {
                     let _ = slot.compare_exchange(0, value, Ordering::SeqCst, Ordering::SeqCst);
@@ -118,7 +123,7 @@ trait TerminalDriver {
     fn enable_raw_mode(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
     fn hide_cursor(&mut self) -> io::Result<()>;
-    fn draw(&mut self, app: &App) -> Result<(), TutError>;
+    fn draw(&mut self, app: &mut App) -> Result<(), TutError>;
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read(&mut self) -> io::Result<Event>;
     fn show_cursor(&mut self) -> io::Result<()>;
@@ -308,7 +313,13 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
             redraw = false;
         }
 
-        let ready = match driver.poll(MAX_POLL) {
+        let background_work = app.has_background_work();
+        let timeout = if background_work {
+            BACKGROUND_POLL
+        } else {
+            MAX_POLL
+        };
+        let ready = match driver.poll(timeout) {
             Ok(ready) => ready,
             Err(source) => {
                 if let Some(signal) = signals.received() {
@@ -324,6 +335,12 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
             return Primary::Signal(signal);
         }
         if !ready {
+            if background_work {
+                match advance_background(app, signals) {
+                    Ok(changed) => redraw |= changed,
+                    Err(primary) => return primary,
+                }
+            }
             continue;
         }
 
@@ -343,16 +360,27 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
             return Primary::Signal(signal);
         }
 
-        let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) else {
-            continue;
-        };
-        match app.update(action) {
-            Ok(Outcome::Changed) => redraw = true,
-            Ok(Outcome::Unchanged) => {}
-            Ok(Outcome::Quit) => return Primary::Normal,
-            Err(error) => return Primary::Error(error),
+        if let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) {
+            match app.update(action) {
+                Ok(Outcome::Changed) => redraw = true,
+                Ok(Outcome::Unchanged) => {}
+                Ok(Outcome::Quit) => return Primary::Normal,
+                Err(error) => return Primary::Error(error),
+            }
+        }
+        if app.has_background_work() {
+            match advance_background(app, signals) {
+                Ok(changed) => redraw |= changed,
+                Err(primary) => return primary,
+            }
         }
     }
+}
+
+fn advance_background(app: &mut App, signals: &SignalState) -> Result<bool, Primary> {
+    let result = app.advance_background();
+    check_signal(signals)?;
+    result.map_err(Primary::Error)
 }
 
 struct CrosstermDriver {
@@ -385,7 +413,7 @@ impl TerminalDriver for CrosstermDriver {
         execute!(self.terminal.backend_mut(), Hide)
     }
 
-    fn draw(&mut self, app: &App) -> Result<(), TutError> {
+    fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
         let state = app.render_state()?;
         let mut view_result = Ok(());
         self.terminal
@@ -438,13 +466,14 @@ pub(super) fn run(app: &mut App, signals: &SignalState) -> Result<RunOutcome, Tu
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::Path};
+    use std::{collections::VecDeque, fs, path::Path};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use signal_hook::consts::signal::{SIGHUP, SIGTERM};
+    use tempfile::tempdir;
 
     use super::*;
-    use crate::app::app_from_normalized;
+    use crate::app::app_from_text;
 
     struct FakeDriver {
         calls: Vec<&'static str>,
@@ -452,6 +481,7 @@ mod tests {
         events: VecDeque<Event>,
         inject_on: Option<&'static str>,
         signals: SignalState,
+        poll_timeouts: Vec<Duration>,
     }
 
     impl FakeDriver {
@@ -462,6 +492,7 @@ mod tests {
                 events: VecDeque::new(),
                 inject_on: None,
                 signals: signals.clone(),
+                poll_timeouts: Vec::new(),
             }
         }
 
@@ -496,14 +527,15 @@ mod tests {
             self.call("hide_cursor")
         }
 
-        fn draw(&mut self, _app: &App) -> Result<(), TutError> {
+        fn draw(&mut self, _app: &mut App) -> Result<(), TutError> {
             self.call("draw").map_err(|source| TutError::Io {
                 operation: "draw terminal frame",
                 source,
             })
         }
 
-        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            self.poll_timeouts.push(timeout);
             self.call("poll")?;
             Ok(!self.events.is_empty())
         }
@@ -538,7 +570,7 @@ mod tests {
     }
 
     fn app() -> App {
-        app_from_normalized(Path::new("/tmp/book.txt"), "body".to_owned())
+        app_from_text(Path::new("/tmp/book.txt"), "body".to_owned())
     }
 
     #[test]
@@ -612,6 +644,48 @@ mod tests {
             run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
+    }
+
+    #[test]
+    fn signal_preempts_incremental_index_work() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.txt");
+        fs::write(&path, "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.inject_on = Some("poll");
+
+        assert_eq!(
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
+            RunOutcome::Signal(ExternalSignal::Terminate)
+        );
+        assert!(app.has_background_work());
+        assert_eq!(driver.poll_timeouts, vec![BACKGROUND_POLL]);
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn terminal_events_do_not_starve_incremental_index_work() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.txt");
+        fs::write(&path, "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver
+            .events
+            .extend([Event::FocusGained, Event::FocusGained, quit_event()]);
+
+        assert_eq!(
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
+            RunOutcome::Normal
+        );
+        assert!(!app.has_background_work());
     }
 
     #[test]
