@@ -379,7 +379,18 @@ mod tests {
     use super::*;
     use crate::app::{Action, Geometry, app_from_text};
 
+    fn prepare_frame(app: &mut crate::app::App) {
+        for _ in 0..1024 {
+            if app.frame_ready() {
+                return;
+            }
+            app.advance_background().unwrap();
+        }
+        panic!("render work exceeded the test step limit");
+    }
+
     fn draw_into(terminal: &mut Terminal<TestBackend>, app: &mut crate::app::App) {
+        prepare_frame(app);
         let state = app.render_state().unwrap();
         terminal
             .draw(|frame| render(frame, &state).unwrap())
@@ -396,6 +407,7 @@ mod tests {
     fn body_buffer(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
+        prepare_frame(app);
         let state = app.render_state().unwrap();
         ReaderBody { rows: state.rows }.render(area, &mut buffer);
         buffer
@@ -423,6 +435,7 @@ mod tests {
     fn body_uses_highlight_and_forced_width_metadata() {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), "ｶﾞ cat".to_owned());
         app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+        prepare_frame(&mut app);
         app.update(Action::BeginSearch).unwrap();
         for character in "cat".chars() {
             app.update(Action::SearchInsert(character)).unwrap();

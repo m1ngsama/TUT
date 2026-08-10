@@ -504,7 +504,7 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
         if let Err(primary) = check_control(signals) {
             return primary;
         }
-        if redraw {
+        if redraw && app.frame_ready() {
             let started = recorder.begin_operation();
             let result = driver.draw(app);
             recorder.finish_operation(RuntimeOperation::Draw, started);
@@ -618,6 +618,7 @@ fn advance_background<R: RuntimeRecorder>(
     recorder: &mut R,
     work: BackgroundWork,
 ) -> Result<bool, Primary> {
+    check_control(signals)?;
     let started = recorder.begin_operation();
     let result = app.advance_background();
     recorder.finish_operation(RuntimeOperation::Background(work), started);
@@ -812,7 +813,8 @@ mod tests {
             self.call("hide_cursor")
         }
 
-        fn draw(&mut self, _app: &mut App) -> Result<(), TutError> {
+        fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
+            assert!(app.frame_ready());
             self.call("draw").map_err(|source| TutError::Io {
                 operation: "draw terminal frame",
                 source,
@@ -856,6 +858,8 @@ mod tests {
         events: u64,
         terminal_sessions: u64,
         suspensions: u64,
+        suspend_after_render: Option<SignalState>,
+        terminate_after_render: Option<SignalState>,
     }
 
     impl RuntimeRecorder for TraceRecorder {
@@ -869,6 +873,20 @@ mod tests {
 
         fn finish_operation(&mut self, operation: RuntimeOperation, started: Self::Stamp) {
             self.operations.push((operation, started));
+            if matches!(
+                operation,
+                RuntimeOperation::Background(BackgroundWork::Render)
+            ) && let Some(signals) = self.suspend_after_render.take()
+            {
+                signals.store_suspend();
+            }
+            if matches!(
+                operation,
+                RuntimeOperation::Background(BackgroundWork::Render)
+            ) && let Some(signals) = self.terminate_after_render.take()
+            {
+                signals.store_raw(SIGTERM as usize);
+            }
         }
 
         fn event(&mut self) {
@@ -904,6 +922,15 @@ mod tests {
 
     fn app() -> App {
         app_from_text(Path::new("/tmp/book.txt"), "body".to_owned())
+    }
+
+    fn ready_app() -> App {
+        let mut app = app();
+        app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+        while !app.frame_ready() {
+            app.advance_background().unwrap();
+        }
+        app
     }
 
     #[test]
@@ -1027,8 +1054,9 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.events.push_back(quit_event());
+        let mut app = ready_app();
         assert_eq!(
-            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(
@@ -1049,6 +1077,48 @@ mod tests {
                 .calls
                 .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
         );
+    }
+
+    #[test]
+    fn queued_quit_preempts_the_initial_render_job() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        let mut recorder = TraceRecorder::default();
+        let mut app = app();
+
+        assert_eq!(
+            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+
+        assert!(!driver.calls.contains(&"draw"));
+        assert_eq!(recorder.operations, [(RuntimeOperation::Action, 0)]);
+        assert!(app.has_background_work());
+    }
+
+    #[test]
+    fn queued_quit_preempts_the_next_render_step() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((4096, 4));
+        driver.events.extend([Event::FocusGained, quit_event()]);
+        let mut recorder = TraceRecorder::default();
+        let mut app = app_from_text(Path::new("/tmp/queued-render.txt"), "x".repeat(4096));
+
+        assert_eq!(
+            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(
+            recorder.operations,
+            [
+                (RuntimeOperation::Background(BackgroundWork::Render), 0),
+                (RuntimeOperation::Action, 1)
+            ]
+        );
+        assert!(!driver.calls.contains(&"draw"));
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
     }
 
     #[test]
@@ -1089,8 +1159,8 @@ mod tests {
         assert_eq!(
             recorder.operations,
             vec![
-                (RuntimeOperation::Draw, 0),
-                (RuntimeOperation::Background(BackgroundWork::LineIndex), 1),
+                (RuntimeOperation::Background(BackgroundWork::Render), 0),
+                (RuntimeOperation::Draw, 1),
                 (RuntimeOperation::Action, 2),
             ]
         );
@@ -1103,9 +1173,10 @@ mod tests {
         driver.events.push_back(quit_event());
         driver.inject_suspend_on = Some("poll");
         let mut recorder = TraceRecorder::default();
+        let mut app = ready_app();
 
         assert_eq!(
-            run_with_recorder(&mut app(), &mut driver, &signals, &mut recorder).unwrap(),
+            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(recorder.events, 1);
@@ -1127,9 +1198,10 @@ mod tests {
         let mut driver = FakeDriver::new(&signals);
         driver.events.push_back(quit_event());
         driver.inject_suspend_on = Some("poll");
+        let mut app = ready_app();
 
         assert_eq!(
-            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
             RunOutcome::Normal
         );
         let transition = [
@@ -1156,6 +1228,60 @@ mod tests {
                 .calls
                 .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
         );
+    }
+
+    #[test]
+    fn suspension_preserves_pending_frames_only_for_the_same_geometry() {
+        fn remaining_render_steps(app: &mut App) -> usize {
+            let mut steps = 0;
+            while !app.frame_ready() {
+                assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+                app.advance_background().unwrap();
+                steps += 1;
+            }
+            steps
+        }
+
+        fn suspend_after_one_step(resume_width: u16) -> App {
+            let signals = SignalState::empty();
+            let mut driver = FakeDriver::new(&signals);
+            driver.sizes.extend([(4096, 4), (resume_width, 4)]);
+            driver.events.extend([Event::FocusGained, quit_event()]);
+            let mut recorder = TraceRecorder {
+                suspend_after_render: Some(signals.clone()),
+                ..TraceRecorder::default()
+            };
+            let mut app = app_from_text(Path::new("/tmp/partial-frame.txt"), "x".repeat(4096));
+
+            assert_eq!(
+                run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+                RunOutcome::Normal
+            );
+            assert_eq!(recorder.suspensions, 1);
+            assert_eq!(
+                recorder
+                    .operations
+                    .iter()
+                    .filter(|(operation, _)| matches!(
+                        operation,
+                        RuntimeOperation::Background(BackgroundWork::Render)
+                    ))
+                    .count(),
+                1
+            );
+            app
+        }
+
+        let mut preserved = suspend_after_one_step(4096);
+        assert_eq!(remaining_render_steps(&mut preserved), 4);
+
+        let mut discarded = suspend_after_one_step(2048);
+        let discarded_steps = remaining_render_steps(&mut discarded);
+        let mut fresh = app_from_text(Path::new("/tmp/fresh-frame.txt"), "x".repeat(4096));
+        fresh
+            .update(Action::Resize(Geometry::new(2048, 4)))
+            .unwrap();
+        assert_eq!(discarded_steps, remaining_render_steps(&mut fresh));
     }
 
     #[test]
@@ -1225,8 +1351,9 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.events.push_back(Event::Resize(u16::MAX, u16::MAX));
+        let mut app = ready_app();
 
-        let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
+        let error = run_with_driver(&mut app, &mut driver, &signals).unwrap_err();
 
         assert!(matches!(error, TutError::TerminalTooLarge { .. }));
         assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
@@ -1246,9 +1373,10 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.events.extend([Event::Resize(40, 10), quit_event()]);
+        let mut app = ready_app();
 
         assert_eq!(
-            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(
@@ -1271,9 +1399,10 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.events.extend([Event::Resize(20, 4), quit_event()]);
+        let mut app = ready_app();
 
         assert_eq!(
-            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(
@@ -1324,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_preempts_incremental_index_work() {
+    fn signal_preempts_initial_render_work() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("large.txt");
         fs::write(&path, "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2)).unwrap();
@@ -1337,8 +1466,36 @@ mod tests {
             run_with_driver(&mut app, &mut driver, &signals).unwrap(),
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
-        assert!(app.has_background_work());
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
         assert_eq!(driver.poll_timeouts, vec![BACKGROUND_POLL]);
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn signal_after_one_render_step_prevents_partial_frame_draw() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((4096, 4));
+        let mut recorder = TraceRecorder {
+            terminate_after_render: Some(signals.clone()),
+            ..TraceRecorder::default()
+        };
+        let mut app = app_from_text(Path::new("/tmp/signal-render.txt"), "x".repeat(4096));
+
+        assert_eq!(
+            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Signal(ExternalSignal::Terminate)
+        );
+        assert_eq!(
+            recorder.operations,
+            [(RuntimeOperation::Background(BackgroundWork::Render), 0)]
+        );
+        assert!(!driver.calls.contains(&"draw"));
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
         assert!(
             driver
                 .calls
@@ -1354,9 +1511,12 @@ mod tests {
         let mut app = App::new(crate::document::load(path).unwrap());
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
-        driver
-            .events
-            .extend([Event::FocusGained, Event::FocusGained, quit_event()]);
+        driver.events.extend([
+            Event::FocusGained,
+            Event::FocusGained,
+            Event::FocusGained,
+            quit_event(),
+        ]);
 
         assert_eq!(
             run_with_driver(&mut app, &mut driver, &signals).unwrap(),
@@ -1365,7 +1525,7 @@ mod tests {
         assert!(!app.has_background_work());
         assert_eq!(
             driver.poll_timeouts,
-            [BACKGROUND_POLL, BACKGROUND_POLL, MAX_POLL]
+            [BACKGROUND_POLL, BACKGROUND_POLL, BACKGROUND_POLL, MAX_POLL,]
         );
     }
 

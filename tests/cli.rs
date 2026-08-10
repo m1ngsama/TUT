@@ -325,7 +325,16 @@ mod pty {
         }
 
         fn wait_for_after(&mut self, start: usize, bytes: &[u8]) -> io::Result<()> {
-            let deadline = Instant::now() + TIMEOUT;
+            self.wait_for_after_with_timeout(start, bytes, TIMEOUT)
+        }
+
+        fn wait_for_after_with_timeout(
+            &mut self,
+            start: usize,
+            bytes: &[u8],
+            timeout: Duration,
+        ) -> io::Result<()> {
+            let deadline = Instant::now() + timeout;
             loop {
                 self.pump()?;
                 if self
@@ -765,6 +774,83 @@ mod pty {
         pty.assert_restored();
         let log = std::fs::read_to_string(log).unwrap();
         assert!(log.ends_with(" terminal_sessions=2 suspensions=1\n"));
+    }
+
+    #[test]
+    fn maximum_grapheme_rendering_remains_responsive_to_signals_and_job_control() {
+        const MAXIMUM_CLUSTERS: usize = 32;
+        const PTY_CLUSTERS: usize = 8;
+        let mut input = NamedTempFile::new().unwrap();
+        let cluster_bytes = usize::try_from(tut::MAX_FILE_BYTES).unwrap() / MAXIMUM_CLUSTERS;
+        let mut cluster = String::from('é');
+        cluster.extend(std::iter::repeat_n(
+            '\u{301}',
+            (cluster_bytes - 'é'.len_utf8()) / '\u{301}'.len_utf8(),
+        ));
+        assert_eq!(cluster.len(), cluster_bytes);
+        for _ in 0..PTY_CLUSTERS {
+            input.as_file_mut().write_all(cluster.as_bytes()).unwrap();
+        }
+        input.as_file_mut().flush().unwrap();
+        assert_eq!(
+            input.as_file().metadata().unwrap().len(),
+            u64::try_from(cluster_bytes * PTY_CLUSTERS).unwrap()
+        );
+
+        let mut terminated = PtyChild::spawn(input.path()).unwrap();
+        terminated.wait_for(HIDE_CURSOR).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        terminated.signal(Signal::TERM).unwrap();
+        let status = terminated.wait().unwrap();
+        assert_eq!(status.code(), Some(143));
+        assert_eq!(terminated.stderr_output, b"tut: interrupted by SIGTERM\n");
+        assert!(
+            terminated
+                .output
+                .windows(SHOW_CURSOR.len())
+                .any(|window| window == SHOW_CURSOR)
+        );
+        assert!(
+            terminated
+                .output
+                .windows(LEAVE_ALT.len())
+                .any(|window| window == LEAVE_ALT)
+        );
+        terminated.assert_restored();
+
+        let mut suspended = PtyChild::spawn(input.path()).unwrap();
+        suspended.wait_for(HIDE_CURSOR).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let suspension_start = suspended.output.len();
+        suspended.signal(Signal::TSTP).unwrap();
+        suspended.wait_until_stopped().unwrap();
+        suspended
+            .wait_for_after(suspension_start, SHOW_CURSOR)
+            .unwrap();
+        suspended
+            .wait_for_after(suspension_start, LEAVE_ALT)
+            .unwrap();
+        suspended.assert_restored();
+
+        let continuation_start = suspended.output.len();
+        suspended.signal(Signal::CONT).unwrap();
+        suspended
+            .wait_for_after(continuation_start, ENTER_ALT)
+            .unwrap();
+        suspended
+            .wait_for_after(continuation_start, HIDE_CURSOR)
+            .unwrap();
+        suspended
+            .wait_for_after_with_timeout(
+                continuation_start,
+                "\u{fffd}".as_bytes(),
+                Duration::from_secs(15),
+            )
+            .unwrap();
+        suspended.master.write_all(b"q").unwrap();
+        assert_eq!(suspended.wait().unwrap().code(), Some(0));
+        assert!(suspended.stderr_output.is_empty());
+        suspended.assert_restored();
     }
 
     #[test]
