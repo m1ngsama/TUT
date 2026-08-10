@@ -1,4 +1,4 @@
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 #[cfg(test)]
 use std::ops::Range;
@@ -7,7 +7,7 @@ use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    document::{DocumentId, DocumentReader, SourceGrapheme},
+    document::{DocumentId, DocumentReader, SOURCE_WINDOW_BYTES, SourceGrapheme},
     error::{LayoutError, TutError, is_terminal_control},
     source::{SourceOffset, SourceText},
 };
@@ -16,6 +16,8 @@ pub(super) const REPLACEMENT_CHARACTER: &str = "\u{fffd}";
 pub(super) const DOTTED_CIRCLE: &str = "\u{25cc}";
 pub(super) const MAX_RENDER_GRAPHEME_BYTES: usize = 1024;
 const TAB_STOP: u32 = 4;
+const PROJECTED_SCAN_ATOM_BUDGET: usize = 1024;
+const PROJECTED_SCAN_BYTE_BUDGET: u64 = SOURCE_WINDOW_BYTES as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -308,6 +310,25 @@ pub(super) trait ProjectedRowSink {
     fn finish_row(&mut self, through: Self::Checkpoint, carry_tail: bool) -> Result<(), TutError>;
 }
 
+impl<S> ProjectedRowSink for &mut S
+where
+    S: ProjectedRowSink + ?Sized,
+{
+    type Checkpoint = S::Checkpoint;
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        (**self).checkpoint()
+    }
+
+    fn push(&mut self, atom: ProjectedAtom<'_>) -> Result<(), TutError> {
+        (**self).push(atom)
+    }
+
+    fn finish_row(&mut self, through: Self::Checkpoint, carry_tail: bool) -> Result<(), TutError> {
+        (**self).finish_row(through, carry_tail)
+    }
+}
+
 impl ViewportLayout {
     pub(super) const fn row_cache_key(&self) -> (DocumentId, ContentWidth) {
         (self.document_id, self.width)
@@ -549,6 +570,282 @@ struct SoftWrap<C> {
     column_after: DisplayColumn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectedScanKey {
+    document_id: DocumentId,
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+    width: ContentWidth,
+}
+
+#[derive(Debug)]
+pub(super) struct ProjectedScanMeter {
+    atom_limit: NonZeroUsize,
+    byte_limit: NonZeroU64,
+    atoms: usize,
+    bytes: u64,
+}
+
+impl ProjectedScanMeter {
+    pub(super) const fn standard() -> Self {
+        Self {
+            atom_limit: NonZeroUsize::new(PROJECTED_SCAN_ATOM_BUDGET)
+                .expect("projected scan atom budgets are nonzero"),
+            byte_limit: NonZeroU64::new(PROJECTED_SCAN_BYTE_BUDGET)
+                .expect("projected scan byte budgets are nonzero"),
+            atoms: 0,
+            bytes: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_limits(atom_limit: usize, byte_limit: u64) -> Self {
+        Self {
+            atom_limit: NonZeroUsize::new(atom_limit).expect("test atom budgets are nonzero"),
+            byte_limit: NonZeroU64::new(byte_limit).expect("test byte budgets are nonzero"),
+            atoms: 0,
+            bytes: 0,
+        }
+    }
+
+    const fn exhausted(&self) -> bool {
+        self.atoms >= self.atom_limit.get() || self.bytes >= self.byte_limit.get()
+    }
+
+    fn charge(&mut self, source: GraphemeRange) {
+        self.atoms = self.atoms.saturating_add(1);
+        self.bytes = self
+            .bytes
+            .saturating_add(source.end().get().saturating_sub(source.start().get()));
+    }
+
+    #[cfg(test)]
+    const fn atoms(&self) -> usize {
+        self.atoms
+    }
+
+    #[cfg(test)]
+    const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProjectedRowsResult {
+    pub(super) rows: usize,
+    pub(super) end: SourceOffset,
+    pub(super) next: Option<SourceOffset>,
+}
+
+impl From<ProjectedRowsExtent> for ProjectedRowsResult {
+    fn from(extent: ProjectedRowsExtent) -> Self {
+        Self {
+            rows: extent.rows,
+            end: extent.boundary.end,
+            next: extent.boundary.next,
+        }
+    }
+}
+
+pub(super) enum ProjectedScanAdvance<S>
+where
+    S: ProjectedRowSink,
+{
+    Pending(ProjectedRowsScanner<S>),
+    Complete {
+        result: ProjectedRowsResult,
+        sink: S,
+    },
+}
+
+pub(super) struct ProjectedRowsScanner<S>
+where
+    S: ProjectedRowSink,
+{
+    key: ProjectedScanKey,
+    cursor: SourceOffset,
+    row_limit: NonZeroUsize,
+    rows: usize,
+    column: DisplayColumn,
+    soft_wrap: Option<SoftWrap<S::Checkpoint>>,
+    sink: S,
+}
+
+impl<S> ProjectedRowsScanner<S>
+where
+    S: ProjectedRowSink,
+{
+    pub(super) fn new(
+        reader: &DocumentReader<'_>,
+        start: SourceOffset,
+        width: ContentWidth,
+        row_limit: NonZeroUsize,
+        sink: S,
+    ) -> Result<Self, TutError> {
+        if start < reader.source_start() || start > reader.source_end() {
+            return Err(LayoutError::NonIncreasingRowStart {
+                previous: reader.source_start().get(),
+                next: start.get(),
+            }
+            .into());
+        }
+        Ok(Self {
+            key: ProjectedScanKey {
+                document_id: reader.document_id(),
+                source_start: reader.source_start(),
+                source_end: reader.source_end(),
+                width,
+            },
+            cursor: start,
+            row_limit,
+            rows: 0,
+            column: DisplayColumn::ZERO,
+            soft_wrap: None,
+            sink,
+        })
+    }
+
+    pub(super) fn advance(
+        mut self,
+        reader: &mut DocumentReader<'_>,
+        meter: &mut ProjectedScanMeter,
+    ) -> Result<ProjectedScanAdvance<S>, TutError> {
+        self.require_matching_source(reader)?;
+        reader.validate()?;
+        if meter.exhausted() {
+            return Ok(ProjectedScanAdvance::Pending(self));
+        }
+
+        let mut graphemes = reader.graphemes(self.cursor)?;
+        loop {
+            if meter.exhausted() {
+                return Ok(ProjectedScanAdvance::Pending(self));
+            }
+            let Some(grapheme) = graphemes.next_grapheme()? else {
+                let checkpoint = self.sink.checkpoint();
+                self.sink.finish_row(checkpoint, false)?;
+                let extent = ProjectedRowsExtent {
+                    rows: self.rows + 1,
+                    boundary: VisualRowBoundary {
+                        end: self.key.source_end,
+                        next: None,
+                    },
+                };
+                return Ok(self.finish(extent));
+            };
+            let atom = DisplayAtom::from_grapheme(grapheme);
+            let source = atom.source();
+            if atom.kind() == DisplayAtomKind::LineFeed {
+                let checkpoint = self.sink.checkpoint();
+                self.sink.finish_row(checkpoint, false)?;
+                self.cursor = source.end();
+                self.rows += 1;
+                meter.charge(source);
+                let boundary = VisualRowBoundary {
+                    end: source.end(),
+                    next: Some(source.end()),
+                };
+                if self.rows == self.row_limit.get() {
+                    let extent = ProjectedRowsExtent {
+                        rows: self.rows,
+                        boundary,
+                    };
+                    return Ok(self.finish(extent));
+                }
+                self.column = DisplayColumn::ZERO;
+                self.soft_wrap = None;
+                continue;
+            }
+
+            loop {
+                let projected = atom
+                    .project(self.column, self.key.width)
+                    .expect("only line feeds have no projection");
+                if projected.fits_after(self.column, self.key.width) {
+                    self.column = self.column.plus(projected.width());
+                    self.sink.push(projected)?;
+                    if atom.is_unicode_whitespace() {
+                        self.soft_wrap = Some(SoftWrap {
+                            source_end: source.end(),
+                            checkpoint: self.sink.checkpoint(),
+                            column_after: self.column,
+                        });
+                    }
+                    self.cursor = source.end();
+                    meter.charge(source);
+                    break;
+                }
+
+                if let Some(saved) = self.soft_wrap.take() {
+                    let boundary = VisualRowBoundary {
+                        end: saved.source_end,
+                        next: Some(saved.source_end),
+                    };
+                    let carry_tail = self.rows + 1 < self.row_limit.get();
+                    self.sink.finish_row(saved.checkpoint, carry_tail)?;
+                    self.rows += 1;
+                    if self.rows == self.row_limit.get() {
+                        meter.charge(source);
+                        let extent = ProjectedRowsExtent {
+                            rows: self.rows,
+                            boundary,
+                        };
+                        return Ok(self.finish(extent));
+                    }
+                    self.column = DisplayColumn::new(
+                        self.column
+                            .get()
+                            .checked_sub(saved.column_after.get())
+                            .expect("soft-wrap suffix widths remain nonnegative"),
+                    );
+                } else {
+                    let boundary = VisualRowBoundary {
+                        end: source.start(),
+                        next: Some(source.start()),
+                    };
+                    let checkpoint = self.sink.checkpoint();
+                    self.sink.finish_row(checkpoint, false)?;
+                    self.rows += 1;
+                    if self.rows == self.row_limit.get() {
+                        meter.charge(source);
+                        let extent = ProjectedRowsExtent {
+                            rows: self.rows,
+                            boundary,
+                        };
+                        return Ok(self.finish(extent));
+                    }
+                    self.column = DisplayColumn::ZERO;
+                }
+            }
+        }
+    }
+
+    fn finish(self, extent: ProjectedRowsExtent) -> ProjectedScanAdvance<S> {
+        ProjectedScanAdvance::Complete {
+            result: extent.into(),
+            sink: self.sink,
+        }
+    }
+
+    fn require_matching_source(&self, reader: &DocumentReader<'_>) -> Result<(), TutError> {
+        if reader.document_id() != self.key.document_id {
+            return Err(LayoutError::DocumentMismatch.into());
+        }
+        if reader.source_start() != self.key.source_start
+            || reader.source_end() != self.key.source_end
+        {
+            return Err(LayoutError::SourceRangeMismatch {
+                expected_start: self.key.source_start.get(),
+                expected_end: self.key.source_end.get(),
+                actual_start: reader.source_start().get(),
+                actual_end: reader.source_end().get(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
 struct DiscardProjectedRows;
 
 impl ProjectedRowSink for DiscardProjectedRows {
@@ -646,87 +943,20 @@ fn scan_projected_rows<S>(
 where
     S: ProjectedRowSink,
 {
-    let source_end = reader.source_end();
-    let mut graphemes = reader.graphemes(start)?;
-    let mut column = DisplayColumn::ZERO;
-    let mut soft_wrap = None;
-    let mut rows = 0;
-
+    let mut scanner = ProjectedRowsScanner::new(reader, start, width, row_limit, sink)?;
     loop {
-        let Some(grapheme) = graphemes.next_grapheme()? else {
-            let checkpoint = sink.checkpoint();
-            sink.finish_row(checkpoint, false)?;
-            return Ok(ProjectedRowsExtent {
-                rows: rows + 1,
-                boundary: VisualRowBoundary {
-                    end: source_end,
-                    next: None,
-                },
-            });
-        };
-        let atom = DisplayAtom::from_grapheme(grapheme);
-        if atom.kind() == DisplayAtomKind::LineFeed {
-            let checkpoint = sink.checkpoint();
-            sink.finish_row(checkpoint, false)?;
-            rows += 1;
-            let boundary = VisualRowBoundary {
-                end: atom.source().end(),
-                next: Some(atom.source().end()),
-            };
-            if rows == row_limit.get() {
-                return Ok(ProjectedRowsExtent { rows, boundary });
-            }
-            column = DisplayColumn::ZERO;
-            soft_wrap = None;
-            continue;
-        }
-
-        loop {
-            let projected = atom
-                .project(column, width)
-                .expect("only line feeds have no projection");
-            if projected.fits_after(column, width) {
-                column = column.plus(projected.width());
-                sink.push(projected)?;
-                if atom.is_unicode_whitespace() {
-                    soft_wrap = Some(SoftWrap {
-                        source_end: atom.source().end(),
-                        checkpoint: sink.checkpoint(),
-                        column_after: column,
-                    });
-                }
-                break;
-            }
-
-            if let Some(saved) = soft_wrap.take() {
-                let boundary = VisualRowBoundary {
-                    end: saved.source_end,
-                    next: Some(saved.source_end),
-                };
-                let carry_tail = rows + 1 < row_limit.get();
-                sink.finish_row(saved.checkpoint, carry_tail)?;
-                rows += 1;
-                if rows == row_limit.get() {
-                    return Ok(ProjectedRowsExtent { rows, boundary });
-                }
-                column = DisplayColumn::new(
-                    column
-                        .get()
-                        .checked_sub(saved.column_after.get())
-                        .expect("soft-wrap suffix widths remain nonnegative"),
-                );
-            } else {
-                let boundary = VisualRowBoundary {
-                    end: atom.source().start(),
-                    next: Some(atom.source().start()),
-                };
-                let checkpoint = sink.checkpoint();
-                sink.finish_row(checkpoint, false)?;
-                rows += 1;
-                if rows == row_limit.get() {
-                    return Ok(ProjectedRowsExtent { rows, boundary });
-                }
-                column = DisplayColumn::ZERO;
+        let mut meter = ProjectedScanMeter::standard();
+        match scanner.advance(reader, &mut meter)? {
+            ProjectedScanAdvance::Pending(pending) => scanner = pending,
+            ProjectedScanAdvance::Complete { result, sink } => {
+                let _ = sink;
+                return Ok(ProjectedRowsExtent {
+                    rows: result.rows,
+                    boundary: VisualRowBoundary {
+                        end: result.end,
+                        next: result.next,
+                    },
+                });
             }
         }
     }
@@ -816,10 +1046,11 @@ fn row_start_at_or_before(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{cell::Cell, fs, path::Path};
 
     use super::*;
-    use crate::document::{Document, DocumentCache};
+    use crate::document::{Document, DocumentCache, load};
+    use tempfile::tempdir;
 
     struct Fixture {
         document: Document,
@@ -926,6 +1157,51 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum SinkFailure {
+        Push,
+        Finish,
+    }
+
+    struct FailingSink<'a> {
+        failure: SinkFailure,
+        checkpoints: usize,
+        drops: &'a Cell<usize>,
+    }
+
+    impl Drop for FailingSink<'_> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    impl ProjectedRowSink for FailingSink<'_> {
+        type Checkpoint = usize;
+
+        fn checkpoint(&self) -> Self::Checkpoint {
+            self.checkpoints
+        }
+
+        fn push(&mut self, _atom: ProjectedAtom<'_>) -> Result<(), TutError> {
+            if matches!(self.failure, SinkFailure::Push) {
+                return Err(TutError::Allocation("test projected row sink"));
+            }
+            self.checkpoints += 1;
+            Ok(())
+        }
+
+        fn finish_row(
+            &mut self,
+            _through: Self::Checkpoint,
+            _carry_tail: bool,
+        ) -> Result<(), TutError> {
+            if matches!(self.failure, SinkFailure::Finish) {
+                return Err(TutError::Allocation("test projected row sink"));
+            }
+            Ok(())
+        }
+    }
+
     impl Fixture {
         fn new(text: &str) -> Self {
             Self::at(text, SourceOffset::ZERO)
@@ -986,6 +1262,43 @@ mod tests {
             })
             .unwrap();
         output
+    }
+
+    fn project_incrementally(
+        fixture: &mut Fixture,
+        layout: &ViewportLayout,
+        start: SourceOffset,
+        row_limit: usize,
+        atom_limit: usize,
+        byte_limit: u64,
+    ) -> (ProjectedRowsResult, CollectedRows, Vec<(usize, u64)>) {
+        let mut scanner = {
+            let reader = fixture.document.reader(&mut fixture.cache);
+            ProjectedRowsScanner::new(
+                &reader,
+                start,
+                layout.width,
+                NonZeroUsize::new(row_limit).unwrap(),
+                CollectedRows::default(),
+            )
+            .unwrap()
+        };
+        let mut steps = Vec::new();
+        for _ in 0..fixture.document.source().len_bytes().saturating_add(2) {
+            let mut meter = ProjectedScanMeter::with_limits(atom_limit, byte_limit);
+            let advance = {
+                let mut reader = fixture.document.reader(&mut fixture.cache);
+                scanner.advance(&mut reader, &mut meter).unwrap()
+            };
+            steps.push((meter.atoms(), meter.bytes()));
+            match advance {
+                ProjectedScanAdvance::Pending(pending) => scanner = pending,
+                ProjectedScanAdvance::Complete { result, sink } => {
+                    return (result, sink, steps);
+                }
+            }
+        }
+        panic!("resumable projected-row scan did not complete")
     }
 
     #[test]
@@ -1186,6 +1499,364 @@ mod tests {
                 assert_eq!(actual.owned_rows(), expected, "{text:?}, width {width}");
             }
         }
+    }
+
+    #[test]
+    fn resumable_rows_match_single_pass_results_at_every_emission() {
+        let samples = [
+            "",
+            "\n",
+            "\n\n",
+            "a\r\nb\rc\n",
+            "a bcdef",
+            "a bc\tz",
+            "a\u{a0}bc def",
+            "a\u{001b}\u{0085}b",
+            "e\u{301}\u{200b}🙂 text\n",
+        ];
+
+        for text in samples {
+            for width in 1..=8 {
+                for height in 1..=4 {
+                    let mut expected_fixture = Fixture::new(text);
+                    let expected_layout = expected_fixture.layout(width, height);
+                    let mut expected = CollectedRows::default();
+                    let expected_extent = {
+                        let mut reader = expected_fixture
+                            .document
+                            .reader(&mut expected_fixture.cache);
+                        expected_layout
+                            .project_visible_rows(&mut reader, SourceOffset::ZERO, &mut expected)
+                            .unwrap()
+                    };
+
+                    let mut actual_fixture = Fixture::new(text);
+                    let actual_layout = actual_fixture.layout(width, height);
+                    actual_fixture.cache.reset_metrics();
+                    let (result, actual, steps) = project_incrementally(
+                        &mut actual_fixture,
+                        &actual_layout,
+                        SourceOffset::ZERO,
+                        usize::from(height),
+                        1,
+                        1,
+                    );
+
+                    assert_eq!(
+                        (result.rows, result.end),
+                        expected_extent,
+                        "{text:?}, width {width}, height {height}"
+                    );
+                    assert_eq!(
+                        actual.owned_rows(),
+                        expected.owned_rows(),
+                        "{text:?}, width {width}, height {height}"
+                    );
+                    assert!(
+                        steps[..steps.len().saturating_sub(1)]
+                            .iter()
+                            .all(|&(atoms, _)| atoms == 1),
+                        "{text:?}, width {width}, height {height}, steps {steps:?}"
+                    );
+                    if result.next.is_none() {
+                        assert_eq!(
+                            actual_fixture.cache.metrics().grapheme_emissions(),
+                            text.graphemes(true).count(),
+                            "{text:?}, width {width}, height {height}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_scan_allows_only_one_emission_past_the_byte_budget() {
+        let mut cluster = String::from("a");
+        cluster.extend(std::iter::repeat_n('\u{301}', 2048));
+        let cluster_end = SourceOffset::from_usize(cluster.len());
+        cluster.push('z');
+        let mut fixture = Fixture::new(&cluster);
+        let layout = fixture.layout(16, 2);
+        let (result, rows, steps) = project_incrementally(
+            &mut fixture,
+            &layout,
+            SourceOffset::ZERO,
+            2,
+            PROJECTED_SCAN_ATOM_BUDGET,
+            64,
+        );
+
+        assert_eq!(
+            result,
+            ProjectedRowsResult {
+                rows: 1,
+                end: fixture.document.source().end(),
+                next: None,
+            }
+        );
+        assert_eq!(steps, [(1, cluster_end.get()), (1, 1)]);
+        assert_eq!(rows.text_rows(), [format!("{REPLACEMENT_CHARACTER}z")]);
+    }
+
+    #[test]
+    fn resumable_scans_keep_absolute_offsets_across_crlf_boundaries() {
+        let source_start = SourceOffset::new(u64::from(u32::MAX) + 17);
+        let mut fixture = Fixture::at("a\r\nb", source_start);
+        let layout = fixture.layout(4, 1);
+        let (result, rows, steps) =
+            project_incrementally(&mut fixture, &layout, source_start, 1, 1, 1);
+        let next = source_start.checked_add(3).unwrap();
+
+        assert_eq!(
+            result,
+            ProjectedRowsResult {
+                rows: 1,
+                end: next,
+                next: Some(next),
+            }
+        );
+        assert_eq!(steps, [(1, 1), (1, 2)]);
+        assert_eq!(rows.text_rows(), ["a"]);
+    }
+
+    #[test]
+    fn completed_resumable_scans_return_the_owned_sink() {
+        let mut fixture = Fixture::new("a\n");
+        let layout = fixture.layout(4, 4);
+        let scanner = {
+            let reader = fixture.document.reader(&mut fixture.cache);
+            ProjectedRowsScanner::new(
+                &reader,
+                SourceOffset::ZERO,
+                layout.width,
+                NonZeroUsize::new(4).unwrap(),
+                CollectedRows::default(),
+            )
+            .unwrap()
+        };
+        let advance = {
+            let mut reader = fixture.document.reader(&mut fixture.cache);
+            let mut meter = ProjectedScanMeter::standard();
+            scanner.advance(&mut reader, &mut meter).unwrap()
+        };
+        let ProjectedScanAdvance::Complete { result, sink } = advance else {
+            panic!("projected-row scan remained pending")
+        };
+        assert_eq!(result.rows, 2);
+        assert_eq!(sink.text_rows(), ["a", ""]);
+    }
+
+    #[test]
+    fn resumable_scans_reject_another_document_before_using_the_owned_sink() {
+        let mut first = Fixture::new("a bcdef");
+        let layout = first.layout(4, 3);
+        let scanner = {
+            let reader = first.document.reader(&mut first.cache);
+            ProjectedRowsScanner::new(
+                &reader,
+                SourceOffset::ZERO,
+                layout.width,
+                NonZeroUsize::new(3).unwrap(),
+                CollectedRows::default(),
+            )
+            .unwrap()
+        };
+        let scanner = {
+            let mut reader = first.document.reader(&mut first.cache);
+            let mut meter = ProjectedScanMeter::with_limits(1, 1);
+            let ProjectedScanAdvance::Pending(scanner) =
+                scanner.advance(&mut reader, &mut meter).unwrap()
+            else {
+                panic!("one-atom projected-row scan completed unexpectedly")
+            };
+            scanner
+        };
+
+        let mut second = Fixture::new("x yzuvw");
+        let error = {
+            let mut reader = second.document.reader(&mut second.cache);
+            let mut meter = ProjectedScanMeter::standard();
+            match scanner.advance(&mut reader, &mut meter) {
+                Err(error) => error,
+                Ok(_) => panic!("projected-row scan accepted another document"),
+            }
+        };
+        assert!(matches!(
+            error,
+            TutError::Layout(LayoutError::DocumentMismatch)
+        ));
+        assert_eq!(second.cache.metrics().grapheme_emissions(), 0);
+    }
+
+    #[test]
+    fn resumed_file_scans_validate_before_using_partial_sink_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("resumable-layout.txt");
+        fs::write(&path, "a bcdef").unwrap();
+        let document = load(path.clone()).unwrap();
+        let mut cache = DocumentCache::default();
+        let layout = {
+            let reader = document.reader(&mut cache);
+            let mut slot = None;
+            rebuild_viewport_layout(
+                &mut slot,
+                &reader,
+                ContentWidth::new(4).unwrap(),
+                BodyHeight::new(3).unwrap(),
+            );
+            slot.unwrap()
+        };
+        let scanner = {
+            let reader = document.reader(&mut cache);
+            ProjectedRowsScanner::new(
+                &reader,
+                document.source_start(),
+                layout.width,
+                NonZeroUsize::new(3).unwrap(),
+                CollectedRows::default(),
+            )
+            .unwrap()
+        };
+        let scanner = {
+            let mut reader = document.reader(&mut cache);
+            let mut meter = ProjectedScanMeter::with_limits(1, 1);
+            let ProjectedScanAdvance::Pending(scanner) =
+                scanner.advance(&mut reader, &mut meter).unwrap()
+            else {
+                panic!("one-atom file scan completed unexpectedly")
+            };
+            scanner
+        };
+
+        fs::write(path, "x yzuvw").unwrap();
+        cache.reset_metrics();
+        let error = {
+            let mut reader = document.reader(&mut cache);
+            let mut meter = ProjectedScanMeter::standard();
+            match scanner.advance(&mut reader, &mut meter) {
+                Err(error) => error,
+                Ok(_) => panic!("changed file resumed a projected-row scan"),
+            }
+        };
+        assert!(matches!(error, TutError::Load(_)));
+        assert_eq!(cache.metrics().window_calls(), 0);
+        assert_eq!(cache.metrics().grapheme_emissions(), 0);
+    }
+
+    #[test]
+    fn scanner_and_owned_sink_are_discarded_together_after_sink_errors() {
+        for (text, width, failure) in [
+            ("a", 4, SinkFailure::Push),
+            ("a bcdef", 4, SinkFailure::Finish),
+        ] {
+            let mut fixture = Fixture::new(text);
+            let layout = fixture.layout(width, 3);
+            let drops = Cell::new(0);
+            let scanner = {
+                let reader = fixture.document.reader(&mut fixture.cache);
+                ProjectedRowsScanner::new(
+                    &reader,
+                    SourceOffset::ZERO,
+                    layout.width,
+                    NonZeroUsize::new(3).unwrap(),
+                    FailingSink {
+                        failure,
+                        checkpoints: 0,
+                        drops: &drops,
+                    },
+                )
+                .unwrap()
+            };
+            let error = {
+                let mut reader = fixture.document.reader(&mut fixture.cache);
+                let mut meter = ProjectedScanMeter::standard();
+                match scanner.advance(&mut reader, &mut meter) {
+                    Err(error) => error,
+                    Ok(_) => panic!("failing projected-row sink accepted a scan"),
+                }
+            };
+
+            assert!(matches!(
+                error,
+                TutError::Allocation("test projected row sink")
+            ));
+            assert_eq!(drops.get(), 1);
+        }
+    }
+
+    #[test]
+    fn exhausted_meters_do_not_read_or_mutate_the_owned_sink() {
+        let mut fixture = Fixture::new("abc");
+        let layout = fixture.layout(4, 1);
+        let scanner = {
+            let reader = fixture.document.reader(&mut fixture.cache);
+            ProjectedRowsScanner::new(
+                &reader,
+                SourceOffset::ZERO,
+                layout.width,
+                NonZeroUsize::new(1).unwrap(),
+                CollectedRows::default(),
+            )
+            .unwrap()
+        };
+        fixture.cache.reset_metrics();
+        let mut meter = ProjectedScanMeter::with_limits(1, 1);
+        meter.charge(GraphemeRange::new(SourceOffset::ZERO, SourceOffset::new(1)).unwrap());
+        let advance = {
+            let mut reader = fixture.document.reader(&mut fixture.cache);
+            scanner.advance(&mut reader, &mut meter).unwrap()
+        };
+        let ProjectedScanAdvance::Pending(scanner) = advance else {
+            panic!("exhausted meter completed a projected-row scan")
+        };
+
+        assert_eq!(scanner.sink.checkpoint(), 0);
+        assert_eq!(fixture.cache.metrics().window_calls(), 0);
+        assert_eq!(fixture.cache.metrics().grapheme_emissions(), 0);
+    }
+
+    #[test]
+    fn standard_meters_stop_before_the_next_atom_after_the_limit() {
+        let text = "x".repeat(PROJECTED_SCAN_ATOM_BUDGET * 2);
+        let mut fixture = Fixture::new(&text);
+        let layout = fixture.layout(4096, 1);
+        let mut scanner = {
+            let reader = fixture.document.reader(&mut fixture.cache);
+            ProjectedRowsScanner::new(
+                &reader,
+                SourceOffset::ZERO,
+                layout.width,
+                NonZeroUsize::new(1).unwrap(),
+                CollectedRows::default(),
+            )
+            .unwrap()
+        };
+
+        for expected_checkpoint in [PROJECTED_SCAN_ATOM_BUDGET, text.len()] {
+            let mut reader = fixture.document.reader(&mut fixture.cache);
+            let mut meter = ProjectedScanMeter::standard();
+            let ProjectedScanAdvance::Pending(pending) =
+                scanner.advance(&mut reader, &mut meter).unwrap()
+            else {
+                panic!("atom-limited projected-row scan completed unexpectedly")
+            };
+            assert_eq!(meter.atoms(), PROJECTED_SCAN_ATOM_BUDGET);
+            assert_eq!(meter.bytes(), PROJECTED_SCAN_ATOM_BUDGET as u64);
+            assert_eq!(pending.sink.checkpoint(), expected_checkpoint);
+            scanner = pending;
+        }
+
+        let complete = {
+            let mut reader = fixture.document.reader(&mut fixture.cache);
+            let mut meter = ProjectedScanMeter::standard();
+            scanner.advance(&mut reader, &mut meter).unwrap()
+        };
+        let ProjectedScanAdvance::Complete { result, sink } = complete else {
+            panic!("complete projected row remained pending")
+        };
+        assert_eq!(result.rows, 1);
+        assert_eq!(sink.text_rows(), [text]);
     }
 
     #[test]
