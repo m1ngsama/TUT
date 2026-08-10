@@ -473,12 +473,28 @@ impl ViewportLayout {
         self.clamp_to_last_viewport(reader, last_row)
     }
 
+    #[cfg(test)]
     pub(super) fn next_row_start(
         &self,
         reader: &mut DocumentReader<'_>,
         start: SourceOffset,
     ) -> Result<Option<SourceOffset>, TutError> {
         Ok(self.row_boundary(reader, start)?.next)
+    }
+
+    pub(super) fn start_row_scan(
+        &self,
+        reader: &DocumentReader<'_>,
+        start: SourceOffset,
+    ) -> Result<VisualRowScanner, TutError> {
+        self.require_visible_start(reader, start)?;
+        ProjectedRowsScanner::new(
+            reader,
+            start,
+            self.width,
+            NonZeroUsize::new(1).expect("one is nonzero"),
+            DiscardProjectedRows,
+        )
     }
 
     #[cfg(test)]
@@ -491,6 +507,7 @@ impl ViewportLayout {
         row_start_at_or_before(reader, offset, self.width)
     }
 
+    #[cfg(test)]
     fn row_boundary(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -608,7 +625,7 @@ impl ProjectedScanMeter {
         }
     }
 
-    const fn exhausted(&self) -> bool {
+    pub(super) const fn exhausted(&self) -> bool {
         self.atoms >= self.atom_limit.get() || self.bytes >= self.byte_limit.get()
     }
 
@@ -846,7 +863,9 @@ where
     }
 }
 
-struct DiscardProjectedRows;
+pub(super) struct DiscardProjectedRows;
+
+pub(super) type VisualRowScanner = ProjectedRowsScanner<DiscardProjectedRows>;
 
 impl ProjectedRowSink for DiscardProjectedRows {
     type Checkpoint = ();
@@ -917,6 +936,7 @@ pub(super) fn progress_percent(
     u8::try_from(percent.min(99)).expect("progress is clamped to 99")
 }
 
+#[cfg(test)]
 fn visual_row_boundary(
     reader: &mut DocumentReader<'_>,
     start: SourceOffset,
