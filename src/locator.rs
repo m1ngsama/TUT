@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, num::NonZeroUsize};
 
 use crate::{
     document::{DocumentId, DocumentReader},
@@ -12,6 +12,18 @@ use crate::{
 
 const INITIAL_ROW_NEIGHBORHOOD_CAPACITY: usize = 64;
 const ROW_NEIGHBORHOOD_CAPACITY: usize = 4096;
+
+pub(super) fn source_row_bound(
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+) -> NonZeroUsize {
+    debug_assert!(source_start <= source_end);
+    let source_bytes = source_end.get().saturating_sub(source_start.get());
+    let bound = usize::try_from(source_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+    NonZeroUsize::new(bound).expect("source row bounds are nonzero")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RowDelta {
@@ -253,15 +265,14 @@ impl ViewportLocator {
         target: SourceOffset,
         delta: RowDelta,
         height: BodyHeight,
+        row_bound: NonZeroUsize,
     ) -> Result<Self, TutError> {
         let height = usize::from(height.get());
         let backward_rows = match delta {
-            RowDelta::Backward(amount) => amount
-                .checked_add(1)
-                .ok_or(TutError::Allocation("viewport locator row starts"))?,
+            RowDelta::Backward(amount) => amount.saturating_add(1),
             RowDelta::Forward(_) => 1,
         };
-        let capacity = height.max(backward_rows);
+        let capacity = height.max(backward_rows).min(row_bound.get());
         let mut history = VecDeque::new();
         let mut prefix_rows = VecDeque::new();
         history
@@ -287,8 +298,9 @@ impl ViewportLocator {
         target: SourceOffset,
         delta: RowDelta,
         height: BodyHeight,
+        row_bound: NonZeroUsize,
     ) -> Result<Self, TutError> {
-        let mut locator = Self::new(target, delta, height)?;
+        let mut locator = Self::new(target, delta, height, row_bound)?;
         locator.push_history(target);
         locator.begin_movement(target);
         Ok(locator)
@@ -329,7 +341,7 @@ impl ViewportLocator {
                         self.begin_clamp(candidate);
                     } else {
                         self.phase = Phase::Prepend {
-                            required: amount + 1,
+                            required: amount.saturating_add(1).min(self.capacity),
                             resume: PrefixResume::SelectBackward { amount },
                         };
                     }
@@ -598,6 +610,10 @@ mod tests {
             BodyHeight::new(height).unwrap(),
         );
         layout.unwrap()
+    }
+
+    fn row_bound(document: &Document) -> NonZeroUsize {
+        source_row_bound(document.source_start(), document.source_end())
     }
 
     fn advance(
@@ -936,6 +952,107 @@ mod tests {
     }
 
     #[test]
+    fn source_row_bounds_cover_empty_shifted_and_maximum_ranges() {
+        assert_eq!(source_row_bound(offset(3), offset(3)).get(), 1);
+        assert_eq!(source_row_bound(offset(3), offset(4)).get(), 2);
+        assert_eq!(
+            source_row_bound(SourceOffset::ZERO, SourceOffset::new(u64::MAX)).get(),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn viewport_locator_reservations_obey_source_bounds_and_match_the_layout_oracle() {
+        for text in ["", "x", "a\n", "a\r\nβ\r終", "abcdefghi\n\nlast"] {
+            let document = Document::from_text(Path::new("bounded-locator.txt"), text.to_owned());
+            let bound = row_bound(&document);
+            let targets: Vec<_> = text
+                .char_indices()
+                .map(|(index, _)| SourceOffset::from_usize(index))
+                .chain(std::iter::once(SourceOffset::from_usize(text.len())))
+                .collect();
+
+            for height_value in [1, u16::MAX] {
+                let height = BodyHeight::new(height_value).unwrap();
+                let mut cache = DocumentCache::default();
+                let layout = viewport_layout(&document, &mut cache, 4, height_value);
+
+                for target in targets.iter().copied() {
+                    for (downward, delta) in [
+                        (false, RowDelta::Backward(0)),
+                        (false, RowDelta::Backward(7)),
+                        (true, RowDelta::Forward(0)),
+                        (true, RowDelta::Forward(7)),
+                    ] {
+                        let amount = match delta {
+                            RowDelta::Backward(amount) | RowDelta::Forward(amount) => amount,
+                        };
+                        let expected = {
+                            let mut reader = document.reader(&mut cache);
+                            let anchor = layout
+                                .move_row_start(&mut reader, target, downward, amount)
+                                .unwrap();
+                            LocatedViewport {
+                                anchor,
+                                at_end: layout.is_last_viewport(&mut reader, anchor).unwrap(),
+                            }
+                        };
+                        let mut locator =
+                            ViewportLocator::new(target, delta, height, bound).unwrap();
+                        let backward_rows = match delta {
+                            RowDelta::Backward(amount) => amount.saturating_add(1),
+                            RowDelta::Forward(_) => 1,
+                        };
+                        let expected_capacity = usize::from(height_value)
+                            .max(backward_rows)
+                            .min(bound.get());
+                        assert_eq!(locator.capacity, expected_capacity);
+                        assert!(locator.history.capacity() >= expected_capacity);
+                        assert!(locator.prefix_rows.capacity() >= expected_capacity);
+
+                        let mut rows = RowNeighborhood::default();
+                        let mut actual = None;
+                        for _ in 0..100 {
+                            actual =
+                                advance(&mut locator, &layout, &document, &mut cache, &mut rows)
+                                    .unwrap();
+                            if actual.is_some() {
+                                break;
+                            }
+                        }
+                        assert_eq!(
+                            actual,
+                            Some(expected),
+                            "text={text:?}, target={target:?}, delta={delta:?}, height={height_value}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let document = Document::from_text(Path::new("bounded-locator.txt"), "a\nb".to_owned());
+        let bound = row_bound(&document);
+        let mut cache = DocumentCache::default();
+        let layout = viewport_layout(&document, &mut cache, u16::MAX, u16::MAX);
+        let mut locator = ViewportLocator::from_row_start(
+            SourceOffset::new(2),
+            RowDelta::Backward(usize::MAX),
+            BodyHeight::new(u16::MAX).unwrap(),
+            bound,
+        )
+        .unwrap();
+        assert_eq!(locator.capacity, 4);
+        let mut rows = RowNeighborhood::default();
+        assert_eq!(
+            advance(&mut locator, &layout, &document, &mut cache, &mut rows).unwrap(),
+            Some(LocatedViewport {
+                anchor: SourceOffset::ZERO,
+                at_end: true,
+            })
+        );
+    }
+
+    #[test]
     fn viewport_locator_preempts_long_rows_without_committing_partial_edges() {
         let document = Document::from_text(Path::new("long-row.txt"), "x".repeat(2_048));
         let mut cache = DocumentCache::default();
@@ -944,6 +1061,7 @@ mod tests {
             SourceOffset::ZERO,
             RowDelta::Forward(0),
             BodyHeight::new(1).unwrap(),
+            row_bound(&document),
         )
         .unwrap();
         let mut rows = RowNeighborhood::default();
@@ -1002,6 +1120,7 @@ mod tests {
             SourceOffset::ZERO,
             RowDelta::Forward(0),
             BodyHeight::new(1).unwrap(),
+            row_bound(&document),
         )
         .unwrap();
         let mut rows = RowNeighborhood::default();
@@ -1035,6 +1154,7 @@ mod tests {
             SourceOffset::ZERO,
             RowDelta::Forward(700),
             BodyHeight::new(1).unwrap(),
+            row_bound(&document),
         )
         .unwrap();
         let mut rows = RowNeighborhood::default();
@@ -1082,6 +1202,7 @@ mod tests {
             SourceOffset::from_usize(1_500),
             RowDelta::Forward(0),
             BodyHeight::new(1).unwrap(),
+            row_bound(&document),
         )
         .unwrap();
         let mut rows = RowNeighborhood::default();
@@ -1110,6 +1231,7 @@ mod tests {
             last_start,
             RowDelta::Forward(0),
             BodyHeight::new(2).unwrap(),
+            row_bound(&document),
         )
         .unwrap();
         locator.phase = Phase::Prepend {
@@ -1154,6 +1276,7 @@ mod tests {
             SourceOffset::ZERO,
             RowDelta::Forward(0),
             BodyHeight::new(1).unwrap(),
+            row_bound(&document),
         )
         .unwrap();
         let mut rows = RowNeighborhood::default();

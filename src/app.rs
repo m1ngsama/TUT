@@ -12,7 +12,7 @@ use crate::{
         ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
-    locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator},
+    locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator, source_row_bound},
     search::{MAX_SEARCH_QUERY_BYTES, SearchRange, SearchSession},
     source::SourceOffset,
 };
@@ -926,12 +926,14 @@ impl App {
         if self.locator.is_none() {
             let height = self.geometry.body_height().expect("usable geometry");
             let (target, delta) = request.locator_parameters(self.document.source_end(), height);
+            let row_bound =
+                source_row_bound(self.document.source_start(), self.document.source_end());
             let target_is_known_row_start =
                 request.is_move() && self.anchor_is_row_start && target == self.anchor;
             self.locator = Some(if target_is_known_row_start {
-                ViewportLocator::from_row_start(target, delta, height)?
+                ViewportLocator::from_row_start(target, delta, height, row_bound)?
             } else {
-                ViewportLocator::new(target, delta, height)?
+                ViewportLocator::new(target, delta, height, row_bound)?
             });
         }
 
@@ -1391,12 +1393,13 @@ impl App {
     }
 
     fn render_row_capacity(&self) -> usize {
-        usize::from(
+        let height = usize::from(
             self.geometry
                 .body_height()
                 .expect("render work requires usable geometry")
                 .get(),
-        )
+        );
+        height.min(source_row_bound(self.document.source_start(), self.document.source_end()).get())
     }
 
     #[cfg(not(test))]
@@ -1986,7 +1989,8 @@ mod tests {
 
     fn locate(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
         let height = app.geometry.body_height().unwrap();
-        let mut locator = ViewportLocator::new(target, delta, height).unwrap();
+        let row_bound = source_row_bound(app.document.source_start(), app.document.source_end());
+        let mut locator = ViewportLocator::new(target, delta, height, row_bound).unwrap();
         let mut neighborhood = RowNeighborhood::default();
         for _ in 0..BACKGROUND_STEP_LIMIT {
             let layout = app.layout.as_ref().unwrap();
@@ -2003,7 +2007,8 @@ mod tests {
 
     fn cache_location(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
         let height = app.geometry.body_height().unwrap();
-        let mut locator = ViewportLocator::new(target, delta, height).unwrap();
+        let row_bound = source_row_bound(app.document.source_start(), app.document.source_end());
+        let mut locator = ViewportLocator::new(target, delta, height, row_bound).unwrap();
         for _ in 0..BACKGROUND_STEP_LIMIT {
             let layout = app.layout.as_ref().unwrap();
             let mut reader = app.document.reader(&mut app.document_cache);
@@ -2214,7 +2219,8 @@ mod tests {
         let (_, delta) = request.locator_parameters(app.document.source_end(), height);
         let expected = cache_location(&mut app, target, delta);
         app.viewport_request = Some(request);
-        app.locator = Some(ViewportLocator::new(target, delta, height).unwrap());
+        let row_bound = source_row_bound(app.document.source_start(), app.document.source_end());
+        app.locator = Some(ViewportLocator::new(target, delta, height, row_bound).unwrap());
         app.document_cache.reset_metrics();
 
         assert!(app.advance_viewport_locator().unwrap());
@@ -2870,6 +2876,21 @@ mod tests {
         app.update(Action::NextMatch).unwrap();
         settle(&mut app);
         assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(8));
+    }
+
+    #[test]
+    fn one_byte_source_caps_render_rows_under_maximum_geometry() {
+        let mut app = app_from_text(Path::new("one-byte.txt"), "\n".to_owned());
+        app.update(Action::Resize(Geometry::new(16, 32_768)))
+            .unwrap();
+
+        assert_eq!(app.render_row_capacity(), 2);
+        settle_frame(&mut app);
+
+        let rows = &app.render_cache().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.storage().rows >= app.render_row_capacity());
+        assert_eq!(rows.reserve_attempts().rows, 1);
     }
 
     #[test]
