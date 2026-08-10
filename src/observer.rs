@@ -1,7 +1,7 @@
 use std::{
     fmt,
     fs::File,
-    io::{self, Write as _},
+    io::Write as _,
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -13,7 +13,7 @@ use crate::{
     app::BackgroundWork,
     document::InputIdentity,
     error::{ExternalSignal, LogError},
-    path_binding::BoundPath,
+    path_binding::{BoundPath, ResolvedPath},
 };
 
 const EVENT_BUFFER_BYTES: usize = 512;
@@ -245,24 +245,43 @@ impl ActiveObserver {
             path: path.clone(),
             source,
         })?;
-        if input_identity.is_some_and(|input| input.pathname_matches(bound.identity())) {
+        let resolved =
+            ResolvedPath::parent(bound.open_path()).map_err(|source| LogError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        if input_identity.is_some_and(|input| {
+            input.pathname_matches(bound.identity(), resolved.identity())
+                || input.location_matches(resolved.location())
+        }) {
             return Err(LogError::InputConflict(path));
         }
-        let descriptor = rustix::fs::open(
-            bound.open_path(),
-            OFlags::WRONLY
-                | OFlags::APPEND
-                | OFlags::CREATE
-                | OFlags::CLOEXEC
-                | OFlags::NOFOLLOW
-                | OFlags::NONBLOCK,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|source| LogError::Open {
-            path: path.clone(),
-            source: io::Error::from(source),
-        })?;
+        // The compared pathname slot and the log open stay anchored to this directory fd.
+        let descriptor = resolved
+            .open(
+                OFlags::WRONLY
+                    | OFlags::APPEND
+                    | OFlags::CREATE
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|source| LogError::Open {
+                path: path.clone(),
+                source,
+            })?;
         let file = File::from(descriptor);
+        if let Some(input) = input_identity
+            && input
+                .current_leaf_matches(&file)
+                .map_err(|source| LogError::Inspect {
+                    path: path.clone(),
+                    source,
+                })?
+        {
+            return Err(LogError::InputConflict(path));
+        }
         let metadata = file.metadata().map_err(|source| LogError::Inspect {
             path: path.clone(),
             source,
@@ -548,6 +567,248 @@ mod tests {
     }
 
     #[test]
+    fn final_symlink_input_protects_the_resolved_replacement_slot() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let target = real.join("input.txt");
+        fs::write(&target, "original input").unwrap();
+        let input = directory.path().join("input-link.txt");
+        std::os::unix::fs::symlink(&target, &input).unwrap();
+
+        assert_resolved_replacement_rejected(&input, &target);
+    }
+
+    #[test]
+    fn directory_symlink_input_protects_the_resolved_replacement_slot() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let target = real.join("input.txt");
+        fs::write(&target, "original input").unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert_resolved_replacement_rejected(&alias.join("input.txt"), &target);
+    }
+
+    #[test]
+    fn symlink_parent_components_protect_the_kernel_resolved_slot() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        let child = real.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let target = real.join("input.txt");
+        fs::write(&target, "original input").unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+
+        assert_resolved_replacement_rejected(&alias.join("..").join("input.txt"), &target);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolved_slot_identity_preserves_non_utf8_leaf_names() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+        let directory = tempdir().unwrap();
+        let leaf = OsString::from_vec(b"input-\xff.txt".to_vec());
+        let target = directory.path().join(leaf);
+        fs::write(&target, "original input").unwrap();
+        let input = directory.path().join("input-link.txt");
+        std::os::unix::fs::symlink(&target, &input).unwrap();
+
+        assert_resolved_replacement_rejected(&input, &target);
+    }
+
+    #[test]
+    fn semantic_symlink_parent_aliases_do_not_trigger_lexical_false_positives() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        let child = real.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(real.join("input.txt"), "original input").unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let document = crate::document::load(alias.join("..").join("input.txt")).unwrap();
+        let safe_log = directory.path().join("input.txt");
+        let mut observer = Observer::new(Some(safe_log.clone()));
+
+        observer
+            .start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            )
+            .unwrap();
+        observer.finish(SessionOutcome::Normal).unwrap();
+
+        assert!(
+            fs::read_to_string(safe_log)
+                .unwrap()
+                .starts_with("schema version=1\n")
+        );
+    }
+
+    #[test]
+    fn exact_unresolved_path_rebinding_remains_rejected() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        let child = real.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(real.join("input.txt"), "original input").unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let input = alias.join("..").join("input.txt");
+        let document = crate::document::load(input.clone()).unwrap();
+
+        fs::rename(&real, directory.path().join("moved")).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        fs::write(real.join("input.txt"), "replacement must remain unchanged").unwrap();
+        fs::set_permissions(real.join("input.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = fs::read(real.join("input.txt")).unwrap();
+        let mut observer = Observer::new(Some(input.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            ),
+            Err(LogError::InputConflict(path)) if path == input
+        ));
+        assert_eq!(fs::read(real.join("input.txt")).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn case_folded_log_aliases_cannot_modify_resolved_replacements() {
+        assert_macos_path_alias_replacement_rejected("Input.txt", "input.txt");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unicode_normalized_log_aliases_cannot_modify_resolved_replacements() {
+        assert_macos_path_alias_replacement_rejected("Caf\u{e9}.txt", "Cafe\u{301}.txt");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_macos_path_alias_replacement_rejected(input_name: &str, alias_name: &str) {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join(input_name);
+        let log_alias = directory.path().join(alias_name);
+        fs::write(&input, "original input").unwrap();
+        let Ok(alias_metadata) = fs::metadata(&log_alias) else {
+            return;
+        };
+        let input_metadata = fs::metadata(&input).unwrap();
+        if (alias_metadata.dev(), alias_metadata.ino())
+            != (input_metadata.dev(), input_metadata.ino())
+        {
+            return;
+        }
+        let document = crate::document::load(input.clone()).unwrap();
+        let replacement = directory.path().join("replacement.txt");
+        fs::write(&replacement, "replacement must remain unchanged").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &input).unwrap();
+        let expected = fs::read(&input).unwrap();
+        let mut observer = Observer::new(Some(log_alias.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            ),
+            Err(LogError::InputConflict(path)) if path == log_alias
+        ));
+        assert_eq!(fs::read(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn missing_resolved_input_leaf_does_not_block_a_distinct_log_slot() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        fs::write(&input, "original input").unwrap();
+        let document = crate::document::load(input.clone()).unwrap();
+        fs::remove_file(&input).unwrap();
+        let log = directory.path().join("session.log");
+        let mut observer = Observer::new(Some(log.clone()));
+
+        observer
+            .start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            )
+            .unwrap();
+        observer.finish(SessionOutcome::Normal).unwrap();
+
+        assert!(
+            fs::read_to_string(log)
+                .unwrap()
+                .starts_with("schema version=1\n")
+        );
+    }
+
+    #[test]
+    fn current_input_leaf_symlink_cannot_redirect_into_a_direct_log_target() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        fs::write(&input, "original input").unwrap();
+        let document = crate::document::load(input.clone()).unwrap();
+        fs::remove_file(&input).unwrap();
+        let log = directory.path().join("replacement.log");
+        fs::write(&log, "replacement must remain unchanged").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&log, &input).unwrap();
+        let expected = fs::read(&log).unwrap();
+        let mut observer = Observer::new(Some(log.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            ),
+            Err(LogError::InputConflict(path)) if path == log
+        ));
+        assert_eq!(fs::read(log).unwrap(), expected);
+    }
+
+    #[test]
+    fn cross_directory_hardlink_cannot_alias_the_current_input_replacement() {
+        let directory = tempdir().unwrap();
+        let input_directory = directory.path().join("input");
+        let log_directory = directory.path().join("logs");
+        fs::create_dir(&input_directory).unwrap();
+        fs::create_dir(&log_directory).unwrap();
+        let input = input_directory.join("document.txt");
+        fs::write(&input, "original input").unwrap();
+        let document = crate::document::load(input.clone()).unwrap();
+
+        let replacement = input_directory.join("replacement.txt");
+        fs::write(&replacement, "replacement must remain unchanged").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &input).unwrap();
+        let log = log_directory.join("session.log");
+        fs::hard_link(&input, &log).unwrap();
+        let expected = fs::read(&input).unwrap();
+        let mut observer = Observer::new(Some(log.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            ),
+            Err(LogError::InputConflict(path)) if path == log
+        ));
+        assert_eq!(fs::read(input).unwrap(), expected);
+    }
+
+    #[test]
     fn removed_input_path_is_rejected_before_log_creation() {
         let directory = tempdir().unwrap();
         let input = directory.path().join("input.txt");
@@ -593,6 +854,26 @@ mod tests {
             Err(LogError::InputConflict(path)) if path == input
         ));
         assert_eq!(fs::read(&input).unwrap(), expected);
+    }
+
+    fn assert_resolved_replacement_rejected(input: &Path, target: &Path) {
+        let replacement = target.with_extension("replacement");
+        fs::write(&replacement, "replacement must remain unchanged").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        let document = crate::document::load(input.to_path_buf()).unwrap();
+        fs::rename(&replacement, target).unwrap();
+        let expected = fs::read(target).unwrap();
+        let mut observer = Observer::new(Some(target.to_path_buf()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity()
+            ),
+            Err(LogError::InputConflict(path)) if path == target
+        ));
+        assert_eq!(fs::read(target).unwrap(), expected);
     }
 
     #[test]
