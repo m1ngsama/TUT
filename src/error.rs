@@ -106,6 +106,11 @@ pub enum TutError {
     Invocation(InvocationError),
     Load(LoadError),
     NotATerminal,
+    TerminalTooLarge {
+        columns: u16,
+        rows: u16,
+        cell_limit: u64,
+    },
     Layout(LayoutError),
     Search(SearchError),
     Log(LogError),
@@ -171,6 +176,11 @@ impl TutError {
             Self::NotATerminal => {
                 "interactive reading requires terminal input and output".to_owned()
             }
+            Self::TerminalTooLarge {
+                columns,
+                rows,
+                cell_limit,
+            } => format!("terminal size {columns}x{rows} exceeds the {cell_limit}-cell limit"),
             Self::Layout(LayoutError::DocumentMismatch) => {
                 "layout state belongs to another document".to_owned()
             }
@@ -433,6 +443,18 @@ mod tests {
             stdin.message(),
             "invalid UTF-8 in standard input at byte 16"
         );
+
+        let terminal = TutError::TerminalTooLarge {
+            columns: u16::MAX,
+            rows: u16::MAX,
+            cell_limit: 512 * 1024,
+        };
+        assert_eq!(
+            terminal.message(),
+            "terminal size 65535x65535 exceeds the 524288-cell limit"
+        );
+        assert_eq!(terminal.exit_code(), 1);
+        assert!(!terminal.show_usage());
 
         let log = TutError::Log(LogError::InputConflict(PathBuf::from("bad\n.log")));
         assert_eq!(
