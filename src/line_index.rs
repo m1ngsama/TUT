@@ -4,6 +4,7 @@ use crate::source::{SourceOffset, SourceText};
 
 const LINE_INDEX_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024;
+const INITIAL_CHECKPOINT_INTERVAL_LINES: u64 = 1;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,6 +29,7 @@ struct LineCheckpoint {
     line: PhysicalLine,
     line_start: SourceOffset,
     pending_cr: bool,
+    byte_guard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +161,8 @@ pub(super) struct LineIndex {
     last_line_start: SourceOffset,
     checkpoints: Vec<LineCheckpoint>,
     checkpoint_interval_bytes: u64,
+    checkpoint_interval_lines: u64,
+    last_byte_checkpoint: SourceOffset,
     max_checkpoints: usize,
     pending_cr: bool,
     finished: bool,
@@ -190,6 +194,7 @@ impl LineIndex {
             line: PhysicalLine::ZERO,
             line_start: source_start,
             pending_cr: false,
+            byte_guard: true,
         });
 
         Ok(Self {
@@ -200,6 +205,8 @@ impl LineIndex {
             last_line_start: source_start,
             checkpoints,
             checkpoint_interval_bytes: limits.initial_interval_bytes,
+            checkpoint_interval_lines: INITIAL_CHECKPOINT_INTERVAL_LINES,
+            last_byte_checkpoint: source_start,
             max_checkpoints: limits.max_checkpoints,
             pending_cr: false,
             finished: false,
@@ -368,49 +375,133 @@ impl LineIndex {
             .ok_or(LineIndexError::CoordinateOverflow)?;
         self.last_line = line;
         self.last_line_start = start;
-        Ok(())
+        self.record_checkpoint_at(LineCheckpoint {
+            scan_at: start,
+            line,
+            line_start: start,
+            pending_cr: false,
+            byte_guard: false,
+        })
     }
 
     fn record_checkpoint(&mut self) -> Result<(), LineIndexError> {
-        let last = self
-            .checkpoints
-            .last()
-            .expect("line indexes retain their source-start checkpoint");
-        if self.scanned_to.get() - last.scan_at.get() < self.checkpoint_interval_bytes {
-            return Ok(());
-        }
-        while self.checkpoints.len() >= self.max_checkpoints {
-            self.compact()?;
-            let last = self
-                .checkpoints
-                .last()
-                .expect("line indexes retain their source-start checkpoint");
-            if self.scanned_to.get() - last.scan_at.get() < self.checkpoint_interval_bytes {
-                return Ok(());
-            }
-        }
-        self.reserve_checkpoint()?;
-        self.checkpoints.push(LineCheckpoint {
+        self.record_checkpoint_at(LineCheckpoint {
             scan_at: self.scanned_to,
             line: self.last_line,
             line_start: self.last_line_start,
             pending_cr: self.pending_cr,
-        });
-        Ok(())
+            byte_guard: true,
+        })
+    }
+
+    fn record_checkpoint_at(
+        &mut self,
+        mut checkpoint: LineCheckpoint,
+    ) -> Result<(), LineIndexError> {
+        loop {
+            let last = *self
+                .checkpoints
+                .last()
+                .expect("line indexes retain their source-start checkpoint");
+            if checkpoint.scan_at == last.scan_at {
+                checkpoint.byte_guard = last.byte_guard
+                    || checkpoint.byte_guard && self.byte_checkpoint_due(checkpoint.scan_at);
+                *self
+                    .checkpoints
+                    .last_mut()
+                    .expect("line indexes retain their source-start checkpoint") = checkpoint;
+                if checkpoint.byte_guard {
+                    self.last_byte_checkpoint = checkpoint.scan_at;
+                }
+                return Ok(());
+            }
+
+            let line_due =
+                checkpoint.line.get() - last.line.get() >= self.checkpoint_interval_lines;
+            let byte_due = checkpoint.byte_guard && self.byte_checkpoint_due(checkpoint.scan_at);
+            if !line_due && !byte_due {
+                return Ok(());
+            }
+            checkpoint.byte_guard = byte_due;
+            if self.checkpoints.len() < self.max_checkpoints {
+                self.reserve_checkpoint()?;
+                self.checkpoints.push(checkpoint);
+                if checkpoint.byte_guard {
+                    self.last_byte_checkpoint = checkpoint.scan_at;
+                }
+                return Ok(());
+            }
+            self.compact()?;
+        }
+    }
+
+    fn byte_checkpoint_due(&self, scan_at: SourceOffset) -> bool {
+        scan_at.get() - self.last_byte_checkpoint.get() >= self.checkpoint_interval_bytes
     }
 
     fn compact(&mut self) -> Result<(), LineIndexError> {
-        self.checkpoint_interval_bytes = self
-            .checkpoint_interval_bytes
-            .checked_mul(2)
-            .ok_or(LineIndexError::CoordinateOverflow)?;
-        let mut index = 0;
-        self.checkpoints.retain(|_| {
-            let keep = index % 2 == 0;
-            index += 1;
-            keep
+        let previous_len = self.checkpoints.len();
+        loop {
+            while self
+                .checkpoints
+                .iter()
+                .any(|checkpoint| !checkpoint.byte_guard)
+            {
+                self.checkpoint_interval_lines = self
+                    .checkpoint_interval_lines
+                    .checked_mul(2)
+                    .ok_or(LineIndexError::CoordinateOverflow)?;
+                self.retain_checkpoints(true);
+                if self.checkpoints.len() < previous_len {
+                    return Ok(());
+                }
+            }
+
+            self.checkpoint_interval_bytes = self
+                .checkpoint_interval_bytes
+                .checked_mul(2)
+                .ok_or(LineIndexError::CoordinateOverflow)?;
+            self.retain_checkpoints(false);
+            if self.checkpoints.len() < previous_len {
+                return Ok(());
+            }
+        }
+    }
+
+    fn retain_checkpoints(&mut self, preserve_byte_guards: bool) {
+        let mut first = true;
+        let mut last_kept = self.checkpoints[0];
+        let mut last_byte_guard = self.checkpoints[0];
+        self.checkpoints.retain_mut(|checkpoint| {
+            if first {
+                first = false;
+                checkpoint.byte_guard = true;
+                return true;
+            }
+
+            let line_due =
+                checkpoint.line.get() - last_kept.line.get() >= self.checkpoint_interval_lines;
+            let byte_due = checkpoint.byte_guard
+                && (preserve_byte_guards
+                    || checkpoint.scan_at.get() - last_byte_guard.scan_at.get()
+                        >= self.checkpoint_interval_bytes);
+            if !line_due && !byte_due {
+                return false;
+            }
+            checkpoint.byte_guard = byte_due;
+            last_kept = *checkpoint;
+            if byte_due {
+                last_byte_guard = *checkpoint;
+            }
+            true
         });
-        Ok(())
+        self.last_byte_checkpoint = self
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.byte_guard)
+            .expect("line indexes retain a source-start byte checkpoint")
+            .scan_at;
     }
 
     fn reserve_checkpoint(&mut self) -> Result<(), LineIndexError> {
@@ -568,6 +659,61 @@ mod tests {
     }
 
     #[test]
+    fn line_rich_checkpoints_bound_cumulative_sequential_replay() {
+        const LINE_BYTES: usize = 80;
+        const LINE_COUNT: usize = 819;
+
+        let mut line = "x".repeat(LINE_BYTES - 1);
+        line.push('\n');
+        let text = line.repeat(LINE_COUNT);
+        let source = SourceText::new(&text);
+        let index = build_in_chunks(source, source.len_bytes());
+        let mut replayed_bytes = 0_u64;
+
+        for line in 0..LINE_COUNT {
+            let offset = SourceOffset::new((line * LINE_BYTES) as u64);
+            let scan = index.scan_from(offset).unwrap();
+            replayed_bytes += offset.get() - scan.start().get() + 1;
+            assert_eq!(scan.finish(0).unwrap().current(), line as u64 + 1);
+        }
+
+        assert!(replayed_bytes <= source.len_bytes() as u64);
+    }
+
+    #[test]
+    fn tiny_line_budget_preserves_mixed_endings_and_partial_frontiers() {
+        let text = "a\r\nb\rc\n\n".repeat(4);
+        let source = SourceText::new(&text);
+        let reference = build_in_chunks(source, source.len_bytes());
+        let limits = LineIndexLimits::new(64, 4).unwrap();
+        let mut compacted = LineIndex::with_limits(source.start(), source.end(), limits).unwrap();
+
+        for relative in 0..source.len_bytes() {
+            let start = SourceOffset::new(relative as u64);
+            let end = start.checked_add(1).unwrap();
+            compacted
+                .extend(SourceText::with_start(source.slice(start..end).unwrap(), start).unwrap())
+                .unwrap();
+            assert_eq!(
+                compacted.scan_from(end).is_none(),
+                source.as_str().as_bytes()[relative] == b'\r'
+            );
+        }
+        compacted.finish().unwrap();
+
+        assert!(compacted.checkpoints.len() <= 4);
+        assert!(compacted.checkpoint_interval_lines > 1);
+        assert_eq!(compacted.checkpoint_interval_bytes, 64);
+        for relative in 0..=source.len_bytes() {
+            let offset = SourceOffset::new(relative as u64);
+            assert_eq!(
+                compacted.position(source, offset),
+                reference.position(source, offset)
+            );
+        }
+    }
+
+    #[test]
     fn builder_rejects_discontinuous_and_incomplete_input() {
         let mut index = LineIndex::new(SourceOffset::new(10), SourceOffset::new(20)).unwrap();
         assert!(matches!(
@@ -667,6 +813,32 @@ mod tests {
             LinePosition {
                 current: 1,
                 total: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn default_compaction_keeps_the_long_line_byte_bound() {
+        let line_count = LineIndexLimits::DEFAULT.max_checkpoints + 1;
+        let mut text = "\n".repeat(line_count);
+        text.push_str(&"x".repeat(INITIAL_CHECKPOINT_INTERVAL_BYTES as usize * 2 + 17));
+        let source = SourceText::new(&text);
+        let index = build_in_chunks(source, INITIAL_CHECKPOINT_INTERVAL_BYTES as usize);
+        let target = source.end().checked_sub(1).unwrap();
+        let scan = index.scan_from(target).unwrap();
+
+        assert!(index.checkpoint_interval_lines > 1);
+        assert_eq!(
+            index.checkpoint_interval_bytes,
+            INITIAL_CHECKPOINT_INTERVAL_BYTES
+        );
+        assert!(index.checkpoints.len() <= LineIndexLimits::DEFAULT.max_checkpoints);
+        assert!(target.get() - scan.start().get() < INITIAL_CHECKPOINT_INTERVAL_BYTES);
+        assert_eq!(
+            index.position(source, target).unwrap(),
+            LinePosition {
+                current: line_count as u64 + 1,
+                total: Some(line_count as u64 + 1),
             }
         );
     }
