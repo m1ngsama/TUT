@@ -85,22 +85,14 @@ fn write_render_row(
             continue;
         }
         if let Some((current, current_highlight)) = pending.take()
-            && !write_render_run(
-                buffer,
-                area,
-                &mut x,
-                y,
-                row.text,
-                &current,
-                current_highlight,
-            )
+            && !write_render_run(buffer, area, &mut x, y, row, &current, current_highlight)
         {
             return;
         }
         pending = Some((span.clone(), highlight));
     }
     if let Some((span, highlight)) = pending {
-        write_render_run(buffer, area, &mut x, y, row.text, &span, highlight);
+        write_render_run(buffer, area, &mut x, y, row, &span, highlight);
     }
 }
 
@@ -109,7 +101,7 @@ fn write_render_run(
     area: Rect,
     x: &mut u16,
     y: u16,
-    row: &str,
+    row: RenderRow<'_>,
     span: &RenderSpan,
     highlight: Highlight,
 ) -> bool {
@@ -118,7 +110,7 @@ fn write_render_run(
     if width > area.right().saturating_sub(*x) {
         return false;
     }
-    *x += write_render_span(buffer, *x, y, row, span, highlight);
+    *x += write_render_span(buffer, *x, y, row.span_text(span), span, highlight);
     true
 }
 
@@ -126,7 +118,7 @@ fn write_render_span(
     buffer: &mut Buffer,
     x: u16,
     y: u16,
-    row: &str,
+    text: &str,
     span: &RenderSpan,
     highlight: Highlight,
 ) -> u16 {
@@ -153,7 +145,7 @@ fn write_render_span(
         .cell_mut((x, y))
         .expect("span was clipped to the buffer area");
     cell.reset();
-    cell.set_symbol(span.text(row))
+    cell.set_symbol(text)
         .set_style(style)
         .set_diff_option(CellDiffOption::ForcedWidth(forced_width));
     for offset in 1..width {
@@ -196,7 +188,14 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
         if width > area.right().saturating_sub(x) {
             break;
         }
-        x += write_render_span(frame.buffer_mut(), x, area.y, &row, &span, Highlight::None);
+        x += write_render_span(
+            frame.buffer_mut(),
+            x,
+            area.y,
+            span.standalone_text(&row),
+            &span,
+            Highlight::None,
+        );
         column = DisplayColumn::new(column.get() + u32::from(width));
     }
     Ok(())

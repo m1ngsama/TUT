@@ -161,14 +161,9 @@ impl RenderTextRange {
         }
     }
 
-    fn as_usize(self) -> Range<usize> {
-        self.start as usize..self.end as usize
-    }
-
-    fn shift_left(&mut self, base: u32) {
+    fn relative_to(self, base: u32) -> Range<usize> {
         debug_assert!(base <= self.start && base <= self.end);
-        self.start -= base;
-        self.end -= base;
+        (self.start - base) as usize..(self.end - base) as usize
     }
 }
 
@@ -187,9 +182,13 @@ impl RenderSpan {
         Ok(pending.append_to(output))
     }
 
-    pub(super) fn text<'a>(&self, row: &'a str) -> &'a str {
-        row.get(self.text.as_usize())
+    fn text<'a>(&self, row: &'a str, row_start: u32) -> &'a str {
+        row.get(self.text.relative_to(row_start))
             .expect("render spans retain valid row-text boundaries")
+    }
+
+    pub(super) fn standalone_text<'a>(&self, row: &'a str) -> &'a str {
+        self.text(row, 0)
     }
 
     pub(super) const fn source(&self) -> GraphemeRange {
@@ -326,28 +325,41 @@ static EMPTY_RENDER_ROWS: RenderRows = RenderRows {
 pub(super) struct RenderRow<'a> {
     pub text: &'a str,
     pub spans: &'a [RenderSpan],
+    text_start: u32,
+}
+
+impl<'a> RenderRow<'a> {
+    pub(super) fn span_text(&self, span: &RenderSpan) -> &'a str {
+        span.text(self.text, self.text_start)
+    }
 }
 
 impl RenderRows {
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = RenderRow<'_>> + '_ {
-        self.rows.iter().map(|row| RenderRow {
-            text: self
-                .text
-                .get(row.text.clone())
-                .expect("render rows retain valid text boundaries"),
-            spans: self
-                .spans
-                .get(row.spans.clone())
-                .expect("render rows retain valid span boundaries"),
+        self.rows.iter().map(|row| {
+            debug_assert!(row.text.start <= MAX_TRANSIENT_RENDER_TEXT_BYTES);
+            RenderRow {
+                text: self
+                    .text
+                    .get(row.text.clone())
+                    .expect("render rows retain valid text boundaries"),
+                spans: self
+                    .spans
+                    .get(row.spans.clone())
+                    .expect("render rows retain valid span boundaries"),
+                text_start: row.text.start as u32,
+            }
         })
     }
 
     #[cfg(test)]
     pub(super) fn get(&self, index: usize) -> Option<RenderRow<'_>> {
         let row = self.rows.get(index)?;
+        debug_assert!(row.text.start <= MAX_TRANSIENT_RENDER_TEXT_BYTES);
         Some(RenderRow {
             text: self.text.get(row.text.clone())?,
             spans: self.spans.get(row.spans.clone())?,
+            text_start: row.text.start as u32,
         })
     }
 
@@ -1608,11 +1620,6 @@ impl ProjectedRowSink for RenderRowsBuilder {
             self.text.truncate(through.text);
             self.spans.truncate(through.spans);
         }
-        debug_assert!(self.row_start.text <= MAX_TRANSIENT_RENDER_TEXT_BYTES);
-        let row_text_start = self.row_start.text as u32;
-        for span in &mut self.spans[self.row_start.spans..through.spans] {
-            span.text.shift_left(row_text_start);
-        }
         self.rows.push(RenderRowRange {
             text: self.row_start.text..through.text,
             spans: self.row_start.spans..through.spans,
@@ -1756,7 +1763,7 @@ mod tests {
                 .iter()
                 .map(|span| {
                     (
-                        span.text(row.text).to_owned(),
+                        row.span_text(span).to_owned(),
                         cursor.role_for(span.source()),
                     )
                 })
@@ -2857,34 +2864,38 @@ mod tests {
     #[test]
     fn carried_provisional_tail_becomes_the_next_row_without_copying() {
         let mut builder = RenderRowsBuilder::with_limit(2, usize::MAX).unwrap();
-        builder.push(projected_atom("a")).unwrap();
+        builder.push(projected_atom("é")).unwrap();
         let through = builder.checkpoint();
-        builder.push(projected_atom("b")).unwrap();
+        builder.push(projected_atom("終")).unwrap();
         let text_pointer = builder.text.as_ptr();
         let spans_pointer = builder.spans.as_ptr();
+        let spans = builder.spans.clone();
         let storage = builder.storage();
 
         builder.finish_row(through, true).unwrap();
 
-        assert_eq!(builder.text, "ab");
+        assert_eq!(builder.text, "é終");
         assert_eq!(builder.spans.len(), 2);
         assert_eq!(builder.row_start, through);
         assert_eq!(builder.text.as_ptr(), text_pointer);
         assert_eq!(builder.spans.as_ptr(), spans_pointer);
+        assert_eq!(builder.spans, spans);
         assert_eq!(builder.storage(), storage);
 
         let end = builder.checkpoint();
         builder.finish_row(end, false).unwrap();
         let rows = builder.finish();
+        assert_eq!(rows.spans[0].text, RenderTextRange::new(0, 2));
+        assert_eq!(rows.spans[1].text, RenderTextRange::new(2, 5));
         assert_eq!(
             rows.iter().map(|row| row.text).collect::<Vec<_>>(),
-            vec!["a", "b"]
+            vec!["é", "終"]
         );
         assert_eq!(
             rows.iter()
-                .map(|row| row.spans[0].text(row.text))
+                .map(|row| row.span_text(&row.spans[0]))
                 .collect::<Vec<_>>(),
-            vec!["a", "b"]
+            vec!["é", "終"]
         );
     }
 
@@ -3561,7 +3572,7 @@ mod tests {
         let state = app.render_state().unwrap();
         let row = state.rows.get(0).unwrap();
         let span = &row.spans[0];
-        assert_eq!(span.text(row.text), "◌\u{200b}");
+        assert_eq!(row.span_text(span), "◌\u{200b}");
         assert_eq!(span.projection, RenderProjectionKind::DottedCircle);
         assert_eq!(span.cell_width, DisplayColumn::new(1));
     }
