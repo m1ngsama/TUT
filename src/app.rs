@@ -685,14 +685,8 @@ impl App {
             let request = self
                 .viewport_request
                 .expect("viewport work retains its request");
-            let index_ready = match request {
-                ViewportRequest::End => self.document.line_index_complete(),
-                _ => self
-                    .document
-                    .line_index_covers(request.target(self.document.source_end())),
-            };
             return Some(BackgroundSchedule {
-                work: if index_ready {
+                work: if self.viewport_request_is_ready(request) {
                     BackgroundWork::Viewport
                 } else {
                     BackgroundWork::LineIndex
@@ -715,6 +709,42 @@ impl App {
             work: BackgroundWork::LineIndex,
             next_search_turn: Some(true),
         })
+    }
+
+    fn viewport_request_is_ready(&self, request: ViewportRequest) -> bool {
+        if self.cached_viewport_location(request).is_some() {
+            return true;
+        }
+        if matches!(
+            request,
+            ViewportRequest::Move {
+                target,
+                delta: RowDelta::Forward(_),
+                ..
+            } if self.anchor_is_row_start && target == self.anchor
+        ) {
+            return true;
+        }
+        match request {
+            ViewportRequest::End => self.document.line_index_complete(),
+            _ => self
+                .document
+                .line_index_covers(request.target(self.document.source_end())),
+        }
+    }
+
+    fn cached_viewport_location(&self, request: ViewportRequest) -> Option<LocatedViewport> {
+        let height = self.geometry.body_height()?;
+        let layout = self.layout.as_ref()?;
+        let (target, delta) = request.locator_parameters(self.document.source_end(), height);
+        self.row_neighborhood.locate_target(
+            layout.row_cache_key(),
+            self.document.source_start(),
+            self.document.source_end(),
+            target,
+            delta,
+            height,
+        )
     }
 
     pub(super) fn background_work(&self) -> Option<BackgroundWork> {
@@ -744,25 +774,13 @@ impl App {
         let request = self
             .viewport_request
             .expect("viewport work retains its request");
+        if let Some(located) = self.cached_viewport_location(request) {
+            self.document.validate()?;
+            return Ok(self.finish_viewport_request(request, located));
+        }
         if self.locator.is_none() {
             let height = self.geometry.body_height().expect("usable geometry");
             let (target, delta) = request.locator_parameters(self.document.source_end(), height);
-            let row_key = self
-                .layout
-                .as_ref()
-                .expect("usable geometry has a layout")
-                .row_cache_key();
-            if let Some(located) = self.row_neighborhood.locate_target(
-                row_key,
-                self.document.source_start(),
-                self.document.source_end(),
-                target,
-                delta,
-                height,
-            ) {
-                self.document.validate()?;
-                return Ok(self.finish_viewport_request(request, located));
-            }
             let target_is_known_row_start =
                 request.is_move() && self.anchor_is_row_start && target == self.anchor;
             self.locator = Some(if target_is_known_row_start {
@@ -1787,6 +1805,28 @@ mod tests {
     }
 
     #[test]
+    fn active_locators_reuse_row_edges_observed_by_an_earlier_step() {
+        let mut app = reader(&"x".repeat(SOURCE_WINDOW_BYTES * 2), 16, 7);
+        let target = SourceOffset::from_usize(SOURCE_WINDOW_BYTES);
+        let request = ViewportRequest::Reflow { target };
+        let height = app.geometry.body_height().unwrap();
+        let (_, delta) = request.locator_parameters(app.document.source_end(), height);
+        let expected = cache_location(&mut app, target, delta);
+        app.viewport_request = Some(request);
+        app.locator = Some(ViewportLocator::new(target, delta, height).unwrap());
+        app.document_cache.reset_metrics();
+
+        assert!(app.advance_viewport_locator().unwrap());
+
+        assert_eq!(app.anchor, expected.anchor);
+        assert!(app.viewport_request.is_none());
+        assert!(app.locator.is_none());
+        assert_eq!(app.document_cache.metrics().window_calls(), 0);
+        assert_eq!(app.document_cache.metrics().grapheme_window_calls(), 0);
+        assert_eq!(app.document_cache.metrics().grapheme_emissions(), 0);
+    }
+
+    #[test]
     fn deep_reflow_remains_background_while_cached_moves_and_searches_are_immediate() {
         let match_start = SOURCE_WINDOW_BYTES * 2;
         let mut text = "x".repeat(match_start);
@@ -1847,6 +1887,81 @@ mod tests {
         assert_eq!(app.anchor, anchor.checked_add(width).unwrap());
         let height = usize::from(app.geometry.body_height().unwrap().get());
         assert!(app.document_cache.metrics().grapheme_emissions() <= (height + 1) * (width + 1));
+    }
+
+    #[test]
+    fn known_forward_rows_advance_ahead_of_the_partial_line_index() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("forward-ahead-of-index.txt");
+        fs::write(&path, "x".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        let anchor = SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2);
+        app.anchor = anchor;
+        app.anchor_is_row_start = true;
+        app.row_neighborhood.clear();
+        assert!(!app.document.line_index_covers(anchor));
+
+        app.update(Action::LineDown).unwrap();
+
+        assert_eq!(app.background_work(), Some(BackgroundWork::Viewport));
+        assert!(app.advance_background().unwrap());
+        assert_eq!(app.anchor, anchor.checked_add(16).unwrap());
+        assert!(!app.document.line_index_covers(anchor));
+
+        app.row_neighborhood.clear();
+        app.update(Action::LineUp).unwrap();
+        assert_eq!(app.background_work(), Some(BackgroundWork::LineIndex));
+    }
+
+    #[test]
+    fn cached_backward_rows_advance_ahead_of_the_partial_line_index() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cached-ahead-of-index.txt");
+        fs::write(&path, "x".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        let target = SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2);
+        let request = ViewportRequest::Move {
+            target,
+            delta: RowDelta::Backward(1),
+            follow_end: FollowEndPolicy::Never,
+        };
+        let expected = cache_location(&mut app, target, RowDelta::Backward(1));
+        assert!(!app.document.line_index_covers(target));
+        app.anchor = target;
+        app.anchor_is_row_start = true;
+        app.viewport_request = Some(request);
+        app.document_cache.reset_metrics();
+
+        assert_eq!(app.background_work(), Some(BackgroundWork::Viewport));
+        assert!(app.advance_background().unwrap());
+
+        assert_eq!(app.anchor, expected.anchor);
+        assert!(app.viewport_request.is_none());
+        assert_eq!(app.document_cache.metrics().window_calls(), 0);
+        assert_eq!(app.document_cache.metrics().grapheme_window_calls(), 0);
+    }
+
+    #[test]
+    fn known_forward_rows_validate_files_before_advancing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-forward-row.txt");
+        fs::write(&path, "x".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        let anchor = SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2);
+        app.anchor = anchor;
+        app.anchor_is_row_start = true;
+        app.row_neighborhood.clear();
+        app.update(Action::LineDown).unwrap();
+        assert_eq!(app.background_work(), Some(BackgroundWork::Viewport));
+
+        fs::write(path, "y".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+
+        assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
+        assert_eq!(app.anchor, anchor);
+        assert!(app.viewport_request.is_some());
     }
 
     #[test]
