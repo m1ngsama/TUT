@@ -81,6 +81,7 @@ pub(super) enum Action {
     SearchCancel,
     NextMatch,
     PreviousMatch,
+    Interrupt,
     Quit,
 }
 
@@ -88,6 +89,7 @@ pub(super) enum Action {
 pub(super) enum Outcome {
     Unchanged,
     Changed,
+    Interrupt,
     Quit,
 }
 
@@ -813,8 +815,13 @@ impl App {
     }
 
     pub(super) fn update(&mut self, action: Action) -> Result<Outcome, TutError> {
-        if self.terminal_too_small() && !matches!(action, Action::Resize(_) | Action::Quit) {
+        if self.terminal_too_small()
+            && !matches!(action, Action::Resize(_) | Action::Interrupt | Action::Quit)
+        {
             return Ok(Outcome::Unchanged);
+        }
+        if action == Action::Interrupt {
+            return Ok(Outcome::Interrupt);
         }
         if action == Action::Quit {
             return Ok(Outcome::Quit);
@@ -2038,11 +2045,12 @@ mod tests {
     }
 
     #[test]
-    fn tiny_geometry_freezes_state_except_for_quit_and_resize() {
+    fn tiny_geometry_freezes_state_except_for_control_and_resize() {
         let mut app = reader("line", 10, 3);
         assert!(app.terminal_too_small());
         assert_eq!(app.update(Action::BeginSearch).unwrap(), Outcome::Unchanged);
         assert!(matches!(app.mode(), Mode::Reading));
+        assert_eq!(app.update(Action::Interrupt).unwrap(), Outcome::Interrupt);
         assert_eq!(app.update(Action::Quit).unwrap(), Outcome::Quit);
     }
 

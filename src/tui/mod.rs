@@ -577,6 +577,7 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
                     }
                     redraw = true;
                 }
+                Ok(Outcome::Interrupt) => return Primary::Signal(ExternalSignal::Interrupt),
                 Ok(Outcome::Quit) => return Primary::Normal,
                 Err(error) => return Primary::Error(error),
             }
@@ -587,6 +588,7 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             match result {
                 Ok(Outcome::Changed) => redraw = true,
                 Ok(Outcome::Unchanged) => {}
+                Ok(Outcome::Interrupt) => return Primary::Signal(ExternalSignal::Interrupt),
                 Ok(Outcome::Quit) => return Primary::Normal,
                 Err(error) => return Primary::Error(error),
             }
@@ -881,6 +883,15 @@ mod tests {
         })
     }
 
+    fn interrupt_event() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
     fn app() -> App {
         app_from_text(Path::new("/tmp/book.txt"), "body".to_owned())
     }
@@ -1022,6 +1033,23 @@ mod tests {
             ]
         );
         assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn keyboard_interrupt_restores_terminal_and_reports_sigint() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(interrupt_event());
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Signal(ExternalSignal::Interrupt)
+        );
         assert!(
             driver
                 .calls

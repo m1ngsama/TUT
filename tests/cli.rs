@@ -477,14 +477,31 @@ mod pty {
     #[test]
     fn normal_quit_and_keyboard_interrupt_restore_the_terminal() {
         let file = NamedTempFile::new().unwrap();
+        let directory = tempdir().unwrap();
         std::fs::write(file.path(), "line one\nline two\n").unwrap();
-        for input in [b"q".as_slice(), b"\x03".as_slice()] {
-            let mut pty = PtyChild::spawn(file.path()).unwrap();
+        for (name, input, code, diagnostic, summary) in [
+            (
+                "quit",
+                b"q".as_slice(),
+                0,
+                b"".as_slice(),
+                "session_summary outcome=normal ",
+            ),
+            (
+                "interrupt",
+                b"\x03".as_slice(),
+                130,
+                b"tut: interrupted by SIGINT\n".as_slice(),
+                "session_summary outcome=signal signal=SIGINT ",
+            ),
+        ] {
+            let log = directory.path().join(format!("{name}.log"));
+            let mut pty = PtyChild::spawn_logged(file.path(), None, Some(&log)).unwrap();
             pty.wait_for(HIDE_CURSOR).unwrap();
             pty.master.write_all(input).unwrap();
             let status = pty.wait().unwrap();
-            assert_eq!(status.code(), Some(0));
-            assert!(pty.stderr_output.is_empty());
+            assert_eq!(status.code(), Some(code));
+            assert_eq!(pty.stderr_output, diagnostic);
             for sequence in [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT] {
                 assert!(
                     pty.output
@@ -493,6 +510,7 @@ mod pty {
                 );
             }
             pty.assert_restored();
+            assert!(std::fs::read_to_string(log).unwrap().contains(summary));
         }
     }
 
