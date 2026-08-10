@@ -206,7 +206,7 @@ impl Document {
 #[derive(Debug)]
 pub(super) struct DocumentCache {
     chunk: Vec<u8>,
-    grapheme: Vec<u8>,
+    grapheme: String,
     grapheme_start: SourceOffset,
     grapheme_end: SourceOffset,
     grapheme_document_id: Option<DocumentId>,
@@ -224,6 +224,7 @@ pub(super) struct DocumentMetrics {
     segmentation_advanced_bytes: usize,
     grapheme_window_calls: usize,
     grapheme_window_returned_bytes: usize,
+    grapheme_utf8_validated_bytes: usize,
 }
 
 #[cfg(test)]
@@ -251,13 +252,17 @@ impl DocumentMetrics {
     pub(super) const fn grapheme_window_returned_bytes(self) -> usize {
         self.grapheme_window_returned_bytes
     }
+
+    pub(super) const fn grapheme_utf8_validated_bytes(self) -> usize {
+        self.grapheme_utf8_validated_bytes
+    }
 }
 
 impl Default for DocumentCache {
     fn default() -> Self {
         Self {
             chunk: Vec::new(),
-            grapheme: Vec::new(),
+            grapheme: String::new(),
             grapheme_start: SourceOffset::ZERO,
             grapheme_end: SourceOffset::ZERO,
             grapheme_document_id: None,
@@ -308,9 +313,7 @@ impl<'document> DocumentReader<'document> {
         {
             let cursor = usize::try_from(start.get() - self.cache.grapheme_start.get())
                 .expect("grapheme caches fit the process address space");
-            let buffer = std::str::from_utf8(&self.cache.grapheme)
-                .expect("document caches contain validated UTF-8");
-            if !buffer.is_char_boundary(cursor) {
+            if !self.cache.grapheme.is_char_boundary(cursor) {
                 return Err(self.protocol_error("invalid grapheme cursor offset"));
             }
             debug_assert_eq!(
@@ -640,9 +643,7 @@ impl DocumentGraphemes<'_, '_> {
         loop {
             self.ensure_data()?;
             let (candidate_len, boundary) = {
-                let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
-                    .expect("document caches contain validated UTF-8");
-                let candidate = &buffer[self.cursor..];
+                let candidate = &self.reader.cache.grapheme[self.cursor..];
                 #[cfg(test)]
                 {
                     self.reader.cache.metrics.segmentation_runs += 1;
@@ -695,9 +696,7 @@ impl DocumentGraphemes<'_, '_> {
         if self.cursor == 0 {
             return;
         }
-        let remaining = self.reader.cache.grapheme.len() - self.cursor;
-        self.reader.cache.grapheme.copy_within(self.cursor.., 0);
-        self.reader.cache.grapheme.truncate(remaining);
+        self.reader.cache.grapheme.replace_range(..self.cursor, "");
         self.reader.cache.grapheme_start = self.next_start;
         self.cursor = 0;
     }
@@ -721,15 +720,18 @@ impl DocumentGraphemes<'_, '_> {
         if start != expected_start || end <= start {
             return Err(self.reader.protocol_error("non-contiguous document window"));
         }
+        let chunk = std::str::from_utf8(&self.reader.cache.chunk)
+            .expect("document windows contain validated UTF-8");
+        #[cfg(test)]
+        {
+            self.reader.cache.metrics.grapheme_utf8_validated_bytes += chunk.len();
+        }
         self.reader
             .cache
             .grapheme
             .try_reserve(length)
             .map_err(|_| LoadError::Allocation("grapheme buffer"))?;
-        self.reader
-            .cache
-            .grapheme
-            .extend_from_slice(&self.reader.cache.chunk);
+        self.reader.cache.grapheme.push_str(chunk);
         self.loaded_end = end;
         self.reader.cache.grapheme_end = end;
         Ok(())
@@ -751,11 +753,8 @@ impl DocumentGraphemes<'_, '_> {
         let text_start = self.cursor;
         self.cursor += length;
         self.next_start = end;
-        let text = include_text.then(|| {
-            let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
-                .expect("document caches contain validated UTF-8");
-            &buffer[text_start..text_start + length]
-        });
+        let text =
+            include_text.then(|| &self.reader.cache.grapheme[text_start..text_start + length]);
         Ok(Some(SourceGrapheme { start, end, text }))
     }
 }
@@ -2293,10 +2292,12 @@ mod tests {
         let expected: Vec<_> = text[UTF8_BOM_BYTES..]
             .grapheme_indices(true)
             .map(|(relative, grapheme)| {
+                let start = SourceOffset::new(UTF8_BOM_BYTES as u64)
+                    .checked_add(relative)
+                    .unwrap();
                 (
-                    SourceOffset::new(UTF8_BOM_BYTES as u64)
-                        .checked_add(relative)
-                        .unwrap(),
+                    start,
+                    start.checked_add(grapheme.len()).unwrap(),
                     grapheme.to_owned(),
                 )
             })
@@ -2305,21 +2306,58 @@ mod tests {
         for (backend, document) in [("memory", &memory), ("file", &file)] {
             for window_bytes in 1..=8 {
                 let mut cache = DocumentCache::with_window_bytes(window_bytes);
-                let mut reader = document.reader(&mut cache);
-                let mut graphemes = reader.graphemes(reader.source_start()).unwrap();
-                let mut actual = Vec::new();
-                while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
-                    actual.push((
-                        grapheme.start(),
-                        grapheme
-                            .text()
-                            .expect("test graphemes fit the limit")
-                            .to_owned(),
-                    ));
-                }
+                let actual = {
+                    let mut reader = document.reader(&mut cache);
+                    let mut graphemes = reader.graphemes(reader.source_start()).unwrap();
+                    let mut actual = Vec::new();
+                    while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+                        actual.push((
+                            grapheme.start(),
+                            grapheme.end(),
+                            grapheme
+                                .text()
+                                .expect("test graphemes fit the limit")
+                                .to_owned(),
+                        ));
+                    }
+                    actual
+                };
                 assert_eq!(actual, expected, "{backend} window size {window_bytes}");
+                assert_eq!(
+                    cache.metrics().grapheme_utf8_validated_bytes(),
+                    cache.metrics().grapheme_window_returned_bytes()
+                );
             }
         }
+    }
+
+    #[test]
+    fn ascii_graphemes_validate_each_cached_byte_once() {
+        let text = "a".repeat(SOURCE_WINDOW_BYTES);
+        let document = Document::from_text(Path::new("ascii.txt"), text);
+        let mut cache = DocumentCache::default();
+        let grapheme_count = {
+            let mut reader = document.reader(&mut cache);
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            let mut count = 0;
+            while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+                assert_eq!(grapheme.text(), Some("a"));
+                count += 1;
+            }
+            count
+        };
+
+        assert_eq!(grapheme_count, SOURCE_WINDOW_BYTES);
+        assert_eq!(cache.metrics().grapheme_emissions(), SOURCE_WINDOW_BYTES);
+        assert_eq!(cache.metrics().grapheme_window_calls(), 1);
+        assert_eq!(
+            cache.metrics().grapheme_window_returned_bytes(),
+            SOURCE_WINDOW_BYTES
+        );
+        assert_eq!(
+            cache.metrics().grapheme_utf8_validated_bytes(),
+            SOURCE_WINDOW_BYTES
+        );
     }
 
     #[test]
@@ -2335,7 +2373,7 @@ mod tests {
                 Some("a")
             );
         }
-        assert_eq!(reader.cache.grapheme.as_slice(), b"abcd");
+        assert_eq!(reader.cache.grapheme.as_bytes(), b"abcd");
         assert_eq!(reader.cache.grapheme_start, SourceOffset::ZERO);
         assert_eq!(reader.cache.grapheme_end, SourceOffset::new(4));
 
@@ -2346,7 +2384,7 @@ mod tests {
                 Some("b")
             );
         }
-        assert_eq!(reader.cache.grapheme.as_slice(), b"abcd");
+        assert_eq!(reader.cache.grapheme.as_bytes(), b"abcd");
         assert_eq!(reader.cache.grapheme_start, SourceOffset::ZERO);
         assert_eq!(reader.cache.grapheme_end, SourceOffset::new(4));
     }
@@ -2443,7 +2481,16 @@ mod tests {
             assert!(first.text().is_some());
         }
 
+        assert!(cache.metrics().segmentation_runs() > 1);
         assert_eq!(cache.metrics().segmentation_advanced_bytes(), cluster_len);
+        assert_eq!(
+            cache.metrics().grapheme_window_returned_bytes(),
+            cluster_len + 1
+        );
+        assert_eq!(
+            cache.metrics().grapheme_utf8_validated_bytes(),
+            cluster_len + 1
+        );
     }
 
     #[test]
