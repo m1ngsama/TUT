@@ -658,10 +658,17 @@ impl DocumentGraphemes<'_, '_> {
             }
             match boundary {
                 Ok(Some(grapheme_bytes)) => {
-                    return self.emit(grapheme_bytes, grapheme_bytes <= MAX_GRAPHEME_BYTES);
+                    return if grapheme_bytes <= MAX_GRAPHEME_BYTES {
+                        self.emit(grapheme_bytes, true)
+                    } else {
+                        self.emit(self.bounded_grapheme_length(), false)
+                    };
                 }
                 Err(GraphemeIncomplete::NextChunk) if candidate_len >= MAX_GRAPHEME_BYTES => {
-                    return self.emit(candidate_len, false);
+                    let bounded = self.bounded_grapheme_length();
+                    if candidate_len > bounded {
+                        return self.emit(bounded, false);
+                    }
                 }
                 Err(GraphemeIncomplete::NextChunk) => {}
                 Ok(None)
@@ -678,6 +685,15 @@ impl DocumentGraphemes<'_, '_> {
             self.compact();
             self.append_window()?;
         }
+    }
+
+    fn bounded_grapheme_length(&self) -> usize {
+        let candidate = &self.reader.cache.grapheme[self.cursor..];
+        let mut length = MAX_GRAPHEME_BYTES;
+        while !candidate.is_char_boundary(length) {
+            length -= 1;
+        }
+        length
     }
 
     fn ensure_data(&mut self) -> Result<(), LoadError> {
@@ -726,12 +742,17 @@ impl DocumentGraphemes<'_, '_> {
         {
             self.reader.cache.metrics.grapheme_utf8_validated_bytes += chunk.len();
         }
-        self.reader
-            .cache
-            .grapheme
-            .try_reserve(length)
-            .map_err(|_| LoadError::Allocation("grapheme buffer"))?;
-        self.reader.cache.grapheme.push_str(chunk);
+        let cache = &mut self.reader.cache.grapheme;
+        if cache.len().saturating_add(length) >= MAX_GRAPHEME_BYTES {
+            cache
+                .try_reserve_exact(length)
+                .map_err(|_| LoadError::Allocation("grapheme buffer"))?;
+        } else {
+            cache
+                .try_reserve(length)
+                .map_err(|_| LoadError::Allocation("grapheme buffer"))?;
+        }
+        cache.push_str(chunk);
         self.loaded_end = end;
         self.reader.cache.grapheme_end = end;
         Ok(())
@@ -2491,6 +2512,148 @@ mod tests {
             cache.metrics().grapheme_utf8_validated_bytes(),
             cluster_len + 1
         );
+    }
+
+    fn exact_limit_grapheme() -> String {
+        let mut grapheme = String::with_capacity(MAX_GRAPHEME_BYTES);
+        grapheme.push('é');
+        grapheme.extend(std::iter::repeat_n(
+            '\u{301}',
+            (MAX_GRAPHEME_BYTES - 'é'.len_utf8()) / '\u{301}'.len_utf8(),
+        ));
+        assert_eq!(grapheme.len(), MAX_GRAPHEME_BYTES);
+        grapheme
+    }
+
+    #[test]
+    fn exact_limit_graphemes_keep_text_before_a_following_scalar() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("exact-limit.txt");
+        let mut text = exact_limit_grapheme();
+        text.push('🙂');
+        fs::write(&path, &text).unwrap();
+        let memory = Document::from_text(Path::new("exact-limit-memory.txt"), text.clone());
+        let file = load(path).unwrap();
+
+        for (backend, document) in [("memory", memory), ("file", file)] {
+            let mut cache = DocumentCache::default();
+            {
+                let mut reader = document.reader(&mut cache);
+                let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+                let first = graphemes.next_grapheme().unwrap().unwrap();
+                assert_eq!(first.start(), SourceOffset::ZERO, "{backend}");
+                assert_eq!(
+                    first.end(),
+                    SourceOffset::from_usize(MAX_GRAPHEME_BYTES),
+                    "{backend}"
+                );
+                assert_eq!(
+                    first.text().map(str::len),
+                    Some(MAX_GRAPHEME_BYTES),
+                    "{backend}"
+                );
+                let second = graphemes.next_grapheme().unwrap().unwrap();
+                assert_eq!(second.text(), Some("🙂"), "{backend}");
+                assert!(graphemes.next_grapheme().unwrap().is_none(), "{backend}");
+            }
+            assert!(cache.grapheme.len() <= MAX_GRAPHEME_BYTES + UTF8_BOUNDARY_SLOP_BYTES + 1);
+        }
+    }
+
+    #[test]
+    fn exact_limit_graphemes_at_eof_need_no_lookahead() {
+        let document =
+            Document::from_text(Path::new("exact-limit-eof.txt"), exact_limit_grapheme());
+        let mut cache = DocumentCache::default();
+        {
+            let mut reader = document.reader(&mut cache);
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            let first = graphemes.next_grapheme().unwrap().unwrap();
+            assert_eq!(first.text().map(str::len), Some(MAX_GRAPHEME_BYTES));
+            assert!(graphemes.next_grapheme().unwrap().is_none());
+        }
+        assert_eq!(cache.grapheme.len(), MAX_GRAPHEME_BYTES);
+        assert_eq!(
+            cache.metrics().grapheme_window_returned_bytes(),
+            MAX_GRAPHEME_BYTES
+        );
+    }
+
+    #[test]
+    fn exact_limit_continuations_split_before_the_lookahead() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("continued-limit.txt");
+        let mut text = exact_limit_grapheme();
+        text.push('\u{301}');
+        text.push('z');
+        fs::write(&path, &text).unwrap();
+        let memory = Document::from_text(Path::new("continued-limit-memory.txt"), text.clone());
+        let file = load(path).unwrap();
+
+        for (backend, document) in [("memory", memory), ("file", file)] {
+            let source_end = document.source_end();
+            let mut cache = DocumentCache::default();
+            let mut reader = document.reader(&mut cache);
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            let first = graphemes.next_grapheme().unwrap().unwrap();
+            assert_eq!(first.text(), None, "{backend}");
+            let first_end = first.end();
+            assert_eq!(
+                first_end,
+                SourceOffset::from_usize(MAX_GRAPHEME_BYTES),
+                "{backend}"
+            );
+            assert!(
+                graphemes.reader.cache.grapheme.len()
+                    <= MAX_GRAPHEME_BYTES + UTF8_BOUNDARY_SLOP_BYTES + 1,
+                "{backend}"
+            );
+            let mut next_start = first_end;
+            let mut saw_final = false;
+            while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+                assert_eq!(grapheme.start(), next_start, "{backend}");
+                saw_final |= grapheme.text() == Some("z");
+                next_start = grapheme.end();
+            }
+            assert!(saw_final, "{backend}");
+            assert_eq!(next_start, source_end, "{backend}");
+        }
+    }
+
+    #[test]
+    fn four_byte_extenders_are_retained_after_the_last_bounded_boundary() {
+        let mut text = String::with_capacity(MAX_GRAPHEME_BYTES + UTF8_BOUNDARY_SLOP_BYTES + 2);
+        text.push('a');
+        text.extend(std::iter::repeat_n(
+            '\u{301}',
+            (MAX_GRAPHEME_BYTES - 2) / '\u{301}'.len_utf8(),
+        ));
+        assert_eq!(text.len(), MAX_GRAPHEME_BYTES - 1);
+        text.push('\u{1f3fb}');
+        text.push('z');
+
+        let document = Document::from_text(Path::new("four-byte-lookahead.txt"), text);
+        let source_end = document.source_end();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+        let first = graphemes.next_grapheme().unwrap().unwrap();
+        assert_eq!(first.text(), None);
+        let first_end = first.end();
+        assert_eq!(first_end, SourceOffset::from_usize(MAX_GRAPHEME_BYTES - 1));
+        assert!(
+            graphemes.reader.cache.grapheme.len()
+                <= MAX_GRAPHEME_BYTES + UTF8_BOUNDARY_SLOP_BYTES + 1
+        );
+        let mut next_start = first_end;
+        let mut saw_final = false;
+        while let Some(grapheme) = graphemes.next_grapheme().unwrap() {
+            assert_eq!(grapheme.start(), next_start);
+            saw_final |= grapheme.text() == Some("z");
+            next_start = grapheme.end();
+        }
+        assert!(saw_final);
+        assert_eq!(next_start, source_end);
     }
 
     #[test]
