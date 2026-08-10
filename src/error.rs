@@ -107,6 +107,7 @@ pub enum TutError {
     Load(LoadError),
     Busy,
     NotATerminal,
+    TerminalInUse,
     TerminalTooLarge {
         columns: u16,
         rows: u16,
@@ -188,6 +189,9 @@ impl TutError {
             Self::Busy => "another TUT session is active in this process".to_owned(),
             Self::NotATerminal => {
                 "interactive reading requires terminal input and output".to_owned()
+            }
+            Self::TerminalInUse => {
+                "terminal raw mode is already owned by another session".to_owned()
             }
             Self::TerminalTooLarge {
                 columns,
@@ -499,6 +503,14 @@ mod tests {
         );
         assert_eq!(terminal.exit_code(), 1);
         assert!(!terminal.show_usage());
+
+        let in_use = TutError::TerminalInUse;
+        assert_eq!(
+            in_use.message(),
+            "terminal raw mode is already owned by another session"
+        );
+        assert_eq!(in_use.exit_code(), 1);
+        assert!(!in_use.show_usage());
 
         let render = TutError::VisibleRenderTooLarge {
             limit: 32 * 1024 * 1024,

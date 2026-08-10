@@ -143,11 +143,12 @@ mod pty {
         io::{self, Read, Write},
         os::unix::process::{CommandExt, ExitStatusExt},
         path::Path,
-        process::{Child, ChildStderr, ChildStdin, ExitStatus, Stdio},
+        process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio},
         thread,
         time::{Duration, Instant},
     };
 
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
     use rustix::{
         fs::{self, Mode, OFlags},
         process::{
@@ -164,6 +165,7 @@ mod pty {
     const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
     const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
     const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+    const NESTED_RAW_HELPER: &str = "TUT_TEST_NESTED_RAW_HELPER";
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn reset_signal_state() -> io::Result<()> {
@@ -272,20 +274,7 @@ mod pty {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::piped());
-            // The child setup uses only async-signal-safe descriptor and session operations.
-            unsafe {
-                command.pre_exec(move || {
-                    reset_signal_state()?;
-                    setsid().map_err(io::Error::from)?;
-                    let controlling =
-                        fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
-                            .map_err(io::Error::from)?;
-                    ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
-                    termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
-                    drop(controlling);
-                    Ok(())
-                });
-            }
+            configure_child_session(&mut command, Some(controlling_name));
             Self::finish_spawn(
                 command.spawn()?,
                 TestInput::StandardInput(bytes),
@@ -298,6 +287,32 @@ mod pty {
 
         fn spawn_unreadable_standard_input() -> io::Result<Self> {
             Self::spawn_inner(TestInput::UnreadableStandardInput, None, None)
+        }
+
+        fn spawn_nested_raw_helper(path: &Path) -> io::Result<Self> {
+            let (master, terminal_input, controlling_name, initial) = open_test_pty()?;
+            let stdout = terminal_input.try_clone()?;
+            let probe = master.try_clone()?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "pty::nested_crossterm_raw_owner_is_preserved",
+                    "--nocapture",
+                ])
+                .env(NESTED_RAW_HELPER, path)
+                .stdin(Stdio::from(terminal_input))
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::piped());
+            configure_child_session(&mut command, Some(controlling_name));
+            Self::finish_spawn(
+                command.spawn()?,
+                TestInput::Path(path),
+                master,
+                probe,
+                initial,
+                None,
+            )
         }
 
         fn spawn_inner(
@@ -338,22 +353,10 @@ mod pty {
                 command.arg("--log-file").arg(path);
             }
             command.stdout(Stdio::from(stdout)).stderr(Stdio::piped());
-            // The child setup uses only async-signal-safe descriptor and session operations.
-            unsafe {
-                command.pre_exec(move || {
-                    reset_signal_state()?;
-                    setsid().map_err(io::Error::from)?;
-                    if acquire_controlling_terminal {
-                        let controlling =
-                            fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
-                                .map_err(io::Error::from)?;
-                        ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
-                        termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
-                        drop(controlling);
-                    }
-                    Ok(())
-                });
-            }
+            configure_child_session(
+                &mut command,
+                acquire_controlling_terminal.then_some(controlling_name),
+            );
             Self::finish_spawn(command.spawn()?, input, master, probe, initial, None)
         }
 
@@ -526,40 +529,7 @@ mod pty {
 
         fn assert_restored(&self) {
             let after = termios::tcgetattr(&self.probe).unwrap();
-            assert_eq!(after.input_modes, self.initial.input_modes);
-            assert_eq!(after.output_modes, self.initial.output_modes);
-            assert_eq!(after.control_modes, self.initial.control_modes);
-            let mut after_local_modes = after.local_modes;
-            let mut initial_local_modes = self.initial.local_modes;
-            // PENDIN and FLUSHO report transient line-discipline state rather than saved
-            // terminal configuration, so the kernel may change them while settings restore.
-            let state_modes = termios::LocalModes::PENDIN | termios::LocalModes::FLUSHO;
-            after_local_modes.remove(state_modes);
-            initial_local_modes.remove(state_modes);
-            assert_eq!(after_local_modes, initial_local_modes);
-            assert_eq!(after.input_speed(), self.initial.input_speed());
-            assert_eq!(after.output_speed(), self.initial.output_speed());
-            for index in [
-                SpecialCodeIndex::VINTR,
-                SpecialCodeIndex::VQUIT,
-                SpecialCodeIndex::VERASE,
-                SpecialCodeIndex::VKILL,
-                SpecialCodeIndex::VEOF,
-                SpecialCodeIndex::VTIME,
-                SpecialCodeIndex::VMIN,
-                SpecialCodeIndex::VSTART,
-                SpecialCodeIndex::VSTOP,
-                SpecialCodeIndex::VSUSP,
-                SpecialCodeIndex::VEOL,
-                SpecialCodeIndex::VEOL2,
-            ] {
-                assert_eq!(
-                    after.special_codes[index],
-                    self.initial.special_codes[index]
-                );
-            }
-            #[cfg(target_os = "linux")]
-            assert_eq!(after.line_discipline, self.initial.line_discipline);
+            assert_terminal_configuration(&after, &self.initial);
         }
 
         fn terminate_and_reap(&mut self) {
@@ -581,6 +551,58 @@ mod pty {
         fn drop(&mut self) {
             self.terminate_and_reap();
         }
+    }
+
+    fn configure_child_session(command: &mut Command, controlling_name: Option<CString>) {
+        // The child setup uses only async-signal-safe descriptor and session operations.
+        unsafe {
+            command.pre_exec(move || {
+                reset_signal_state()?;
+                setsid().map_err(io::Error::from)?;
+                if let Some(name) = &controlling_name {
+                    let controlling = fs::open(name.as_c_str(), OFlags::RDWR, Mode::empty())
+                        .map_err(io::Error::from)?;
+                    ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
+                    termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
+                    drop(controlling);
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn assert_terminal_configuration(actual: &Termios, expected: &Termios) {
+        assert_eq!(actual.input_modes, expected.input_modes);
+        assert_eq!(actual.output_modes, expected.output_modes);
+        assert_eq!(actual.control_modes, expected.control_modes);
+        let mut actual_local_modes = actual.local_modes;
+        let mut expected_local_modes = expected.local_modes;
+        // PENDIN and FLUSHO report transient line-discipline state rather than saved
+        // terminal configuration, so the kernel may change them while settings restore.
+        let state_modes = termios::LocalModes::PENDIN | termios::LocalModes::FLUSHO;
+        actual_local_modes.remove(state_modes);
+        expected_local_modes.remove(state_modes);
+        assert_eq!(actual_local_modes, expected_local_modes);
+        assert_eq!(actual.input_speed(), expected.input_speed());
+        assert_eq!(actual.output_speed(), expected.output_speed());
+        for index in [
+            SpecialCodeIndex::VINTR,
+            SpecialCodeIndex::VQUIT,
+            SpecialCodeIndex::VERASE,
+            SpecialCodeIndex::VKILL,
+            SpecialCodeIndex::VEOF,
+            SpecialCodeIndex::VTIME,
+            SpecialCodeIndex::VMIN,
+            SpecialCodeIndex::VSTART,
+            SpecialCodeIndex::VSTOP,
+            SpecialCodeIndex::VSUSP,
+            SpecialCodeIndex::VEOL,
+            SpecialCodeIndex::VEOL2,
+        ] {
+            assert_eq!(actual.special_codes[index], expected.special_codes[index]);
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(actual.line_discipline, expected.line_discipline);
     }
 
     fn open_test_pty() -> io::Result<(File, File, CString, Termios)> {
@@ -611,6 +633,61 @@ mod pty {
             slave_name,
             initial,
         ))
+    }
+
+    struct RawModeGuard;
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+
+    fn exercise_nested_raw_rejection(path: &Path) {
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .unwrap();
+        let initial = termios::tcgetattr(&terminal).unwrap();
+        enable_raw_mode().unwrap();
+        let guard = RawModeGuard;
+        assert!(is_raw_mode_enabled().unwrap());
+        let owned = termios::tcgetattr(&terminal).unwrap();
+
+        let error = tut::run([path.as_os_str().to_owned()]).unwrap_err();
+
+        assert!(matches!(error, tut::TutError::TerminalInUse));
+        assert!(is_raw_mode_enabled().unwrap());
+        let after = termios::tcgetattr(&terminal).unwrap();
+        assert_terminal_configuration(&after, &owned);
+        drop(guard);
+        assert!(!is_raw_mode_enabled().unwrap());
+        let restored = termios::tcgetattr(&terminal).unwrap();
+        assert_terminal_configuration(&restored, &initial);
+    }
+
+    #[test]
+    fn nested_crossterm_raw_owner_is_preserved() {
+        if let Some(path) = std::env::var_os(NESTED_RAW_HELPER) {
+            exercise_nested_raw_rejection(Path::new(&path));
+            return;
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "host-owned terminal\n").unwrap();
+        let mut pty = PtyChild::spawn_nested_raw_helper(file.path()).unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        for sequence in [ENTER_ALT, LEAVE_ALT, HIDE_CURSOR, SHOW_CURSOR] {
+            assert!(
+                !pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
     }
 
     #[test]
