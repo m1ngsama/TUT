@@ -105,6 +105,7 @@ pub enum RunOutcome {
 pub enum TutError {
     Invocation(InvocationError),
     Load(LoadError),
+    Busy,
     NotATerminal,
     TerminalTooLarge {
         columns: u16,
@@ -127,6 +128,14 @@ pub enum TutError {
         restoration: Box<Self>,
     },
     SignalAndRestoration {
+        signal: ExternalSignal,
+        restoration: Box<Self>,
+    },
+    PrimaryAndSignalHandlerRestoration {
+        primary: Box<Self>,
+        restoration: Box<Self>,
+    },
+    SignalAndSignalHandlerRestoration {
         signal: ExternalSignal,
         restoration: Box<Self>,
     },
@@ -176,6 +185,7 @@ impl TutError {
                 }
             },
             Self::Load(error) => load_message(error),
+            Self::Busy => "another TUT session is active in this process".to_owned(),
             Self::NotATerminal => {
                 "interactive reading requires terminal input and output".to_owned()
             }
@@ -232,6 +242,22 @@ impl TutError {
                 restoration,
             } => format!(
                 "interrupted by {}; terminal restoration failed: {}",
+                signal.name(),
+                restoration.message()
+            ),
+            Self::PrimaryAndSignalHandlerRestoration {
+                primary,
+                restoration,
+            } => format!(
+                "{}; signal-handler restoration failed: {}",
+                primary.message(),
+                restoration.message()
+            ),
+            Self::SignalAndSignalHandlerRestoration {
+                signal,
+                restoration,
+            } => format!(
+                "interrupted by {}; signal-handler restoration failed: {}",
                 signal.name(),
                 restoration.message()
             ),
@@ -378,6 +404,10 @@ impl Error for TutError {
             | Self::Io { source, .. } => Some(source),
             Self::PrimaryAndRestoration { primary, .. } => Some(primary.as_ref()),
             Self::SignalAndRestoration { restoration, .. } => Some(restoration.as_ref()),
+            Self::PrimaryAndSignalHandlerRestoration { primary, .. } => Some(primary.as_ref()),
+            Self::SignalAndSignalHandlerRestoration { restoration, .. } => {
+                Some(restoration.as_ref())
+            }
             Self::PrimaryAndLog { primary, .. } => Some(primary.as_ref()),
             Self::SignalAndLog { logging, .. } => Some(logging.as_ref()),
             _ => None,
@@ -436,6 +466,14 @@ mod tests {
         assert_eq!(invocation.message(), "missing file operand");
         assert_eq!(invocation.exit_code(), 2);
         assert!(invocation.show_usage());
+
+        let busy = TutError::Busy;
+        assert_eq!(
+            busy.message(),
+            "another TUT session is active in this process"
+        );
+        assert_eq!(busy.exit_code(), 1);
+        assert!(!busy.show_usage());
 
         let invalid = TutError::Load(LoadError::InvalidUtf8 {
             path: PathBuf::from("bad\n.txt"),

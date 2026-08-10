@@ -166,6 +166,46 @@ mod pty {
     const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
     const TIMEOUT: Duration = Duration::from_secs(5);
 
+    fn reset_signal_state() -> io::Result<()> {
+        // SAFETY: sigaction is fully initialized before each synchronous libc call.
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = libc::SIG_DFL;
+        // SAFETY: sa_mask points to writable storage within action.
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+            // SAFETY: action is initialized and the signal is supported on both test targets.
+            if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        // SAFETY: sigset_t is initialized before it is passed to libc.
+        let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: signals points to writable sigset_t storage.
+        if unsafe { libc::sigemptyset(&mut signals) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for signal in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGTSTP,
+            libc::SIGCONT,
+        ] {
+            // SAFETY: signals remains initialized and each signal is supported on both targets.
+            if unsafe { libc::sigaddset(&mut signals, signal) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        // SAFETY: signals is initialized and the null output pointer requests no prior mask.
+        if unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Copy)]
     enum TestInput<'a> {
         Path(&'a Path),
@@ -235,6 +275,7 @@ mod pty {
             // The child setup uses only async-signal-safe descriptor and session operations.
             unsafe {
                 command.pre_exec(move || {
+                    reset_signal_state()?;
                     setsid().map_err(io::Error::from)?;
                     let controlling =
                         fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
@@ -300,6 +341,7 @@ mod pty {
             // The child setup uses only async-signal-safe descriptor and session operations.
             unsafe {
                 command.pre_exec(move || {
+                    reset_signal_state()?;
                     setsid().map_err(io::Error::from)?;
                     if acquire_controlling_terminal {
                         let controlling =
@@ -796,7 +838,7 @@ mod pty {
         thread::sleep(Duration::from_millis(50));
         pty.signal(Signal::TERM).unwrap();
         let status = pty.wait().unwrap();
-        assert_eq!(status.signal(), Some(signal_hook::consts::signal::SIGTERM));
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
         assert!(pty.stderr_output.is_empty());
         for sequence in [ENTER_ALT, HIDE_CURSOR] {
             assert!(
@@ -912,6 +954,50 @@ mod pty {
         pty.assert_restored();
         let log = std::fs::read_to_string(log).unwrap();
         assert!(log.ends_with(" terminal_sessions=2 suspensions=1\n"));
+    }
+
+    #[test]
+    fn stopped_reader_uses_inherited_default_termination_actions() {
+        let input = NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), "STOPPED_SIGNAL_SENTINEL\n").unwrap();
+
+        for signal in [Signal::HUP, Signal::INT, Signal::QUIT, Signal::TERM] {
+            let mut pty = PtyChild::spawn(input.path()).unwrap();
+            pty.wait_for(b"STOPPED_SIGNAL_SENTINEL").unwrap();
+
+            let suspension_start = pty.output.len();
+            pty.signal(Signal::TSTP).unwrap();
+            pty.wait_until_stopped().unwrap();
+            pty.wait_for_after(suspension_start, SHOW_CURSOR).unwrap();
+            pty.wait_for_after(suspension_start, LEAVE_ALT).unwrap();
+            pty.assert_restored();
+
+            pty.signal(signal).unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                thread::sleep(Duration::from_millis(50));
+                assert!(
+                    pty.child.try_wait().unwrap().is_none(),
+                    "a fatal signal must remain pending while Linux holds the group-stop"
+                );
+                pty.pump().unwrap();
+                assert!(
+                    !pty.output[suspension_start..]
+                        .windows(ENTER_ALT.len())
+                        .any(|window| window == ENTER_ALT)
+                );
+                pty.signal(Signal::CONT).unwrap();
+            }
+            let status = pty.wait().unwrap();
+            assert_eq!(status.signal(), Some(signal.as_raw()));
+            assert!(pty.stderr_output.is_empty());
+            assert!(
+                !pty.output[suspension_start..]
+                    .windows(ENTER_ALT.len())
+                    .any(|window| window == ENTER_ALT)
+            );
+            pty.assert_restored();
+        }
     }
 
     #[test]
