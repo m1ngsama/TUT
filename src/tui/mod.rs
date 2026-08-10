@@ -147,9 +147,11 @@ impl SignalState {
     }
 }
 
+const SIGNAL_HANDLER_COUNT: usize = 6;
+
 pub(super) struct SignalHandlers {
     state: SignalState,
-    ids: Vec<SigId>,
+    ids: [Option<SigId>; SIGNAL_HANDLER_COUNT],
 }
 
 impl SignalHandlers {
@@ -157,7 +159,8 @@ impl SignalHandlers {
         use signal_hook::consts::signal::{SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP};
 
         let state = SignalState::empty();
-        let mut ids = Vec::new();
+        let mut ids = [None; SIGNAL_HANDLER_COUNT];
+        let mut registered = 0;
         for (signal, value) in [
             (SIGHUP, SIGHUP as usize),
             (SIGINT, SIGINT as usize),
@@ -177,11 +180,12 @@ impl SignalHandlers {
                 })
             };
             match registration {
-                Ok(id) => ids.push(id),
+                Ok(id) => {
+                    ids[registered] = Some(id);
+                    registered += 1;
+                }
                 Err(error) => {
-                    for id in ids {
-                        low_level::unregister(id);
-                    }
+                    Self::unregister(&mut ids);
                     return Err(error);
                 }
             }
@@ -195,28 +199,34 @@ impl SignalHandlers {
                 })
             };
             match registration {
-                Ok(id) => ids.push(id),
+                Ok(id) => {
+                    ids[registered] = Some(id);
+                    registered += 1;
+                }
                 Err(error) => {
-                    for id in ids {
-                        low_level::unregister(id);
-                    }
+                    Self::unregister(&mut ids);
                     return Err(error);
                 }
             }
         }
+        debug_assert_eq!(registered, SIGNAL_HANDLER_COUNT);
         Ok(Self { state, ids })
     }
 
     pub(super) fn state(&self) -> &SignalState {
         &self.state
     }
+
+    fn unregister(ids: &mut [Option<SigId>; SIGNAL_HANDLER_COUNT]) {
+        for id in ids.iter_mut().filter_map(Option::take) {
+            low_level::unregister(id);
+        }
+    }
 }
 
 impl Drop for SignalHandlers {
     fn drop(&mut self) {
-        for id in self.ids.drain(..) {
-            low_level::unregister(id);
-        }
+        Self::unregister(&mut self.ids);
     }
 }
 
