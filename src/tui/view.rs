@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     app::{
-        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, RenderProjectionKind, RenderRow,
+        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, RenderProjectionKind, RenderRows,
         RenderSpan, RenderState, SearchStatus,
     },
     error::{TutError, sanitize_text},
@@ -48,12 +48,12 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(
     Ok(())
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, rows: &[RenderRow]) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, rows: &RenderRows) {
     frame.render_widget(ReaderBody { rows }, area);
 }
 
 struct ReaderBody<'a> {
-    rows: &'a [RenderRow],
+    rows: &'a RenderRows,
 }
 
 impl Widget for ReaderBody<'_> {
@@ -62,13 +62,13 @@ impl Widget for ReaderBody<'_> {
             let y =
                 area.y + u16::try_from(relative_y).expect("visible row count fits terminal height");
             let mut x = area.x;
-            for span in &row.spans {
+            for span in row.spans {
                 let width = u16::try_from(span.cell_width.get())
                     .expect("projected width fits the terminal width");
                 if width > area.right().saturating_sub(x) {
                     break;
                 }
-                x += write_render_span(buffer, x, y, &row.text, span);
+                x += write_render_span(buffer, x, y, row.text, span);
             }
         }
     }
@@ -102,10 +102,11 @@ fn write_render_span(buffer: &mut Buffer, x: u16, y: u16, row: &str, span: &Rend
         .set_style(style)
         .set_diff_option(CellDiffOption::ForcedWidth(forced_width));
     for offset in 1..width {
-        buffer
+        let cell = buffer
             .cell_mut((x + offset, y))
-            .expect("span was clipped to the buffer area")
-            .reset();
+            .expect("span was clipped to the buffer area");
+        cell.reset();
+        cell.set_diff_option(CellDiffOption::Skip);
     }
     width
 }
@@ -331,6 +332,14 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn body_buffer(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        let state = app.render_state().unwrap();
+        ReaderBody { rows: &state.rows }.render(area, &mut buffer);
+        buffer
+    }
+
     fn row_text(buffer: &Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .map(|column| buffer.cell((column, row)).unwrap().symbol())
@@ -361,14 +370,31 @@ mod tests {
         app.advance_background().unwrap();
         let buffer = draw(&mut app, 20, 4);
         let first = buffer.cell((0, 1)).unwrap();
-        assert_eq!(first.symbol(), "ｶﾞ");
+        assert_eq!(first.symbol(), "ｶﾞ ");
         assert_eq!(
             first.diff_option,
-            CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap())
+            CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap())
         );
         let current = buffer.cell((2, 1)).unwrap();
         assert!(current.modifier.contains(Modifier::REVERSED));
         assert!(current.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn compacted_spans_clear_cells_when_the_next_frame_is_shorter() {
+        let mut long = app_from_text(Path::new("/tmp/book.txt"), "abcdef".to_owned());
+        long.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+        let previous = body_buffer(&mut long, 20, 1);
+
+        let mut short = app_from_text(Path::new("/tmp/book.txt"), "a".to_owned());
+        short.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+        let next = body_buffer(&mut short, 20, 1);
+        let body_updates: Vec<_> = previous
+            .diff_iter(&next)
+            .filter_map(|(x, y, _)| (y == 0).then_some(x))
+            .collect();
+
+        assert_eq!(body_updates, (0..6).collect::<Vec<_>>());
     }
 
     #[test]
@@ -390,7 +416,7 @@ mod tests {
         let state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
-            rows: Vec::new(),
+            rows: RenderRows::default(),
             progress: 12,
             current_line: Some(7),
             total_lines: None,

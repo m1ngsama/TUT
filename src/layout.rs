@@ -1,4 +1,4 @@
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroUsize};
 
 #[cfg(test)]
 use std::ops::Range;
@@ -296,8 +296,37 @@ pub(super) struct ViewportLayout {
     source_end: SourceOffset,
 }
 
+pub(super) trait ProjectedRowSink {
+    type Checkpoint: Copy;
+
+    fn checkpoint(&self) -> Self::Checkpoint;
+    fn push(&mut self, atom: ProjectedAtom<'_>) -> Result<(), TutError>;
+    fn finish_row(&mut self, through: Self::Checkpoint, carry_tail: bool) -> Result<(), TutError>;
+}
+
 impl ViewportLayout {
-    pub(super) fn visit_projected_row<F>(
+    pub(super) fn project_visible_rows<S>(
+        &self,
+        reader: &mut DocumentReader<'_>,
+        start: SourceOffset,
+        sink: &mut S,
+    ) -> Result<(usize, SourceOffset), TutError>
+    where
+        S: ProjectedRowSink,
+    {
+        self.require_visible_start(reader, start)?;
+        let extent = scan_projected_rows(
+            reader,
+            start,
+            self.width,
+            NonZeroUsize::new(usize::from(self.height.get())).expect("body heights are nonzero"),
+            sink,
+        )?;
+        Ok((extent.rows, extent.boundary.end))
+    }
+
+    #[cfg(test)]
+    fn visit_projected_row<F>(
         &self,
         reader: &mut DocumentReader<'_>,
         start: SourceOffset,
@@ -306,7 +335,7 @@ impl ViewportLayout {
     where
         F: FnMut(ProjectedAtom<'_>) -> Result<(), TutError>,
     {
-        let boundary = self.row_boundary(reader, start)?;
+        let boundary = reference_visual_row_boundary(reader, start, self.width)?;
         let mut graphemes = reader.graphemes(start)?;
         let mut column = DisplayColumn::ZERO;
         while let Some(grapheme) = graphemes.next_grapheme()? {
@@ -373,28 +402,17 @@ impl ViewportLayout {
         reader: &mut DocumentReader<'_>,
         top: SourceOffset,
     ) -> Result<(usize, SourceOffset), TutError> {
-        self.require_matching_source(reader)?;
-        if top < self.source_start || top > self.source_end {
-            return Err(LayoutError::NonIncreasingRowStart {
-                previous: self.source_start.get(),
-                next: top.get(),
-            }
-            .into());
-        }
+        self.require_visible_start(reader, top)?;
 
-        let mut start = top;
-        let mut visible_rows = 0;
-        let mut visible_end = top;
-        while visible_rows < usize::from(self.height.get()) {
-            let boundary = self.row_boundary(reader, start)?;
-            visible_rows += 1;
-            visible_end = boundary.end;
-            let Some(next) = boundary.next else {
-                break;
-            };
-            start = next;
-        }
-        Ok((visible_rows, visible_end))
+        let mut sink = DiscardProjectedRows;
+        let extent = scan_projected_rows(
+            reader,
+            top,
+            self.width,
+            NonZeroUsize::new(usize::from(self.height.get())).expect("body heights are nonzero"),
+            &mut sink,
+        )?;
+        Ok((extent.rows, extent.boundary.end))
     }
 
     #[cfg(test)]
@@ -404,15 +422,15 @@ impl ViewportLayout {
         top: SourceOffset,
     ) -> Result<bool, TutError> {
         self.require_matching_source(reader)?;
-        let mut start = top;
-        for _ in 0..usize::from(self.height.get()) {
-            let boundary = self.row_boundary(reader, start)?;
-            let Some(next) = boundary.next else {
-                return Ok(true);
-            };
-            start = next;
-        }
-        Ok(false)
+        let mut sink = DiscardProjectedRows;
+        let extent = scan_projected_rows(
+            reader,
+            top,
+            self.width,
+            NonZeroUsize::new(usize::from(self.height.get())).expect("body heights are nonzero"),
+            &mut sink,
+        )?;
+        Ok(extent.boundary.next.is_none())
     }
 
     #[cfg(test)]
@@ -483,12 +501,61 @@ impl ViewportLayout {
             .into())
         }
     }
+
+    fn require_visible_start(
+        &self,
+        reader: &DocumentReader<'_>,
+        start: SourceOffset,
+    ) -> Result<(), TutError> {
+        self.require_matching_source(reader)?;
+        if start >= self.source_start && start <= self.source_end {
+            return Ok(());
+        }
+        Err(LayoutError::NonIncreasingRowStart {
+            previous: self.source_start.get(),
+            next: start.get(),
+        }
+        .into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VisualRowBoundary {
     end: SourceOffset,
     next: Option<SourceOffset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectedRowsExtent {
+    rows: usize,
+    boundary: VisualRowBoundary,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SoftWrap<C> {
+    source_end: SourceOffset,
+    checkpoint: C,
+    column_after: DisplayColumn,
+}
+
+struct DiscardProjectedRows;
+
+impl ProjectedRowSink for DiscardProjectedRows {
+    type Checkpoint = ();
+
+    fn checkpoint(&self) -> Self::Checkpoint {}
+
+    fn push(&mut self, _atom: ProjectedAtom<'_>) -> Result<(), TutError> {
+        Ok(())
+    }
+
+    fn finish_row(
+        &mut self,
+        _through: Self::Checkpoint,
+        _carry_tail: bool,
+    ) -> Result<(), TutError> {
+        Ok(())
+    }
 }
 
 pub(super) fn rebuild_viewport_layout(
@@ -545,12 +612,125 @@ fn visual_row_boundary(
     start: SourceOffset,
     width: ContentWidth,
 ) -> Result<VisualRowBoundary, TutError> {
+    let mut sink = DiscardProjectedRows;
+    Ok(scan_projected_rows(
+        reader,
+        start,
+        width,
+        NonZeroUsize::new(1).expect("one is nonzero"),
+        &mut sink,
+    )?
+    .boundary)
+}
+
+fn scan_projected_rows<S>(
+    reader: &mut DocumentReader<'_>,
+    start: SourceOffset,
+    width: ContentWidth,
+    row_limit: NonZeroUsize,
+    sink: &mut S,
+) -> Result<ProjectedRowsExtent, TutError>
+where
+    S: ProjectedRowSink,
+{
     let source_end = reader.source_end();
     let mut graphemes = reader.graphemes(start)?;
+    let mut column = DisplayColumn::ZERO;
+    let mut soft_wrap = None;
+    let mut rows = 0;
 
+    loop {
+        let Some(grapheme) = graphemes.next_grapheme()? else {
+            let checkpoint = sink.checkpoint();
+            sink.finish_row(checkpoint, false)?;
+            return Ok(ProjectedRowsExtent {
+                rows: rows + 1,
+                boundary: VisualRowBoundary {
+                    end: source_end,
+                    next: None,
+                },
+            });
+        };
+        let atom = DisplayAtom::from_grapheme(grapheme);
+        if atom.kind() == DisplayAtomKind::LineFeed {
+            let checkpoint = sink.checkpoint();
+            sink.finish_row(checkpoint, false)?;
+            rows += 1;
+            let boundary = VisualRowBoundary {
+                end: atom.source().end(),
+                next: Some(atom.source().end()),
+            };
+            if rows == row_limit.get() {
+                return Ok(ProjectedRowsExtent { rows, boundary });
+            }
+            column = DisplayColumn::ZERO;
+            soft_wrap = None;
+            continue;
+        }
+
+        loop {
+            let projected = atom
+                .project(column, width)
+                .expect("only line feeds have no projection");
+            if projected.fits_after(column, width) {
+                column = column.plus(projected.width());
+                sink.push(projected)?;
+                if atom.is_unicode_whitespace() {
+                    soft_wrap = Some(SoftWrap {
+                        source_end: atom.source().end(),
+                        checkpoint: sink.checkpoint(),
+                        column_after: column,
+                    });
+                }
+                break;
+            }
+
+            if let Some(saved) = soft_wrap.take() {
+                let boundary = VisualRowBoundary {
+                    end: saved.source_end,
+                    next: Some(saved.source_end),
+                };
+                let carry_tail = rows + 1 < row_limit.get();
+                sink.finish_row(saved.checkpoint, carry_tail)?;
+                rows += 1;
+                if rows == row_limit.get() {
+                    return Ok(ProjectedRowsExtent { rows, boundary });
+                }
+                column = DisplayColumn::new(
+                    column
+                        .get()
+                        .checked_sub(saved.column_after.get())
+                        .expect("soft-wrap suffix widths remain nonnegative"),
+                );
+            } else {
+                let boundary = VisualRowBoundary {
+                    end: atom.source().start(),
+                    next: Some(atom.source().start()),
+                };
+                let checkpoint = sink.checkpoint();
+                sink.finish_row(checkpoint, false)?;
+                rows += 1;
+                if rows == row_limit.get() {
+                    return Ok(ProjectedRowsExtent { rows, boundary });
+                }
+                column = DisplayColumn::ZERO;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn reference_visual_row_boundary(
+    reader: &mut DocumentReader<'_>,
+    start: SourceOffset,
+    width: ContentWidth,
+) -> Result<VisualRowBoundary, TutError> {
+    let source_end = reader.source_end();
+    let mut graphemes = reader.graphemes(start)?;
     let mut column = DisplayColumn::ZERO;
     let mut consumed = false;
     let mut last_whitespace = None;
+
     while let Some(grapheme) = graphemes.next_grapheme()? {
         let atom = DisplayAtom::from_grapheme(grapheme);
         if atom.kind() == DisplayAtomKind::LineFeed {
@@ -559,7 +739,6 @@ fn visual_row_boundary(
                 next: Some(atom.source().end()),
             });
         }
-
         let projected = atom
             .project(column, width)
             .expect("only line feeds have no projection");
@@ -632,6 +811,106 @@ mod tests {
     struct Fixture {
         document: Document,
         cache: DocumentCache,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum OwnedProjection {
+        Text(String),
+        Spaces(u8),
+        Replacement,
+        DottedCircle(String),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct OwnedProjectedAtom {
+        source: GraphemeRange,
+        width: DisplayColumn,
+        projection: OwnedProjection,
+    }
+
+    impl OwnedProjectedAtom {
+        fn from_projected(atom: ProjectedAtom<'_>) -> Self {
+            let projection = match atom.projection() {
+                DisplayProjection::Text(text) => OwnedProjection::Text(text.to_owned()),
+                DisplayProjection::Spaces(count) => OwnedProjection::Spaces(count),
+                DisplayProjection::Replacement => OwnedProjection::Replacement,
+                DisplayProjection::DottedCircle(source) => {
+                    OwnedProjection::DottedCircle(source.to_owned())
+                }
+            };
+            Self {
+                source: atom.source(),
+                width: atom.width(),
+                projection,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectedRows {
+        atoms: Vec<OwnedProjectedAtom>,
+        rows: Vec<Range<usize>>,
+        row_start: usize,
+    }
+
+    impl ProjectedRowSink for CollectedRows {
+        type Checkpoint = usize;
+
+        fn checkpoint(&self) -> Self::Checkpoint {
+            self.atoms.len()
+        }
+
+        fn push(&mut self, atom: ProjectedAtom<'_>) -> Result<(), TutError> {
+            self.atoms.push(OwnedProjectedAtom::from_projected(atom));
+            Ok(())
+        }
+
+        fn finish_row(
+            &mut self,
+            through: Self::Checkpoint,
+            carry_tail: bool,
+        ) -> Result<(), TutError> {
+            if !carry_tail {
+                self.atoms.truncate(through);
+            }
+            self.rows.push(self.row_start..through);
+            self.row_start = through;
+            Ok(())
+        }
+    }
+
+    impl CollectedRows {
+        fn owned_rows(&self) -> Vec<Vec<OwnedProjectedAtom>> {
+            self.rows
+                .iter()
+                .map(|row| self.atoms[row.clone()].to_vec())
+                .collect()
+        }
+
+        fn text_rows(&self) -> Vec<String> {
+            self.rows
+                .iter()
+                .map(|row| {
+                    let mut text = String::new();
+                    for atom in &self.atoms[row.clone()] {
+                        match &atom.projection {
+                            OwnedProjection::Text(source) => text.push_str(source),
+                            OwnedProjection::Spaces(count) => {
+                                text.extend(std::iter::repeat_n(' ', usize::from(*count)));
+                            }
+                            OwnedProjection::Replacement => {
+                                text.push_str(REPLACEMENT_CHARACTER);
+                            }
+                            OwnedProjection::DottedCircle(source) => {
+                                text.push_str(DOTTED_CIRCLE);
+                                text.push_str(source);
+                            }
+                        }
+                    }
+                    text
+                })
+                .collect()
+        }
     }
 
     impl Fixture {
@@ -724,6 +1003,108 @@ mod tests {
         assert_eq!(projected(&mut fixture, &layout, 0)[3].0, " ");
         assert!(projected(&mut fixture, &layout, 2).is_empty());
         assert!(projected(&mut fixture, &layout, 4).is_empty());
+    }
+
+    #[test]
+    fn single_pass_wrapping_carries_only_the_provisional_suffix() {
+        let mut fixture = Fixture::new("a bcdef");
+        let layout = fixture.layout(4, 3);
+        let mut rows = CollectedRows::default();
+        let mut reader = fixture.document.reader(&mut fixture.cache);
+        let extent = layout
+            .project_visible_rows(&mut reader, SourceOffset::ZERO, &mut rows)
+            .unwrap();
+
+        assert_eq!(extent, (3, SourceOffset::new(7)));
+        assert_eq!(rows.text_rows(), ["a ", "bcde", "f"]);
+
+        let layout = fixture.layout(4, 1);
+        let mut rows = CollectedRows::default();
+        let mut reader = fixture.document.reader(&mut fixture.cache);
+        let extent = layout
+            .project_visible_rows(&mut reader, SourceOffset::ZERO, &mut rows)
+            .unwrap();
+        assert_eq!(extent, (1, SourceOffset::new(2)));
+        assert_eq!(rows.text_rows(), ["a "]);
+
+        let mut fixture = Fixture::new("a bc\tz");
+        let layout = fixture.layout(4, 3);
+        let mut rows = CollectedRows::default();
+        let mut reader = fixture.document.reader(&mut fixture.cache);
+        layout
+            .project_visible_rows(&mut reader, SourceOffset::ZERO, &mut rows)
+            .unwrap();
+        assert_eq!(rows.text_rows(), ["a ", "bc  ", "z"]);
+
+        let start = SourceOffset::new(u64::from(u32::MAX) + 17);
+        let mut fixture = Fixture::at("a\r\nb", start);
+        let layout = fixture.layout(4, 1);
+        let mut rows = CollectedRows::default();
+        let mut reader = fixture.document.reader(&mut fixture.cache);
+        let extent = layout
+            .project_visible_rows(&mut reader, start, &mut rows)
+            .unwrap();
+        assert_eq!(extent, (1, start.checked_add(3).unwrap()));
+        assert_eq!(rows.text_rows(), ["a"]);
+    }
+
+    #[test]
+    fn single_pass_rows_match_the_row_oracle_across_unicode_and_endings() {
+        let samples = [
+            "",
+            "\n",
+            "\n\n",
+            "a\r\nb\rc\n",
+            "a bcdef",
+            "a bc\tz",
+            "a\u{a0}bc def",
+            "a\u{001b}\u{0085}b",
+            "e\u{301}\u{200b}🙂 text\n",
+        ];
+
+        for text in samples {
+            for width in 1..=8 {
+                let mut fixture = Fixture::new(text);
+                let layout = fixture.layout(width, 64);
+                let mut starts = vec![fixture.document.source().start()];
+                loop {
+                    let mut reader = fixture.document.reader(&mut fixture.cache);
+                    let boundary = reference_visual_row_boundary(
+                        &mut reader,
+                        *starts.last().unwrap(),
+                        layout.width,
+                    )
+                    .unwrap();
+                    let Some(next) = boundary.next else {
+                        break;
+                    };
+                    starts.push(next);
+                }
+                let mut expected = Vec::new();
+                for start in starts {
+                    let mut row = Vec::new();
+                    let mut reader = fixture.document.reader(&mut fixture.cache);
+                    layout
+                        .visit_projected_row(&mut reader, start, |atom| {
+                            row.push(OwnedProjectedAtom::from_projected(atom));
+                            Ok(())
+                        })
+                        .unwrap();
+                    expected.push(row);
+                }
+
+                let mut actual = CollectedRows::default();
+                let mut reader = fixture.document.reader(&mut fixture.cache);
+                let source_start = reader.source_start();
+                let (row_count, visible_end) = layout
+                    .project_visible_rows(&mut reader, source_start, &mut actual)
+                    .unwrap();
+
+                assert_eq!(row_count, expected.len(), "{text:?}, width {width}");
+                assert_eq!(visible_end, reader.source_end(), "{text:?}, width {width}");
+                assert_eq!(actual.owned_rows(), expected, "{text:?}, width {width}");
+            }
+        }
     }
 
     #[test]

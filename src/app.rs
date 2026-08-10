@@ -3,12 +3,12 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    document::{Document, DocumentCache, DocumentReader},
+    document::{Document, DocumentCache},
     error::TutError,
     layout::{
         BodyHeight, ContentWidth, DOTTED_CIRCLE, DisplayColumn, DisplayProjection, GraphemeRange,
-        ProjectedAtom, REPLACEMENT_CHARACTER, ViewportLayout, ensure_viewport_layout,
-        progress_percent,
+        ProjectedAtom, ProjectedRowSink, REPLACEMENT_CHARACTER, ViewportLayout,
+        ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
     locator::{RowDelta, ViewportLocator},
@@ -131,6 +131,7 @@ pub(super) enum RenderProjectionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenderSpan {
     text: Range<usize>,
+    source: GraphemeRange,
     pub projection: RenderProjectionKind,
     pub cell_width: DisplayColumn,
     pub highlight: Highlight,
@@ -170,7 +171,7 @@ impl RenderSpan {
                     .checked_add(source.len())
                     .ok_or(TutError::Allocation("zero-width render atom"))?;
                 output
-                    .try_reserve_exact(additional)
+                    .try_reserve(additional)
                     .map_err(|_| TutError::Allocation("zero-width render atom"))?;
                 output.push_str(DOTTED_CIRCLE);
                 output.push_str(source);
@@ -180,6 +181,7 @@ impl RenderSpan {
 
         Ok(Self {
             text: start..output.len(),
+            source: atom.source(),
             projection,
             cell_width,
             highlight,
@@ -190,27 +192,106 @@ impl RenderSpan {
         row.get(self.text.clone())
             .expect("render spans retain valid row-text boundaries")
     }
+
+    fn merge(&mut self, next: &Self) -> bool {
+        if self.projection != next.projection
+            || self.highlight != next.highlight
+            || self.text.end != next.text.start
+            || self.source.end() != next.source.start()
+        {
+            return false;
+        }
+        let Some(width) = self.cell_width.get().checked_add(next.cell_width.get()) else {
+            return false;
+        };
+        self.text.end = next.text.end;
+        self.source = GraphemeRange::new(self.source.start(), next.source.end())
+            .expect("adjacent render spans retain a nonempty source range");
+        self.cell_width = DisplayColumn::new(width);
+        true
+    }
 }
 
 fn append_render_text(output: &mut String, text: &str) -> Result<(), TutError> {
     output
-        .try_reserve_exact(text.len())
+        .try_reserve(text.len())
         .map_err(|_| TutError::Allocation("visible row text"))?;
     output.push_str(text);
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RenderRow {
-    pub text: String,
-    pub spans: Vec<RenderSpan>,
+struct RenderRowRange {
+    text: Range<usize>,
+    spans: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct RenderRows {
+    text: String,
+    spans: Vec<RenderSpan>,
+    rows: Vec<RenderRowRange>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RenderRow<'a> {
+    pub text: &'a str,
+    pub spans: &'a [RenderSpan],
+}
+
+impl RenderRows {
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = RenderRow<'_>> + '_ {
+        self.rows.iter().map(|row| RenderRow {
+            text: self
+                .text
+                .get(row.text.clone())
+                .expect("render rows retain valid text boundaries"),
+            spans: self
+                .spans
+                .get(row.spans.clone())
+                .expect("render rows retain valid span boundaries"),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn get(&self, index: usize) -> Option<RenderRow<'_>> {
+        let row = self.rows.get(index)?;
+        Some(RenderRow {
+            text: self.text.get(row.text.clone())?,
+            spans: self.spans.get(row.spans.clone())?,
+        })
+    }
+
+    pub(super) const fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn apply_highlights(&mut self, ranges: &[SearchRange], current: Option<SearchRange>) {
+        let mut matches = MatchCursor::new(ranges, current);
+        let mut write = 0;
+        for row in &mut self.rows {
+            let source = row.spans.clone();
+            let row_start = write;
+            for read in source {
+                let mut span = self.spans[read].clone();
+                span.highlight = matches.role_for(span.source);
+                if write > row_start && self.spans[write - 1].merge(&span) {
+                    continue;
+                }
+                self.spans[write] = span;
+                write += 1;
+            }
+            row.spans = row_start..write;
+        }
+        self.spans.truncate(write);
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct RenderState<'a> {
     pub filename: &'a str,
     pub path: &'a str,
-    pub rows: Vec<RenderRow>,
+    pub rows: RenderRows,
     pub progress: u8,
     pub current_line: Option<u64>,
     pub total_lines: Option<u64>,
@@ -384,11 +465,19 @@ impl App {
     }
 
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
-        let viewport = self.viewport()?;
+        let (viewport, mut rows) = self.build_render_viewport()?;
         self.prepare_search_highlights(viewport);
         let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
-        let rows = self.build_render_rows(viewport)?;
+        if let Some(viewport) = viewport {
+            let visible = viewport.first_visible_start..viewport.visible_end;
+            let ranges = self
+                .highlights
+                .as_ref()
+                .filter(|highlights| highlights.covers(&visible))
+                .map_or(&[][..], SearchHighlights::ranges);
+            rows.apply_highlights(ranges, self.current_match);
+        }
         Ok(RenderState {
             filename: self.document.display_name(),
             path: self.document.display_path(),
@@ -926,58 +1015,109 @@ impl App {
         changed
     }
 
-    fn build_render_rows(
-        &mut self,
-        viewport: Option<Viewport>,
-    ) -> Result<Vec<RenderRow>, TutError> {
-        let Some(viewport) = viewport else {
-            return Ok(Vec::new());
+    fn build_render_viewport(&mut self) -> Result<(Option<Viewport>, RenderRows), TutError> {
+        let Some(row_capacity) = self.geometry.body_height().map(BodyHeight::get) else {
+            return Ok((None, RenderRows::default()));
         };
         let layout = self.layout.as_ref().expect("viewport has a layout");
-        let visible = viewport.first_visible_start..viewport.visible_end;
-        let ranges = self
-            .highlights
-            .as_ref()
-            .filter(|highlights| highlights.covers(&visible))
-            .map_or(&[][..], SearchHighlights::ranges);
-        let mut matches = MatchCursor::new(ranges, self.current_match);
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(viewport.visible_rows)
-            .map_err(|_| TutError::Allocation("visible rows"))?;
-
-        let mut start = viewport.first_visible_start;
+        let mut rows = RenderRowsBuilder::new(usize::from(row_capacity))?;
         let mut reader = self.document.reader(&mut self.document_cache);
-        for row_number in 0..viewport.visible_rows {
-            let (row, next) = build_render_row(layout, &mut reader, start, &mut matches)?;
-            rows.push(row);
-            if row_number + 1 < viewport.visible_rows {
-                start = next.expect("non-final visible rows have successors");
-            }
-        }
-        Ok(rows)
+        let (visible_rows, visible_end) =
+            layout.project_visible_rows(&mut reader, self.anchor, &mut rows)?;
+        let rows = rows.finish();
+        debug_assert_eq!(rows.len(), visible_rows);
+        Ok((
+            Some(Viewport {
+                visible_rows,
+                first_visible_start: self.anchor,
+                visible_end,
+            }),
+            rows,
+        ))
     }
 }
 
-fn build_render_row(
-    layout: &ViewportLayout,
-    reader: &mut DocumentReader<'_>,
-    start: SourceOffset,
-    matches: &mut MatchCursor<'_>,
-) -> Result<(RenderRow, Option<SourceOffset>), TutError> {
-    let mut text = String::new();
-    let mut spans = Vec::new();
-    let next = layout.visit_projected_row(reader, start, |atom| {
-        let highlight = matches.role_for(atom.source());
-        if spans.len() == spans.capacity() {
-            spans
+#[derive(Debug, Clone, Copy)]
+struct RenderRowsCheckpoint {
+    text: usize,
+    spans: usize,
+}
+
+struct RenderRowsBuilder {
+    text: String,
+    spans: Vec<RenderSpan>,
+    rows: Vec<RenderRowRange>,
+    row_start: RenderRowsCheckpoint,
+}
+
+impl RenderRowsBuilder {
+    fn new(row_capacity: usize) -> Result<Self, TutError> {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(row_capacity)
+            .map_err(|_| TutError::Allocation("visible rows"))?;
+        Ok(Self {
+            text: String::new(),
+            spans: Vec::new(),
+            rows,
+            row_start: RenderRowsCheckpoint { text: 0, spans: 0 },
+        })
+    }
+
+    fn finish(self) -> RenderRows {
+        debug_assert_eq!(self.row_start.text, self.text.len());
+        debug_assert_eq!(self.row_start.spans, self.spans.len());
+        RenderRows {
+            text: self.text,
+            spans: self.spans,
+            rows: self.rows,
+        }
+    }
+}
+
+impl ProjectedRowSink for RenderRowsBuilder {
+    type Checkpoint = RenderRowsCheckpoint;
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        RenderRowsCheckpoint {
+            text: self.text.len(),
+            spans: self.spans.len(),
+        }
+    }
+
+    fn push(&mut self, atom: ProjectedAtom<'_>) -> Result<(), TutError> {
+        if self.spans.len() == self.spans.capacity() {
+            self.spans
                 .try_reserve(1)
                 .map_err(|_| TutError::Allocation("visible row spans"))?;
         }
-        let span = RenderSpan::from_projected(atom, highlight, &mut text)?;
-        spans.push(span);
+        let span = RenderSpan::from_projected(atom, Highlight::None, &mut self.text)?;
+        self.spans.push(span);
         Ok(())
-    })?;
-    Ok((RenderRow { text, spans }, next))
+    }
+
+    fn finish_row(&mut self, through: Self::Checkpoint, carry_tail: bool) -> Result<(), TutError> {
+        debug_assert!(through.text >= self.row_start.text && through.text <= self.text.len());
+        debug_assert!(through.spans >= self.row_start.spans && through.spans <= self.spans.len());
+        if !carry_tail {
+            self.text.truncate(through.text);
+            self.spans.truncate(through.spans);
+        }
+        for span in &mut self.spans[self.row_start.spans..through.spans] {
+            span.text.start -= self.row_start.text;
+            span.text.end -= self.row_start.text;
+        }
+        if self.rows.len() == self.rows.capacity() {
+            self.rows
+                .try_reserve(1)
+                .map_err(|_| TutError::Allocation("visible rows"))?;
+        }
+        self.rows.push(RenderRowRange {
+            text: self.row_start.text..through.text,
+            spans: self.row_start.spans..through.spans,
+        });
+        self.row_start = through;
+        Ok(())
+    }
 }
 
 struct MatchCursor<'a> {
@@ -1599,14 +1739,57 @@ mod tests {
         commit(&mut app, "cat");
         {
             let state = app.render_state().unwrap();
-            assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
-            assert_eq!(state.rows[0].spans[4].highlight, Highlight::None);
+            let row = state.rows.get(0).unwrap();
+            assert_eq!(row.spans[0].highlight, Highlight::Current);
+            assert_eq!(row.spans[0].text(row.text), "cat");
+            assert_eq!(row.spans[1].highlight, Highlight::None);
+            assert_eq!(row.spans[1].text(row.text), " cat");
         }
         settle(&mut app);
         let state = app.render_state().unwrap();
-        assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
-        assert_eq!(state.rows[0].spans[4].highlight, Highlight::Match);
-        assert_eq!(state.rows[0].spans[0].text(&state.rows[0].text), "c");
+        let row = state.rows.get(0).unwrap();
+        assert_eq!(row.spans[0].highlight, Highlight::Current);
+        assert_eq!(row.spans[0].text(row.text), "cat");
+        assert_eq!(row.spans[2].highlight, Highlight::Match);
+        assert_eq!(row.spans[2].text(row.text), "cat");
+    }
+
+    #[test]
+    fn rendering_segments_each_visible_grapheme_once() {
+        let mut app = reader("a\nb\nc\nd\ne\noutside\n", 16, 8);
+        app.document_cache = DocumentCache::default();
+        app.document_cache.reset_metrics();
+
+        {
+            let state = app.render_state().unwrap();
+            assert_eq!(state.rows.len(), 5);
+            assert!(state.rows.iter().all(|row| row.spans.len() <= 1));
+        }
+
+        let metrics = app.document_cache.metrics();
+        assert_eq!(metrics.grapheme_emissions(), 10);
+        assert_eq!(metrics.segmentation_runs(), 10);
+    }
+
+    #[test]
+    fn rendering_reads_one_grapheme_frontier_and_compacts_ascii_spans() {
+        let mut app = reader(&"x".repeat(1024), 127, 4);
+        app.document_cache = DocumentCache::with_window_bytes(128);
+        app.document_cache.reset_metrics();
+
+        {
+            let state = app.render_state().unwrap();
+            let row = state.rows.get(0).unwrap();
+            assert_eq!(row.text.len(), 127);
+            assert_eq!(row.spans.len(), 1);
+            assert_eq!(row.spans[0].cell_width, DisplayColumn::new(127));
+        }
+
+        let metrics = app.document_cache.metrics();
+        assert_eq!(metrics.grapheme_window_calls(), 2);
+        assert_eq!(metrics.grapheme_window_returned_bytes(), 256);
+        assert_eq!(metrics.grapheme_emissions(), 128);
+        assert_eq!(metrics.segmentation_runs(), 129);
     }
 
     #[test]
@@ -1639,7 +1822,7 @@ mod tests {
         commit(&mut app, "cat");
         assert_eq!(app.current_match.unwrap().start(), SourceOffset::new(6));
         assert_eq!(
-            app.render_state().unwrap().rows[1].spans[0].highlight,
+            app.render_state().unwrap().rows.get(1).unwrap().spans[0].highlight,
             Highlight::Current
         );
 
@@ -1790,9 +1973,9 @@ mod tests {
     fn zero_width_source_has_one_owned_visible_cell() {
         let mut app = reader("\u{200b}", 16, 4);
         let state = app.render_state().unwrap();
-        let row = &state.rows[0];
+        let row = state.rows.get(0).unwrap();
         let span = &row.spans[0];
-        assert_eq!(span.text(&row.text), "◌\u{200b}");
+        assert_eq!(span.text(row.text), "◌\u{200b}");
         assert_eq!(span.projection, RenderProjectionKind::DottedCircle);
         assert_eq!(span.cell_width, DisplayColumn::new(1));
     }

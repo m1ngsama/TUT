@@ -140,6 +140,36 @@ pub(super) struct DocumentCache {
     grapheme_end: SourceOffset,
     grapheme_document: Option<usize>,
     window_bytes: NonZeroUsize,
+    #[cfg(test)]
+    metrics: DocumentMetrics,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct DocumentMetrics {
+    grapheme_emissions: usize,
+    segmentation_runs: usize,
+    grapheme_window_calls: usize,
+    grapheme_window_returned_bytes: usize,
+}
+
+#[cfg(test)]
+impl DocumentMetrics {
+    pub(super) const fn grapheme_emissions(self) -> usize {
+        self.grapheme_emissions
+    }
+
+    pub(super) const fn segmentation_runs(self) -> usize {
+        self.segmentation_runs
+    }
+
+    pub(super) const fn grapheme_window_calls(self) -> usize {
+        self.grapheme_window_calls
+    }
+
+    pub(super) const fn grapheme_window_returned_bytes(self) -> usize {
+        self.grapheme_window_returned_bytes
+    }
 }
 
 impl Default for DocumentCache {
@@ -152,6 +182,8 @@ impl Default for DocumentCache {
             grapheme_document: None,
             window_bytes: NonZeroUsize::new(SOURCE_WINDOW_BYTES)
                 .expect("source window size is nonzero"),
+            #[cfg(test)]
+            metrics: DocumentMetrics::default(),
         }
     }
 }
@@ -163,6 +195,16 @@ impl DocumentCache {
             window_bytes: NonZeroUsize::new(window_bytes).expect("test window size is nonzero"),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_metrics(&mut self) {
+        self.metrics = DocumentMetrics::default();
+    }
+
+    #[cfg(test)]
+    pub(super) const fn metrics(&self) -> DocumentMetrics {
+        self.metrics
     }
 }
 
@@ -298,10 +340,15 @@ impl<'document> DocumentReader<'document> {
             scan.line_start(),
             scan.pending_cr().then_some(scan.start()),
         );
-        let target = NonZeroUsize::new(SOURCE_WINDOW_BYTES).expect("source window size is nonzero");
         let mut cursor = scan.start();
 
         while cursor < scan_end {
+            let remaining = scan_end.get() - cursor.get();
+            let target = NonZeroUsize::new(
+                usize::try_from(remaining.min(SOURCE_WINDOW_BYTES as u64))
+                    .expect("bounded line scan lengths fit the process address space"),
+            )
+            .expect("nonempty line scans request nonzero windows");
             let (window_start, window_end, processed, valid_coordinates) = {
                 let window = self.window(cursor, target)?;
                 let end = window.end().min(scan_end);
@@ -481,6 +528,10 @@ impl DocumentGraphemes<'_, '_> {
         }
         loop {
             self.ensure_data()?;
+            #[cfg(test)]
+            {
+                self.reader.cache.metrics.segmentation_runs += 1;
+            }
             let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
                 .expect("document caches contain validated UTF-8");
             let candidate = &buffer[self.cursor..];
@@ -537,6 +588,11 @@ impl DocumentGraphemes<'_, '_> {
             let window = self.reader.window(expected_start, target)?;
             (window.start(), window.end(), window.len_bytes())
         };
+        #[cfg(test)]
+        {
+            self.reader.cache.metrics.grapheme_window_calls += 1;
+            self.reader.cache.metrics.grapheme_window_returned_bytes += length;
+        }
         if start != expected_start || end <= start {
             return Err(self.reader.protocol_error("non-contiguous document window"));
         }
@@ -559,6 +615,10 @@ impl DocumentGraphemes<'_, '_> {
         length: usize,
         include_text: bool,
     ) -> Result<Option<SourceGrapheme<'_>>, LoadError> {
+        #[cfg(test)]
+        {
+            self.reader.cache.metrics.grapheme_emissions += 1;
+        }
         let start = self.next_start;
         let end = start
             .checked_add(length)
@@ -1454,6 +1514,21 @@ mod tests {
             .unwrap();
 
         assert_eq!((position.current(), position.total()), (2, Some(2)));
+    }
+
+    #[test]
+    fn line_queries_read_only_the_required_checkpoint_prefix() {
+        let text = "x".repeat(SOURCE_WINDOW_BYTES * 2);
+        let document = Document::new(Path::new("long-line.txt"), text).unwrap();
+        let mut cache = DocumentCache::default();
+        let position = document
+            .reader(&mut cache)
+            .line_position(SourceOffset::ZERO)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!((position.current(), position.total()), (1, Some(1)));
+        assert_eq!(cache.chunk.len(), 1);
     }
 
     #[test]
