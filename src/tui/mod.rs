@@ -25,6 +25,7 @@ use crate::{
 };
 
 const MAX_POLL: Duration = Duration::from_millis(100);
+const BACKGROUND_POLL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Default)]
 pub(super) struct SignalState(Arc<AtomicUsize>);
@@ -310,7 +311,7 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
 
         let background_work = app.has_background_work();
         let timeout = if background_work {
-            Duration::ZERO
+            BACKGROUND_POLL
         } else {
             MAX_POLL
         };
@@ -476,6 +477,7 @@ mod tests {
         events: VecDeque<Event>,
         inject_on: Option<&'static str>,
         signals: SignalState,
+        poll_timeouts: Vec<Duration>,
     }
 
     impl FakeDriver {
@@ -486,6 +488,7 @@ mod tests {
                 events: VecDeque::new(),
                 inject_on: None,
                 signals: signals.clone(),
+                poll_timeouts: Vec::new(),
             }
         }
 
@@ -527,7 +530,8 @@ mod tests {
             })
         }
 
-        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            self.poll_timeouts.push(timeout);
             self.call("poll")?;
             Ok(!self.events.is_empty())
         }
@@ -653,6 +657,7 @@ mod tests {
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
         assert!(app.has_background_work());
+        assert_eq!(driver.poll_timeouts, vec![BACKGROUND_POLL]);
         assert!(
             driver
                 .calls

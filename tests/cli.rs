@@ -347,6 +347,37 @@ mod pty {
     }
 
     #[test]
+    fn navigation_and_search_work_through_a_real_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        let mut text = String::new();
+        for line in 0..100 {
+            match line {
+                0 => text.push_str("START_SENTINEL\n"),
+                30 => text.push_str("hit ALPHA_SENTINEL\n"),
+                70 => text.push_str("hit BETA_SENTINEL\n"),
+                99 => text.push_str("END_SENTINEL\n"),
+                _ => text.push_str("ordinary line\n"),
+            }
+        }
+        std::fs::write(file.path(), text).unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(b"START_SENTINEL").unwrap();
+        pty.master.write_all(b"G").unwrap();
+        pty.wait_for(b"END_SENTINEL").unwrap();
+        pty.master.write_all(b"/hit\r").unwrap();
+        pty.wait_for(b"ALPHA_SENTINEL").unwrap();
+        pty.master.write_all(b"n").unwrap();
+        pty.wait_for(b"BETA_SENTINEL").unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
     fn external_signals_restore_before_reporting_the_signal() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "text").unwrap();

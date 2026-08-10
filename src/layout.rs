@@ -334,6 +334,7 @@ impl ViewportLayout {
         Ok(start..boundary.end)
     }
 
+    #[cfg(test)]
     pub(super) fn resolve_top(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -344,6 +345,7 @@ impl ViewportLayout {
         self.clamp_to_last_viewport(reader, top)
     }
 
+    #[cfg(test)]
     pub(super) fn move_row_start(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -395,6 +397,7 @@ impl ViewportLayout {
         Ok((visible_rows, visible_end))
     }
 
+    #[cfg(test)]
     pub(super) fn is_last_viewport(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -430,6 +433,7 @@ impl ViewportLayout {
         Ok(self.row_boundary(reader, start)?.next)
     }
 
+    #[cfg(test)]
     pub(super) fn row_start_at_or_before(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -448,6 +452,7 @@ impl ViewportLayout {
         visual_row_boundary(reader, start, self.width)
     }
 
+    #[cfg(test)]
     fn clamp_to_last_viewport(
         &self,
         reader: &mut DocumentReader<'_>,
@@ -581,6 +586,7 @@ fn visual_row_boundary(
     })
 }
 
+#[cfg(test)]
 fn previous_row_start(
     reader: &mut DocumentReader<'_>,
     start: SourceOffset,
@@ -595,6 +601,7 @@ fn previous_row_start(
     row_start_at_or_before(reader, probe, width)
 }
 
+#[cfg(test)]
 fn row_start_at_or_before(
     reader: &mut DocumentReader<'_>,
     offset: SourceOffset,

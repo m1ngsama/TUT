@@ -67,10 +67,6 @@ impl Document {
         self.line_index.is_complete()
     }
 
-    pub(super) const fn completed_last_line_start(&self) -> Option<SourceOffset> {
-        self.line_index.completed_last_line_start()
-    }
-
     pub(super) fn line_index_covers(&self, offset: SourceOffset) -> bool {
         self.line_index.covers(offset)
     }
