@@ -29,7 +29,7 @@ use crate::{
 };
 
 const MAX_POLL: Duration = Duration::from_millis(100);
-const BACKGROUND_POLL: Duration = Duration::from_millis(1);
+const BACKGROUND_POLL: Duration = Duration::ZERO;
 const MAX_TERMINAL_CELLS: u64 = 512 * 1024;
 const MAX_TERMINAL_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1033,6 +1033,7 @@ mod tests {
             ]
         );
         assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
+        assert_eq!(driver.poll_timeouts, [MAX_POLL]);
         assert!(
             driver
                 .calls
@@ -1352,6 +1353,10 @@ mod tests {
             RunOutcome::Normal
         );
         assert!(!app.has_background_work());
+        assert_eq!(
+            driver.poll_timeouts,
+            [BACKGROUND_POLL, BACKGROUND_POLL, MAX_POLL]
+        );
     }
 
     #[test]
