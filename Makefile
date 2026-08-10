@@ -1,25 +1,34 @@
 SHELL = /bin/sh
 
-prefix = /usr/local
-exec_prefix = $(prefix)
-bindir = $(exec_prefix)/bin
+prefix ?= /usr/local
+exec_prefix ?= $(prefix)
+bindir ?= $(exec_prefix)/bin
 
-CARGO = cargo
-INSTALL = install
-INSTALL_PROGRAM = $(INSTALL)
-MKDIR_P = $(INSTALL) -d
-RM = rm -f
-STRIP = strip
+CARGO ?= cargo
+CARGO_TARGET_DIR ?= target
+CARGO_BUILD_TARGET ?=
+INSTALL ?= install
+INSTALL_PROGRAM ?= $(INSTALL)
+MKDIR_P ?= $(INSTALL) -d
+RM ?= rm -f
+STRIP ?= strip
 
-PROGRAM = target/release/tut
+CARGO_TARGET_OPTION = $(if $(strip $(CARGO_BUILD_TARGET)),--target $(CARGO_BUILD_TARGET))
+TARGET_RELEASE_DIR = $(CARGO_TARGET_DIR)/$(if $(strip $(CARGO_BUILD_TARGET)),$(CARGO_BUILD_TARGET)/)release
+PROGRAM = $(TARGET_RELEASE_DIR)/tut
+PACKAGE_VERSION = $(shell $(CARGO) pkgid --locked 2>/dev/null | sed 's/.*[@:]//')
+DIST_ARCHIVE = $(CARGO_TARGET_DIR)/package/tut-$(PACKAGE_VERSION).crate
 
-.PHONY: all check installdirs install install-strip installcheck uninstall mostlyclean clean distclean maintainer-clean
+.PHONY: all check release-check installdirs install install-strip installcheck uninstall dist distcheck mostlyclean clean distclean maintainer-clean
 
 all:
-	$(CARGO) build --release --locked
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) build --release --locked $(CARGO_TARGET_OPTION)
 
 check:
-	$(CARGO) test --all-targets --locked
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) test --all-targets --locked $(CARGO_TARGET_OPTION)
+
+release-check:
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) test --release --all-targets --locked $(CARGO_TARGET_OPTION)
 
 installdirs:
 	$(MKDIR_P) "$(DESTDIR)$(bindir)"
@@ -36,10 +45,25 @@ installcheck:
 uninstall:
 	$(RM) "$(DESTDIR)$(bindir)/tut"
 
+dist:
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) package --locked
+
+distcheck: dist
+	@set -eu; \
+	work=$$(mktemp -d "$${TMPDIR:-/tmp}/tut-distcheck.XXXXXX"); \
+	trap 'rm -rf "$$work"' EXIT HUP INT TERM; \
+	mkdir "$$work/source" "$$work/stage"; \
+	tar -xzf "$(abspath $(DIST_ARCHIVE))" -C "$$work/source"; \
+	cd "$$work/source/tut-$(PACKAGE_VERSION)"; \
+	$(MAKE) check release-check CARGO="$(CARGO)" CARGO_TARGET_DIR="$$work/target"; \
+	$(MAKE) install installcheck CARGO="$(CARGO)" CARGO_TARGET_DIR="$$work/target" DESTDIR="$$work/stage" prefix=/usr; \
+	$(MAKE) uninstall DESTDIR="$$work/stage" prefix=/usr; \
+	test ! -e "$$work/stage/usr/bin/tut"
+
 mostlyclean: clean
 
 clean:
-	$(CARGO) clean
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) clean
 
 distclean: clean
 
