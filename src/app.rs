@@ -3318,6 +3318,40 @@ mod tests {
     }
 
     #[test]
+    fn legal_dense_frames_disable_optional_highlights_without_hiding_the_current_match() {
+        let text = "x\0".repeat(256_000);
+        assert_eq!(text.len(), 512_000);
+        let mut app = reader(&text, 4096, 128);
+        commit(&mut app, "x");
+        let viewport = app.current_render_cache().unwrap().viewport;
+        let visible = viewport.first_visible_start..viewport.visible_end;
+
+        {
+            let state = app.render_state().unwrap();
+            let span_count = state.rows.iter().map(|row| row.spans.len()).sum::<usize>();
+            assert_eq!(span_count, 512_000);
+            assert!(span_count > crate::search::MAX_DISPLAY_HIGHLIGHT_RANGES);
+            assert!(state.rows.ranges.is_empty());
+            let first = state.rows.get(0).unwrap().spans[0].source();
+            assert_eq!(
+                state.rows.highlight_cursor().role_for(first),
+                Highlight::Current
+            );
+        }
+
+        let search = app.search.as_ref().unwrap();
+        assert!(search.highlights_disabled_for(&visible));
+        assert_eq!(search.highlight_reserve_attempts(), 0);
+        let state = app.render_state().unwrap();
+        assert!(state.rows.ranges.is_empty());
+        let first = state.rows.get(0).unwrap().spans[0].source();
+        assert_eq!(
+            state.rows.highlight_cursor().role_for(first),
+            Highlight::Current
+        );
+    }
+
+    #[test]
     fn rendering_segments_each_visible_grapheme_once() {
         let mut app = reader("a\nb\nc\nd\ne\noutside\n", 16, 8);
         app.document_cache = DocumentCache::default();
