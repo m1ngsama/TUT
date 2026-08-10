@@ -2,12 +2,10 @@
 
 use std::{
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::OpenOptions,
     io::{self, IsTerminal},
-    os::fd::{AsFd, OwnedFd},
-    os::unix::ffi::OsStrExt,
-    path::Path,
+    os::fd::AsFd,
 };
 
 mod app;
@@ -74,131 +72,40 @@ fn run_open(command: OpenCommand) -> Result<RunResult, TutError> {
                 return Err(TutError::NotATerminal);
             }
 
-            if stdin_is_terminal {
-                let document = document::load_standard_input(&mut io::stdin().lock())?;
-                let handlers = tui::install_signal_handlers()?;
-                run_document(document, handlers, &mut observer, InputKind::StandardInput)
-            } else {
-                let original = duplicate_descriptor(&rustix::stdio::stdin())
-                    .map_err(|source| LoadError::ReadStandardInput { source })?;
-                let terminal = open_terminal_input().ok_or(TutError::NotATerminal)?;
-                let redirect = StandardInputRedirect::attach(original, &terminal)?;
-                drop(terminal);
-                let result = (|| {
-                    let document = {
-                        let mut reader = redirect.input_reader()?;
-                        document::load_standard_input(&mut reader)?
-                    };
-                    let handlers = tui::install_signal_handlers()?;
-                    run_document(document, handlers, &mut observer, InputKind::StandardInput)
-                })();
-                redirect.finish(result)
+            if !stdin_is_terminal {
+                ensure_controlling_terminal()?;
             }
+            let document = {
+                let stdin = io::stdin();
+                let mut input = stdin.lock();
+                ensure_standard_input_readable(&input)?;
+                document::load_standard_input(&mut input)?
+            };
+            let handlers = tui::install_signal_handlers()?;
+            run_document(document, handlers, &mut observer, InputKind::StandardInput)
         }
     }
 }
 
-fn open_terminal_input() -> Option<std::fs::File> {
-    let name = rustix::termios::ttyname(rustix::stdio::stdout(), Vec::new()).ok()?;
-    let path = Path::new(OsStr::from_bytes(name.to_bytes()));
-    OpenOptions::new().read(true).write(true).open(path).ok()
+fn ensure_controlling_terminal() -> Result<(), TutError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map(drop)
+        .map_err(|_| TutError::NotATerminal)
 }
 
-struct StandardInputRedirect {
-    original: Option<OwnedFd>,
-}
-
-impl StandardInputRedirect {
-    fn attach(original: OwnedFd, terminal: &std::fs::File) -> Result<Self, TutError> {
-        replace_standard_input(terminal).map_err(|source| TutError::Io {
-            operation: "attach terminal input",
-            source,
-        })?;
-        Ok(Self {
-            original: Some(original),
-        })
+fn ensure_standard_input_readable(input: &impl AsFd) -> Result<(), LoadError> {
+    let flags = rustix::fs::fcntl_getfl(input).map_err(|source| LoadError::ReadStandardInput {
+        source: source.into(),
+    })?;
+    if flags & rustix::fs::OFlags::RWMODE == rustix::fs::OFlags::WRONLY {
+        return Err(LoadError::ReadStandardInput {
+            source: io::Error::from(rustix::io::Errno::BADF),
+        });
     }
-
-    fn input_reader(&self) -> Result<std::fs::File, TutError> {
-        let input = duplicate_descriptor(
-            self.original
-                .as_ref()
-                .expect("redirected standard input retains its source"),
-        )
-        .map_err(|source| TutError::Io {
-            operation: "duplicate standard input",
-            source,
-        })?;
-        Ok(input.into())
-    }
-
-    fn restore(&mut self) -> Result<(), TutError> {
-        let original = self
-            .original
-            .as_ref()
-            .expect("standard-input restoration runs once");
-        replace_standard_input(original).map_err(|source| TutError::Io {
-            operation: "restore standard input",
-            source,
-        })?;
-        self.original = None;
-        Ok(())
-    }
-
-    fn finish(mut self, result: Result<RunResult, TutError>) -> Result<RunResult, TutError> {
-        let restoration = self.restore();
-        match (result, restoration) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(RunResult::Completed(RunOutcome::Signal(signal))), Err(restoration)) => {
-                Err(TutError::SignalAndRestoration {
-                    signal,
-                    restoration: Box::new(restoration),
-                })
-            }
-            (Ok(_), Err(restoration)) => Err(restoration),
-            (Err(primary), Err(restoration)) => Err(TutError::PrimaryAndRestoration {
-                primary: Box::new(primary),
-                restoration: Box::new(restoration),
-            }),
-        }
-    }
-}
-
-fn duplicate_descriptor(source: &impl AsFd) -> io::Result<OwnedFd> {
-    loop {
-        match rustix::io::fcntl_dupfd_cloexec(source, 3) {
-            Ok(duplicate) => return Ok(duplicate),
-            Err(error) => {
-                let error = io::Error::from(error);
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-    }
-}
-
-fn replace_standard_input(source: &impl AsFd) -> io::Result<()> {
-    loop {
-        match rustix::stdio::dup2_stdin(source) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let error = io::Error::from(error);
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for StandardInputRedirect {
-    fn drop(&mut self) {
-        if self.original.is_some() {
-            let _ = self.restore();
-        }
-    }
+    Ok(())
 }
 
 fn run_document(
