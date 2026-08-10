@@ -454,9 +454,8 @@ fn count_line_starts(
     }
     while index < bytes.len() {
         let line_end = match bytes[index] {
-            b'\n' => index + 1,
             b'\r' if index + 1 < bytes.len() && bytes[index + 1] == b'\n' => index + 2,
-            b'\r' => index + 1,
+            b'\n' | b'\r' => index + 1,
             _ => {
                 index += 1;
                 continue;

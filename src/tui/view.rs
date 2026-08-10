@@ -11,10 +11,11 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     app::{
-        ContentWidth, DisplayAtoms, DisplayColumn, Highlight, MIN_TERMINAL_COLUMNS,
-        MIN_TERMINAL_ROWS, RenderProjectionKind, RenderRow, RenderSpan, RenderState, SearchStatus,
+        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, RenderProjectionKind, RenderRow,
+        RenderSpan, RenderState, SearchStatus,
     },
     error::{TutError, sanitize_text},
+    layout::{ContentWidth, DisplayAtoms, DisplayColumn},
 };
 
 const TINY_MESSAGE: &str = "terminal too small — resize";
@@ -149,13 +150,13 @@ fn header_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
     let filename = sanitize_text(state.filename);
     let path = sanitize_text(state.path);
     let shown_name = ellipsize_end(&filename, (width / 3).max(1))?;
-    let used = display_width(&shown_name)?;
+    let used = display_width(&shown_name);
     if used >= width {
         return Ok(shown_name);
     }
 
     let separator = if width - used >= 2 { "  " } else { " " };
-    let remaining = width.saturating_sub(used + display_width(separator)?);
+    let remaining = width.saturating_sub(used + display_width(separator));
     let shown_path = ellipsize_start(&path, remaining)?;
     let mut output = String::new();
     output
@@ -205,13 +206,13 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
         }
         (Some(current), None) => write!(prefix, "{}%  {current}/?", state.progress.min(100)),
         (None, Some(total)) => write!(prefix, "{}%  ?/{total}", state.progress.min(100)),
-        (None, None) => write!(prefix, "{}%  ?/?", state.progress.min(100),),
+        (None, None) => write!(prefix, "{}%  ?/?", state.progress.min(100)),
     }
     .expect("reserved String formatting is infallible");
     if query.is_some() {
         prefix.push_str("  /");
     }
-    let fixed_width = display_width(&prefix)?.saturating_add(display_width(suffix)?);
+    let fixed_width = display_width(&prefix).saturating_add(display_width(suffix));
     let query_budget = width.saturating_sub(fixed_width);
     let shown_query = match query.as_deref() {
         Some(query) => ellipsize_end(query, query_budget)?,
@@ -229,7 +230,7 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
 }
 
 fn ellipsize_end(text: &str, maximum: u16) -> Result<String, TutError> {
-    if display_width(text)? <= maximum {
+    if display_width(text) <= maximum {
         return fallible_copy(text, "ellipsized text");
     }
     if maximum == 0 {
@@ -243,7 +244,7 @@ fn ellipsize_end(text: &str, maximum: u16) -> Result<String, TutError> {
     let maximum = u32::from(maximum);
     let mut used = 0_u32;
     for (offset, grapheme) in text.grapheme_indices(true) {
-        let width = u32::from(display_width(grapheme)?);
+        let width = u32::from(display_width(grapheme));
         if used + width + 1 > maximum {
             break;
         }
@@ -260,7 +261,7 @@ fn ellipsize_end(text: &str, maximum: u16) -> Result<String, TutError> {
 }
 
 fn ellipsize_start(text: &str, maximum: u16) -> Result<String, TutError> {
-    if display_width(text)? <= maximum {
+    if display_width(text) <= maximum {
         return fallible_copy(text, "ellipsized text");
     }
     if maximum == 0 {
@@ -274,7 +275,7 @@ fn ellipsize_start(text: &str, maximum: u16) -> Result<String, TutError> {
     let maximum = u32::from(maximum);
     let mut used = 1_u32;
     for (offset, grapheme) in text.grapheme_indices(true).rev() {
-        let width = u32::from(display_width(grapheme)?);
+        let width = u32::from(display_width(grapheme));
         if used + width > maximum {
             break;
         }
@@ -299,7 +300,7 @@ fn fallible_copy(text: &str, context: &'static str) -> Result<String, TutError> 
     Ok(output)
 }
 
-fn display_width(text: &str) -> Result<u16, TutError> {
+fn display_width(text: &str) -> u16 {
     let content_width = ContentWidth::new(u16::MAX).expect("u16::MAX is nonzero");
     let mut column = DisplayColumn::ZERO;
     for atom in DisplayAtoms::new(text) {
@@ -308,7 +309,7 @@ fn display_width(text: &str) -> Result<u16, TutError> {
         };
         column = DisplayColumn::new(column.get().saturating_add(projected.width().get()));
     }
-    Ok(u16::try_from(column.get()).unwrap_or(u16::MAX))
+    u16::try_from(column.get()).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
@@ -419,11 +420,11 @@ mod tests {
 
         let long = "a".repeat(usize::from(u16::MAX) + 1);
         assert_eq!(
-            display_width(&ellipsize_end(&long, u16::MAX).unwrap()).unwrap(),
+            display_width(&ellipsize_end(&long, u16::MAX).unwrap()),
             u16::MAX
         );
         assert_eq!(
-            display_width(&ellipsize_start(&long, u16::MAX).unwrap()).unwrap(),
+            display_width(&ellipsize_start(&long, u16::MAX).unwrap()),
             u16::MAX
         );
     }

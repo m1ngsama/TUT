@@ -2,13 +2,13 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
-pub(super) use crate::layout::{ContentWidth, DisplayAtoms, DisplayColumn};
 use crate::{
     document::{Document, DocumentCache, DocumentReader},
     error::TutError,
     layout::{
-        BodyHeight, DOTTED_CIRCLE, DisplayProjection, GraphemeRange, ProjectedAtom,
-        REPLACEMENT_CHARACTER, ViewportLayout, ensure_viewport_layout, progress_percent,
+        BodyHeight, ContentWidth, DOTTED_CIRCLE, DisplayColumn, DisplayProjection, GraphemeRange,
+        ProjectedAtom, REPLACEMENT_CHARACTER, ViewportLayout, ensure_viewport_layout,
+        progress_percent,
     },
     line_index::LinePosition,
     locator::{RowDelta, ViewportLocator},
@@ -253,15 +253,13 @@ impl ViewportRequest {
         source_end: SourceOffset,
         height: BodyHeight,
     ) -> (SourceOffset, RowDelta) {
-        match self {
-            Self::Reflow { .. } => (self.target(source_end), RowDelta::Forward(0)),
-            Self::Move { delta, .. } => (self.target(source_end), delta),
-            Self::Search { .. } => (
-                self.target(source_end),
-                RowDelta::Backward(usize::from(height.get() / 2)),
-            ),
-            Self::End => (self.target(source_end), RowDelta::Forward(0)),
-        }
+        let target = self.target(source_end);
+        let delta = match self {
+            Self::Move { delta, .. } => delta,
+            Self::Search { .. } => RowDelta::Backward(usize::from(height.get() / 2)),
+            Self::Reflow { .. } | Self::End => RowDelta::Forward(0),
+        };
+        (target, delta)
     }
 
     const fn follows_end(self, at_end: bool) -> bool {
@@ -1056,6 +1054,8 @@ mod tests {
 
     use super::*;
 
+    const BACKGROUND_STEP_LIMIT: usize = 100_000;
+
     fn reader(text: &str, columns: u16, rows: u16) -> App {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), text.to_owned());
         app.update(Action::Resize(Geometry::new(columns, rows)))
@@ -1077,21 +1077,41 @@ mod tests {
     }
 
     fn settle(app: &mut App) {
-        while app.has_background_work() {
+        settle_count(app);
+    }
+
+    fn settle_count(app: &mut App) -> (usize, usize) {
+        let mut changes = 0;
+        for steps in 0..BACKGROUND_STEP_LIMIT {
+            if !app.has_background_work() {
+                return (steps, changes);
+            }
+            changes += usize::from(app.advance_background().unwrap());
+        }
+        panic!("background work exceeded the test step limit");
+    }
+
+    fn advance_until(app: &mut App, ready: impl Fn(&App) -> bool) {
+        for _ in 0..BACKGROUND_STEP_LIMIT {
+            if ready(app) {
+                return;
+            }
             app.advance_background().unwrap();
         }
+        panic!("background condition exceeded the test step limit");
     }
 
     fn locate(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
         let height = app.geometry.body_height().unwrap();
         let mut locator = ViewportLocator::new(target, delta, height).unwrap();
-        loop {
+        for _ in 0..BACKGROUND_STEP_LIMIT {
             let layout = app.layout.as_ref().unwrap();
             let mut reader = app.document.reader(&mut app.document_cache);
             if let Some(located) = locator.advance(layout, &mut reader).unwrap() {
                 return located;
             }
         }
+        panic!("viewport locator exceeded the test step limit");
     }
 
     #[test]
@@ -1265,9 +1285,7 @@ mod tests {
         assert_eq!(app.anchor, SourceOffset::new(before_move.get() - 20));
 
         submit(&mut app, "needle");
-        while app.current_match.is_none() {
-            app.advance_background().unwrap();
-        }
+        advance_until(&mut app, |app| app.current_match.is_some());
         assert!(matches!(
             app.viewport_request,
             Some(ViewportRequest::Search { .. })
@@ -1416,14 +1434,10 @@ mod tests {
         commit(&mut app, "alpha");
         let first = app.current_match.unwrap();
         app.update(Action::NextMatch).unwrap();
-        while app.has_background_work() {
-            app.advance_background().unwrap();
-        }
+        settle(&mut app);
         assert_ne!(app.current_match, Some(first));
         app.update(Action::PreviousMatch).unwrap();
-        while app.has_background_work() {
-            app.advance_background().unwrap();
-        }
+        settle(&mut app);
         assert_eq!(app.current_match, Some(first));
 
         app.update(Action::BeginSearch).unwrap();
@@ -1556,9 +1570,7 @@ mod tests {
                 ..
             }
         ));
-        while app.has_background_work() {
-            app.advance_background().unwrap();
-        }
+        settle(&mut app);
 
         assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
     }
@@ -1575,9 +1587,7 @@ mod tests {
         assert!(app.current_match.is_some());
         submit(&mut app, "beta");
         assert_eq!(app.current_match, None);
-        while app.has_background_work() {
-            app.advance_background().unwrap();
-        }
+        settle(&mut app);
 
         assert_eq!(app.committed_query, "beta");
         assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
@@ -1592,9 +1602,7 @@ mod tests {
             assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
             assert_eq!(state.rows[0].spans[4].highlight, Highlight::None);
         }
-        while app.has_background_work() {
-            app.advance_background().unwrap();
-        }
+        settle(&mut app);
         let state = app.render_state().unwrap();
         assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
         assert_eq!(state.rows[0].spans[4].highlight, Highlight::Match);
@@ -1659,6 +1667,65 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_long_line_location_advances_in_bounded_steps() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("long-line.txt");
+        let line_bytes = SOURCE_WINDOW_BYTES * 2;
+        let mut text = "x".repeat(line_bytes);
+        text.push_str("\nneedle\nend");
+        fs::write(&path, text).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        settle(&mut app);
+
+        let target = SourceOffset::from_usize(line_bytes + 1);
+        let expected = {
+            let height = usize::from(app.geometry.body_height().unwrap().get() / 2);
+            let layout = app.layout.as_ref().unwrap();
+            let mut reader = app.document.reader(&mut app.document_cache);
+            layout
+                .move_row_start(&mut reader, target, false, height)
+                .unwrap()
+        };
+        let selected =
+            SearchRange::new(target, target.checked_add("needle".len()).unwrap()).unwrap();
+
+        app.schedule_search_jump(selected);
+        assert!(!app.advance_background().unwrap());
+        assert_eq!(app.anchor, SourceOffset::ZERO);
+        assert!(app.locator.is_some());
+
+        settle(&mut app);
+        assert_eq!(app.anchor, expected);
+    }
+
+    #[test]
+    fn file_index_and_search_take_fair_background_turns() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("search-book.txt");
+        let mut text = "x".repeat(SOURCE_WINDOW_BYTES * 3);
+        text.push_str("needle");
+        fs::write(&path, text).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+        submit(&mut app, "needle");
+        let first_frontier = SourceOffset::from_usize(SOURCE_WINDOW_BYTES);
+
+        assert!(!app.document.line_index_covers(first_frontier));
+        assert!(!app.search_index.as_ref().unwrap().is_complete());
+        assert!(!app.advance_background().unwrap());
+        assert!(!app.document.line_index_covers(first_frontier));
+        assert!(!app.advance_background().unwrap());
+        assert!(app.document.line_index_covers(first_frontier));
+        assert!(!app.search_index.as_ref().unwrap().is_complete());
+
+        settle(&mut app);
+        assert!(app.document.line_index_complete());
+        assert!(app.search_index.as_ref().unwrap().is_complete());
+        assert_eq!(app.current_match.unwrap().end(), app.document.source_end());
+    }
+
+    #[test]
     fn file_line_index_advances_in_bounded_background_steps() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("large-book.txt");
@@ -1672,12 +1739,7 @@ mod tests {
         assert_eq!((initial.current_line, initial.total_lines), (Some(1), None));
         assert!(app.has_background_work());
 
-        let mut advances = 0;
-        let mut redraws = 0;
-        while app.has_background_work() {
-            redraws += usize::from(app.advance_background().unwrap());
-            advances += 1;
-        }
+        let (advances, redraws) = settle_count(&mut app);
 
         assert_eq!(advances, 3);
         assert_eq!(redraws, 1);
