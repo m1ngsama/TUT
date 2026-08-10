@@ -19,6 +19,10 @@ pub enum LoadError {
     NotRegular(PathBuf),
     TooLarge { path: PathBuf, limit: u64 },
     InvalidUtf8 { path: PathBuf, offset: u64 },
+    StandardInputTooLarge { limit: u64 },
+    InvalidStandardInputUtf8 { offset: u64 },
+    ReadStandardInput { source: io::Error },
+    BufferStandardInput { source: io::Error },
     Allocation(&'static str),
     Read { path: PathBuf, source: io::Error },
 }
@@ -136,7 +140,7 @@ impl TutError {
             },
             Self::Load(error) => load_message(error),
             Self::NotATerminal => {
-                "interactive reading requires terminal stdin and stdout".to_owned()
+                "interactive reading requires terminal input and output".to_owned()
             }
             Self::Layout(LayoutError::DocumentMismatch) => {
                 "layout state belongs to another document".to_owned()
@@ -206,6 +210,18 @@ fn load_message(error: &LoadError) -> String {
             "invalid UTF-8 at byte {offset}: '{}'",
             sanitize_os(path.as_os_str())
         ),
+        LoadError::StandardInputTooLarge { limit } => {
+            format!("standard input exceeds the {limit}-byte limit")
+        }
+        LoadError::InvalidStandardInputUtf8 { offset } => {
+            format!("invalid UTF-8 in standard input at byte {offset}")
+        }
+        LoadError::ReadStandardInput { source } => {
+            format!("cannot read standard input: {source}")
+        }
+        LoadError::BufferStandardInput { source } => {
+            format!("cannot buffer standard input: {source}")
+        }
         LoadError::Allocation(context) => format!("could not allocate {context}"),
         LoadError::Read { path, source } => {
             format!("cannot read '{}': {source}", sanitize_os(path.as_os_str()))
@@ -256,7 +272,12 @@ impl fmt::Display for TutError {
 impl Error for TutError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Load(LoadError::Open { source, .. } | LoadError::Read { source, .. })
+            Self::Load(
+                LoadError::Open { source, .. }
+                | LoadError::Read { source, .. }
+                | LoadError::ReadStandardInput { source }
+                | LoadError::BufferStandardInput { source },
+            )
             | Self::Io { source, .. } => Some(source),
             Self::PrimaryAndRestoration { primary, .. } => Some(primary.as_ref()),
             Self::SignalAndRestoration { restoration, .. } => Some(restoration.as_ref()),
@@ -317,6 +338,12 @@ mod tests {
         });
         assert_eq!(invalid.message(), "invalid UTF-8 at byte 2: 'bad\\x0a.txt'");
         assert_eq!(invalid.exit_code(), 1);
+
+        let stdin = TutError::Load(LoadError::InvalidStandardInputUtf8 { offset: 16 });
+        assert_eq!(
+            stdin.message(),
+            "invalid UTF-8 in standard input at byte 16"
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::{Command, Stdio},
+};
 
 use tempfile::{NamedTempFile, tempdir};
 
@@ -57,7 +60,7 @@ fn double_dash_accepts_a_leading_dash_filename() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         output.stderr,
-        b"tut: interactive reading requires terminal stdin and stdout\n"
+        b"tut: interactive reading requires terminal input and output\n"
     );
 }
 
@@ -71,7 +74,7 @@ fn terminal_validation_precedes_file_access() {
     assert!(missing.stdout.is_empty());
     assert_eq!(
         missing.stderr,
-        b"tut: interactive reading requires terminal stdin and stdout\n"
+        b"tut: interactive reading requires terminal input and output\n"
     );
 
     let file = NamedTempFile::new().unwrap();
@@ -80,6 +83,17 @@ fn terminal_validation_precedes_file_access() {
     assert_eq!(valid.status.code(), Some(1));
     assert!(valid.stdout.is_empty());
     assert_eq!(valid.stderr, missing.stderr);
+}
+
+#[test]
+fn standard_input_requires_terminal_output() {
+    let output = tut().arg("-").stdin(Stdio::piped()).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"tut: interactive reading requires terminal input and output\n"
+    );
 }
 
 #[cfg(unix)]
@@ -101,16 +115,18 @@ mod pty {
     use std::{
         fs::File,
         io::{self, Read, Write},
-        os::unix::process::CommandExt,
+        os::unix::process::{CommandExt, ExitStatusExt},
         path::Path,
-        process::{Child, ChildStderr, ExitStatus, Stdio},
+        process::{Child, ChildStderr, ChildStdin, ExitStatus, Stdio},
         thread,
         time::{Duration, Instant},
     };
 
     use rustix::{
         fs::{self, Mode, OFlags},
-        process::{Pid, Signal, WaitOptions, kill_process, setsid, waitpid},
+        process::{
+            Pid, Signal, WaitOptions, getpgrp, ioctl_tiocsctty, kill_process, setsid, waitpid,
+        },
         pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt},
         termios::{self, SpecialCodeIndex, Termios, Winsize},
     };
@@ -124,6 +140,14 @@ mod pty {
     const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
     const TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[derive(Clone, Copy)]
+    enum TestInput<'a> {
+        Path(&'a Path),
+        StandardInput(&'a [u8]),
+        OpenStandardInput,
+        UnreadableStandardInput,
+    }
+
     struct PtyChild {
         child: Child,
         master: File,
@@ -133,10 +157,27 @@ mod pty {
         output: Vec<u8>,
         stderr_output: Vec<u8>,
         reaped: bool,
+        _input: Option<ChildStdin>,
     }
 
     impl PtyChild {
         fn spawn(path: &Path) -> io::Result<Self> {
+            Self::spawn_inner(TestInput::Path(path))
+        }
+
+        fn spawn_standard_input(bytes: &[u8]) -> io::Result<Self> {
+            Self::spawn_inner(TestInput::StandardInput(bytes))
+        }
+
+        fn spawn_open_standard_input() -> io::Result<Self> {
+            Self::spawn_inner(TestInput::OpenStandardInput)
+        }
+
+        fn spawn_unreadable_standard_input() -> io::Result<Self> {
+            Self::spawn_inner(TestInput::UnreadableStandardInput)
+        }
+
+        fn spawn_inner(input: TestInput<'_>) -> io::Result<Self> {
             let master_fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
             grantpt(&master_fd)?;
             unlockpt(&master_fd)?;
@@ -156,8 +197,8 @@ mod pty {
                 },
             )?;
             let initial = termios::tcgetattr(&slave_fd)?;
-            let stdin = File::from(slave_fd);
-            let stdout = stdin.try_clone()?;
+            let terminal_input = File::from(slave_fd);
+            let stdout = terminal_input.try_clone()?;
 
             let flags = fs::fcntl_getfl(&master_fd)?;
             fs::fcntl_setfl(&master_fd, flags | OFlags::NONBLOCK)?;
@@ -166,11 +207,19 @@ mod pty {
             let controlling_name = slave_name;
 
             let mut command = tut();
-            command
-                .arg(path)
-                .stdin(Stdio::from(stdin))
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::piped());
+            match input {
+                TestInput::Path(path) => {
+                    command.arg(path).stdin(Stdio::from(terminal_input));
+                }
+                TestInput::StandardInput(_) | TestInput::OpenStandardInput => {
+                    command.arg("-").stdin(Stdio::piped());
+                }
+                TestInput::UnreadableStandardInput => {
+                    let unreadable = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+                    command.arg("-").stdin(Stdio::from(unreadable));
+                }
+            }
+            command.stdout(Stdio::from(stdout)).stderr(Stdio::piped());
             // The child setup uses only async-signal-safe descriptor and session operations.
             unsafe {
                 command.pre_exec(move || {
@@ -178,11 +227,25 @@ mod pty {
                     let controlling =
                         fs::open(controlling_name.as_c_str(), OFlags::RDWR, Mode::empty())
                             .map_err(io::Error::from)?;
+                    ioctl_tiocsctty(&controlling).map_err(io::Error::from)?;
+                    termios::tcsetpgrp(&controlling, getpgrp()).map_err(io::Error::from)?;
                     drop(controlling);
                     Ok(())
                 });
             }
             let mut child = command.spawn()?;
+            let mut input_pipe = child.stdin.take();
+            let retained_input = match input {
+                TestInput::StandardInput(bytes) => {
+                    input_pipe
+                        .as_mut()
+                        .expect("standard-input children retain their pipe")
+                        .write_all(bytes)?;
+                    None
+                }
+                TestInput::OpenStandardInput => input_pipe,
+                TestInput::Path(_) | TestInput::UnreadableStandardInput => None,
+            };
             let stderr = child.stderr.take();
             Ok(Self {
                 child,
@@ -193,6 +256,7 @@ mod pty {
                 output: Vec::new(),
                 stderr_output: Vec::new(),
                 reaped: false,
+                _input: retained_input,
             })
         }
 
@@ -413,6 +477,85 @@ mod pty {
         let status = pty.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn piped_standard_input_uses_the_controlling_terminal_for_commands() {
+        let mut text = String::new();
+        for line in 0..60 {
+            match line {
+                0 => text.push_str("PIPE_START_SENTINEL\n"),
+                59 => text.push_str("PIPE_END_SENTINEL\n"),
+                _ => text.push_str("ordinary piped line\n"),
+            }
+        }
+
+        let mut pty = PtyChild::spawn_standard_input(text.as_bytes()).unwrap();
+        pty.wait_for(b"PIPE_START_SENTINEL").unwrap();
+        pty.master.write_all(b"G").unwrap();
+        pty.wait_for(b"PIPE_END_SENTINEL").unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn invalid_standard_input_fails_before_terminal_mutation() {
+        let mut pty = PtyChild::spawn_standard_input(b"ok\xffbad").unwrap();
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(
+            pty.stderr_output,
+            b"tut: invalid UTF-8 in standard input at byte 2\n"
+        );
+        for sequence in [ENTER_ALT, HIDE_CURSOR] {
+            assert!(
+                !pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn signals_terminate_a_blocked_standard_input_read() {
+        let mut pty = PtyChild::spawn_open_standard_input().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        pty.signal(Signal::TERM).unwrap();
+        let status = pty.wait().unwrap();
+        assert_eq!(status.signal(), Some(signal_hook::consts::signal::SIGTERM));
+        assert!(pty.stderr_output.is_empty());
+        for sequence in [ENTER_ALT, HIDE_CURSOR] {
+            assert!(
+                !pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn unreadable_standard_input_fails_without_reading_from_the_terminal() {
+        let mut pty = PtyChild::spawn_unreadable_standard_input().unwrap();
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(
+            pty.stderr_output
+                .starts_with(b"tut: cannot read standard input: ")
+        );
+        for sequence in [ENTER_ALT, HIDE_CURSOR] {
+            assert!(
+                !pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
         pty.assert_restored();
     }
 

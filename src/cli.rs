@@ -5,12 +5,14 @@ use crate::error::InvocationError;
 pub const USAGE: &str = "Usage: tut [OPTION]... FILE";
 pub const HELP: &str = "\
 Usage: tut [OPTION]... FILE
-Read a local UTF-8 text file in the terminal.
+Read UTF-8 text from FILE in the terminal.
 
   -h, --help     display this help and exit
   -V, --version  output version information and exit
 
+With FILE -, read standard input.
 Use -- before a FILE whose name begins with '-'.
+For a file named '-', use ./-.
 
 Report bugs to: https://github.com/m1ngsama/TUT/issues
 TUT home page: https://github.com/m1ngsama/TUT
@@ -29,7 +31,13 @@ pub const VERSION_OUTPUT: &str = concat!(
 pub(super) enum Command {
     Help,
     Version,
-    Open(PathBuf),
+    Open(Input),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Input {
+    Path(PathBuf),
+    StandardInput,
 }
 
 pub(super) fn parse_args<I>(args: I) -> Result<Command, InvocationError>
@@ -56,7 +64,7 @@ where
         if error.is_some() {
             continue;
         }
-        if options && argument.to_string_lossy().starts_with('-') {
+        if options && argument != "-" && argument.to_string_lossy().starts_with('-') {
             error = Some(InvocationError::UnknownOption(argument));
         } else if path.is_none() {
             path = Some(argument);
@@ -67,7 +75,8 @@ where
 
     error.map_or_else(
         || match path {
-            Some(path) => Ok(Command::Open(PathBuf::from(path))),
+            Some(path) if path == "-" => Ok(Command::Open(Input::StandardInput)),
+            Some(path) => Ok(Command::Open(Input::Path(PathBuf::from(path)))),
             None if saw_double_dash => Err(InvocationError::MissingPathAfterDoubleDash),
             None => Err(InvocationError::MissingPath),
         },
@@ -93,19 +102,25 @@ mod tests {
         assert_eq!(parse(&["--version"]), Ok(Command::Version));
         assert_eq!(
             parse(&["book.txt"]),
-            Ok(Command::Open(PathBuf::from("book.txt")))
+            Ok(Command::Open(Input::Path(PathBuf::from("book.txt"))))
         );
         assert_eq!(
             parse(&["--", "-book.txt"]),
-            Ok(Command::Open(PathBuf::from("-book.txt")))
+            Ok(Command::Open(Input::Path(PathBuf::from("-book.txt"))))
         );
         assert_eq!(
             parse(&["book.txt", "--"]),
-            Ok(Command::Open(PathBuf::from("book.txt")))
+            Ok(Command::Open(Input::Path(PathBuf::from("book.txt"))))
         );
         assert_eq!(
             parse(&["--", "--help"]),
-            Ok(Command::Open(PathBuf::from("--help")))
+            Ok(Command::Open(Input::Path(PathBuf::from("--help"))))
+        );
+        assert_eq!(parse(&["-"]), Ok(Command::Open(Input::StandardInput)));
+        assert_eq!(parse(&["--", "-"]), Ok(Command::Open(Input::StandardInput)));
+        assert_eq!(
+            parse(&["./-"]),
+            Ok(Command::Open(Input::Path(PathBuf::from("./-"))))
         );
     }
 
@@ -119,6 +134,13 @@ mod tests {
         );
         assert_eq!(parse(&["--version", "--help"]), Ok(Command::Version));
         assert_eq!(parse(&["--help", "--version"]), Ok(Command::Help));
+        assert_eq!(parse(&["-", "--help"]), Ok(Command::Help));
+        assert_eq!(
+            parse(&["--", "-", "--help"]),
+            Err(InvocationError::UnexpectedArgument(OsString::from(
+                "--help"
+            )))
+        );
     }
 
     #[test]
@@ -142,6 +164,8 @@ mod tests {
     fn help_and_version_follow_gnu_output_conventions() {
         assert!(HELP.starts_with("Usage: tut "));
         assert!(HELP.ends_with('\n'));
+        assert!(HELP.contains("With FILE -, read standard input."));
+        assert!(HELP.contains("For a file named '-', use ./-."));
         assert!(VERSION_OUTPUT.starts_with(concat!("tut (TUT) ", env!("CARGO_PKG_VERSION"), "\n")));
         assert!(VERSION_OUTPUT.contains("Copyright (C) 2024-2026 m1ngsama"));
         assert!(VERSION_OUTPUT.contains("License MIT"));

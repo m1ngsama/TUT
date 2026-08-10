@@ -205,6 +205,9 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
 fn header_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> {
     let filename = sanitize_text(state.filename);
     let path = sanitize_text(state.path);
+    if filename == path {
+        return ellipsize_end(&filename, width);
+    }
     let shown_name = ellipsize_end(&filename, (width / 3).max(1))?;
     let used = display_width(&shown_name);
     if used >= width {
@@ -517,6 +520,20 @@ mod tests {
             ..state
         };
         assert_eq!(status_text(&state, 40).unwrap(), "12%  ?/?");
+    }
+
+    #[test]
+    fn identical_source_names_are_not_repeated_in_the_header() {
+        let state = RenderState {
+            filename: "standard input",
+            path: "standard input",
+            rows: RenderRowsView::empty(),
+            progress: 100,
+            current_line: Some(1),
+            total_lines: Some(1),
+            status: SearchStatus::None,
+        };
+        assert_eq!(header_text(&state, 40).unwrap(), "standard input");
     }
 
     #[test]
