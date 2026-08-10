@@ -4,12 +4,13 @@ use std::{
     io::{self, Write as _},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use rustix::fs::{Mode, OFlags};
 
 use crate::{
+    app::BackgroundWork,
     document::FileIdentity,
     error::{ExternalSignal, LogError},
 };
@@ -38,6 +39,130 @@ pub(super) enum SessionOutcome {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeOperation {
+    Draw,
+    Action,
+    Background(BackgroundWork),
+}
+
+pub(super) trait RuntimeRecorder {
+    type Stamp;
+
+    fn begin_operation(&mut self) -> Self::Stamp;
+    fn finish_operation(&mut self, operation: RuntimeOperation, started: Self::Stamp);
+    fn event(&mut self);
+    fn terminal_session(&mut self);
+    fn suspension(&mut self);
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DisabledRecorder;
+
+impl RuntimeRecorder for DisabledRecorder {
+    type Stamp = ();
+
+    #[inline]
+    fn begin_operation(&mut self) {}
+
+    #[inline]
+    fn finish_operation(&mut self, _operation: RuntimeOperation, _started: Self::Stamp) {}
+
+    #[inline]
+    fn event(&mut self) {}
+
+    #[inline]
+    fn terminal_session(&mut self) {}
+
+    #[inline]
+    fn suspension(&mut self) {}
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Timing {
+    calls: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+impl Timing {
+    fn record(&mut self, elapsed_us: u64) {
+        self.calls = self.calls.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(elapsed_us);
+        self.max_us = self.max_us.max(elapsed_us);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SessionMetrics {
+    terminal_sessions: u64,
+    suspensions: u64,
+    events: u64,
+    draw: Timing,
+    action: Timing,
+    background: Timing,
+    line_steps: u64,
+    viewport_steps: u64,
+    search_steps: u64,
+    background_max_kind: Option<BackgroundWork>,
+}
+
+impl SessionMetrics {
+    fn record(&mut self, operation: RuntimeOperation, elapsed: Duration) {
+        let elapsed_us = duration_micros(elapsed);
+        match operation {
+            RuntimeOperation::Draw => self.draw.record(elapsed_us),
+            RuntimeOperation::Action => self.action.record(elapsed_us),
+            RuntimeOperation::Background(work) => {
+                let new_max = self.background.calls == 0 || elapsed_us > self.background.max_us;
+                self.background.record(elapsed_us);
+                match work {
+                    BackgroundWork::LineIndex => {
+                        self.line_steps = self.line_steps.saturating_add(1);
+                    }
+                    BackgroundWork::Viewport => {
+                        self.viewport_steps = self.viewport_steps.saturating_add(1);
+                    }
+                    BackgroundWork::Search => {
+                        self.search_steps = self.search_steps.saturating_add(1);
+                    }
+                }
+                if new_max {
+                    self.background_max_kind = Some(work);
+                }
+            }
+        }
+    }
+}
+
+impl RuntimeRecorder for SessionMetrics {
+    type Stamp = Instant;
+
+    fn begin_operation(&mut self) -> Self::Stamp {
+        Instant::now()
+    }
+
+    fn finish_operation(&mut self, operation: RuntimeOperation, started: Self::Stamp) {
+        self.record(operation, started.elapsed());
+    }
+
+    fn event(&mut self) {
+        self.events = self.events.saturating_add(1);
+    }
+
+    fn terminal_session(&mut self) {
+        self.terminal_sessions = self.terminal_sessions.saturating_add(1);
+    }
+
+    fn suspension(&mut self) {
+        self.suspensions = self.suspensions.saturating_add(1);
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug)]
 pub(super) struct Observer {
     state: State,
@@ -56,8 +181,7 @@ struct ActiveObserver {
     file: File,
     path: PathBuf,
     started: Instant,
-    terminal_sessions: u64,
-    suspensions: u64,
+    metrics: SessionMetrics,
 }
 
 impl Observer {
@@ -87,22 +211,17 @@ impl Observer {
         Ok(())
     }
 
-    pub(super) fn terminal_session(&mut self) {
-        if let State::Active(active) = &mut self.state {
-            active.terminal_sessions = active.terminal_sessions.saturating_add(1);
-        }
-    }
-
-    pub(super) fn suspension(&mut self) {
-        if let State::Active(active) = &mut self.state {
-            active.suspensions = active.suspensions.saturating_add(1);
+    pub(super) fn runtime_metrics(&mut self) -> Option<&mut SessionMetrics> {
+        match &mut self.state {
+            State::Active(active) => Some(&mut active.metrics),
+            State::Disabled | State::Pending { .. } | State::Finished => None,
         }
     }
 
     pub(super) fn finish(&mut self, outcome: SessionOutcome) -> Result<(), LogError> {
         let state = std::mem::replace(&mut self.state, State::Finished);
         match state {
-            State::Active(mut active) => active.write_summary(outcome),
+            State::Active(mut active) => active.write_finish(outcome),
             State::Disabled | State::Pending { .. } | State::Finished => Ok(()),
         }
     }
@@ -149,8 +268,7 @@ impl ActiveObserver {
             file,
             path,
             started,
-            terminal_sessions: 0,
-            suspensions: 0,
+            metrics: SessionMetrics::default(),
         })
     }
 
@@ -165,10 +283,39 @@ impl ActiveObserver {
         ))
     }
 
+    fn write_runtime_summary(&mut self) -> Result<(), LogError> {
+        let metrics = self.metrics;
+        let frames = metrics.draw.calls;
+        let events = metrics.events;
+        let actions = metrics.action.calls;
+        let draw_us = metrics.draw.total_us;
+        let draw_max_us = metrics.draw.max_us;
+        let action_us = metrics.action.total_us;
+        let action_max_us = metrics.action.max_us;
+        let line_steps = metrics.line_steps;
+        let viewport_steps = metrics.viewport_steps;
+        let search_steps = metrics.search_steps;
+        let background_us = metrics.background.total_us;
+        let background_max_us = metrics.background.max_us;
+        let background_max_kind = metrics
+            .background_max_kind
+            .map_or("none", background_work_name);
+        self.write_event(format_args!(
+            "runtime_summary frames={frames} events={events} actions={actions} draw_us={draw_us} draw_max_us={draw_max_us} action_us={action_us} action_max_us={action_max_us} line_steps={line_steps} viewport_steps={viewport_steps} search_steps={search_steps} background_us={background_us} background_max_us={background_max_us} background_max_kind={background_max_kind}\n"
+        ))
+    }
+
+    fn write_finish(&mut self, outcome: SessionOutcome) -> Result<(), LogError> {
+        let mut first = None;
+        retain_first(&mut first, self.write_runtime_summary());
+        retain_first(&mut first, self.write_summary(outcome));
+        first.map_or(Ok(()), Err)
+    }
+
     fn write_summary(&mut self, outcome: SessionOutcome) -> Result<(), LogError> {
-        let elapsed = self.started.elapsed().as_micros();
-        let terminal_sessions = self.terminal_sessions;
-        let suspensions = self.suspensions;
+        let elapsed = duration_micros(self.started.elapsed());
+        let terminal_sessions = self.metrics.terminal_sessions;
+        let suspensions = self.metrics.suspensions;
         match outcome {
             SessionOutcome::Normal => self.write_event(format_args!(
                 "session_summary outcome=normal elapsed_us={elapsed} terminal_sessions={terminal_sessions} suspensions={suspensions}\n"
@@ -195,6 +342,22 @@ impl ActiveObserver {
                 path: self.path.clone(),
                 source,
             })
+    }
+}
+
+fn retain_first(first: &mut Option<LogError>, result: Result<(), LogError>) {
+    if let Err(error) = result
+        && first.is_none()
+    {
+        *first = Some(error);
+    }
+}
+
+const fn background_work_name(work: BackgroundWork) -> &'static str {
+    match work {
+        BackgroundWork::LineIndex => "line",
+        BackgroundWork::Viewport => "viewport",
+        BackgroundWork::Search => "search",
     }
 }
 
@@ -240,8 +403,7 @@ mod tests {
         observer
             .start(InputKind::Path, 10, None)
             .expect("disabled observers start without I/O");
-        observer.terminal_session();
-        observer.suspension();
+        assert!(observer.runtime_metrics().is_none());
         observer
             .finish(SessionOutcome::Normal)
             .expect("disabled observers finish without I/O");
@@ -262,15 +424,31 @@ mod tests {
                 .unwrap()
                 .contains(rustix::io::FdFlags::CLOEXEC)
         );
-        observer.terminal_session();
-        observer.suspension();
-        observer.terminal_session();
+        let metrics = observer.runtime_metrics().unwrap();
+        metrics.terminal_session();
+        metrics.suspension();
+        metrics.terminal_session();
+        metrics.event();
+        metrics.event();
+        metrics.record(RuntimeOperation::Draw, Duration::from_micros(11));
+        metrics.record(RuntimeOperation::Action, Duration::from_micros(7));
+        metrics.record(
+            RuntimeOperation::Background(BackgroundWork::LineIndex),
+            Duration::from_micros(5),
+        );
+        metrics.record(
+            RuntimeOperation::Background(BackgroundWork::Search),
+            Duration::from_micros(9),
+        );
         observer.finish(SessionOutcome::Normal).unwrap();
 
         let bytes = fs::read(&path).unwrap();
         assert!(bytes.is_ascii());
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("schema version=1\nsession_start input=stdin source_bytes=42\n"));
+        assert!(text.contains(
+            "runtime_summary frames=1 events=2 actions=1 draw_us=11 draw_max_us=11 action_us=7 action_max_us=7 line_steps=1 viewport_steps=0 search_steps=1 background_us=14 background_max_us=9 background_max_kind=search\n"
+        ));
         assert!(text.contains("session_summary outcome=normal elapsed_us="));
         assert!(text.ends_with(" terminal_sessions=2 suspensions=1\n"));
         assert_eq!(
@@ -358,6 +536,105 @@ mod tests {
             observer.finish(SessionOutcome::Error),
             Err(LogError::Write { path: failed, .. }) if failed == path
         ));
+    }
+
+    #[test]
+    fn finish_writes_retain_the_first_error() {
+        let runtime = PathBuf::from("runtime.log");
+        let session = PathBuf::from("session.log");
+        let mut first = None;
+        retain_first(&mut first, Ok(()));
+        retain_first(&mut first, Err(LogError::EventTooLarge(runtime.clone())));
+        retain_first(&mut first, Err(LogError::EventTooLarge(session)));
+        assert!(matches!(
+            first,
+            Some(LogError::EventTooLarge(path)) if path == runtime
+        ));
+    }
+
+    #[test]
+    fn metrics_are_fixed_size_saturating_aggregates() {
+        assert_eq!(std::mem::size_of::<DisabledRecorder>(), 0);
+        assert!(std::mem::size_of::<SessionMetrics>() <= 128);
+        assert_eq!(
+            duration_micros(Duration::new(u64::MAX, 999_999_999)),
+            u64::MAX
+        );
+
+        let mut metrics = SessionMetrics {
+            events: u64::MAX,
+            line_steps: u64::MAX,
+            draw: Timing {
+                calls: u64::MAX,
+                total_us: u64::MAX,
+                max_us: 0,
+            },
+            ..SessionMetrics::default()
+        };
+        metrics.event();
+        metrics.record(RuntimeOperation::Draw, Duration::from_micros(1));
+        metrics.record(
+            RuntimeOperation::Background(BackgroundWork::LineIndex),
+            Duration::from_micros(5),
+        );
+        metrics.record(
+            RuntimeOperation::Background(BackgroundWork::Search),
+            Duration::from_micros(5),
+        );
+        assert_eq!(metrics.events, u64::MAX);
+        assert_eq!(metrics.draw.calls, u64::MAX);
+        assert_eq!(metrics.draw.total_us, u64::MAX);
+        assert_eq!(metrics.draw.max_us, 1);
+        assert_eq!(metrics.line_steps, u64::MAX);
+        assert_eq!(metrics.background_max_kind, Some(BackgroundWork::LineIndex));
+    }
+
+    #[test]
+    fn maximum_runtime_summary_fits_one_event_and_precedes_session_summary() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        let mut observer = Observer::new(Some(path.clone()));
+        observer.start(InputKind::Path, u64::MAX, None).unwrap();
+        let metrics = observer.runtime_metrics().unwrap();
+        *metrics = SessionMetrics {
+            terminal_sessions: u64::MAX,
+            suspensions: u64::MAX,
+            events: u64::MAX,
+            draw: Timing {
+                calls: u64::MAX,
+                total_us: u64::MAX,
+                max_us: u64::MAX,
+            },
+            action: Timing {
+                calls: u64::MAX,
+                total_us: u64::MAX,
+                max_us: u64::MAX,
+            },
+            background: Timing {
+                calls: u64::MAX,
+                total_us: u64::MAX,
+                max_us: u64::MAX,
+            },
+            line_steps: u64::MAX,
+            viewport_steps: u64::MAX,
+            search_steps: u64::MAX,
+            background_max_kind: Some(BackgroundWork::Viewport),
+        };
+        observer.finish(SessionOutcome::Normal).unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        let mut lines = contents.lines();
+        assert_eq!(lines.next(), Some("schema version=1"));
+        assert_eq!(
+            lines.next(),
+            Some("session_start input=path source_bytes=18446744073709551615")
+        );
+        let runtime = lines.next().unwrap();
+        assert!(runtime.starts_with("runtime_summary "));
+        assert_eq!(runtime.len() + 1, 434);
+        assert!(runtime.is_ascii());
+        assert!(lines.next().unwrap().starts_with("session_summary "));
+        assert_eq!(lines.next(), None);
     }
 
     #[test]

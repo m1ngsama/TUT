@@ -20,9 +20,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::{SigId, low_level};
 
 use crate::{
-    app::{Action, App, Geometry, Outcome},
+    app::{Action, App, BackgroundWork, Geometry, Outcome},
     error::{ExternalSignal, RunOutcome, TutError},
-    observer::Observer,
+    observer::{DisabledRecorder, Observer, RuntimeOperation, RuntimeRecorder},
 };
 
 const MAX_POLL: Duration = Duration::from_millis(100);
@@ -338,12 +338,12 @@ fn refresh_geometry<T: TerminalDriver>(
     Ok(())
 }
 
-fn run_session<T: TerminalDriver>(
+fn run_session<T: TerminalDriver, R: RuntimeRecorder>(
     app: &mut App,
     session: &mut TerminalSession<'_, T>,
     signals: &SignalState,
     force_redraw: bool,
-    observer: &mut Observer,
+    recorder: &mut R,
 ) -> Primary {
     if let Err(primary) = refresh_geometry(app, session.driver, signals) {
         return primary;
@@ -351,7 +351,7 @@ fn run_session<T: TerminalDriver>(
     if let Err(primary) = session.initialize(signals) {
         return primary;
     }
-    observer.terminal_session();
+    recorder.terminal_session();
     if force_redraw {
         let result = session.driver.force_redraw();
         if let Err(primary) = check_control(signals) {
@@ -364,19 +364,19 @@ fn run_session<T: TerminalDriver>(
             });
         }
     }
-    event_loop(app, session.driver, signals)
+    event_loop(app, session.driver, signals, recorder)
 }
 
-fn run_with_observer<T: TerminalDriver>(
+fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder>(
     app: &mut App,
     driver: &mut T,
     signals: &SignalState,
-    observer: &mut Observer,
+    recorder: &mut R,
 ) -> Result<RunOutcome, TutError> {
     let mut session = TerminalSession::new(driver);
     let mut resumed = false;
     loop {
-        let primary = run_session(app, &mut session, signals, resumed, observer);
+        let primary = run_session(app, &mut session, signals, resumed, recorder);
         let restoration = session.restore();
         let primary = promote_termination(primary, signals);
         if !matches!(primary, Primary::Suspend) {
@@ -400,7 +400,7 @@ fn run_with_observer<T: TerminalDriver>(
             operation: "suspend process",
             source,
         })?;
-        observer.suspension();
+        recorder.suspension();
         resumed = true;
     }
 }
@@ -411,11 +411,16 @@ fn run_with_driver<T: TerminalDriver>(
     driver: &mut T,
     signals: &SignalState,
 ) -> Result<RunOutcome, TutError> {
-    let mut observer = Observer::new(None);
-    run_with_observer(app, driver, signals, &mut observer)
+    let mut recorder = DisabledRecorder;
+    run_with_recorder(app, driver, signals, &mut recorder)
 }
 
-fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &SignalState) -> Primary {
+fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
+    app: &mut App,
+    driver: &mut T,
+    signals: &SignalState,
+    recorder: &mut R,
+) -> Primary {
     let mut redraw = true;
 
     loop {
@@ -423,7 +428,9 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
             return primary;
         }
         if redraw {
+            let started = recorder.begin_operation();
             let result = driver.draw(app);
+            recorder.finish_operation(RuntimeOperation::Draw, started);
             if let Err(primary) = check_control(signals) {
                 return primary;
             }
@@ -433,8 +440,8 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
             redraw = false;
         }
 
-        let background_work = app.has_background_work();
-        let timeout = if background_work {
+        let background_work = app.background_work();
+        let timeout = if background_work.is_some() {
             BACKGROUND_POLL
         } else {
             MAX_POLL
@@ -455,8 +462,8 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
             return primary;
         }
         if !ready {
-            if background_work {
-                match advance_background(app, signals) {
+            if let Some(work) = background_work {
+                match advance_background(app, signals, recorder, work) {
                     Ok(changed) => redraw |= changed,
                     Err(primary) => return primary,
                 }
@@ -476,20 +483,24 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
                 });
             }
         };
+        recorder.event();
         if let Err(primary) = check_control(signals) {
             return primary;
         }
 
         if let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) {
-            match app.update(action) {
+            let started = recorder.begin_operation();
+            let result = app.update(action);
+            recorder.finish_operation(RuntimeOperation::Action, started);
+            match result {
                 Ok(Outcome::Changed) => redraw = true,
                 Ok(Outcome::Unchanged) => {}
                 Ok(Outcome::Quit) => return Primary::Normal,
                 Err(error) => return Primary::Error(error),
             }
         }
-        if app.has_background_work() {
-            match advance_background(app, signals) {
+        if let Some(work) = app.background_work() {
+            match advance_background(app, signals, recorder, work) {
                 Ok(changed) => redraw |= changed,
                 Err(primary) => return primary,
             }
@@ -497,8 +508,15 @@ fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &Signal
     }
 }
 
-fn advance_background(app: &mut App, signals: &SignalState) -> Result<bool, Primary> {
+fn advance_background<R: RuntimeRecorder>(
+    app: &mut App,
+    signals: &SignalState,
+    recorder: &mut R,
+    work: BackgroundWork,
+) -> Result<bool, Primary> {
+    let started = recorder.begin_operation();
     let result = app.advance_background();
+    recorder.finish_operation(RuntimeOperation::Background(work), started);
     check_control(signals)?;
     result.map_err(Primary::Error)
 }
@@ -594,7 +612,12 @@ pub(super) fn run(
             });
         }
     };
-    run_with_observer(app, &mut driver, signals, observer)
+    if let Some(metrics) = observer.runtime_metrics() {
+        run_with_recorder(app, &mut driver, signals, metrics)
+    } else {
+        let mut recorder = DisabledRecorder;
+        run_with_recorder(app, &mut driver, signals, &mut recorder)
+    }
 }
 
 #[cfg(test)]
@@ -713,6 +736,41 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TraceRecorder {
+        next_stamp: u64,
+        operations: Vec<(RuntimeOperation, u64)>,
+        events: u64,
+        terminal_sessions: u64,
+        suspensions: u64,
+    }
+
+    impl RuntimeRecorder for TraceRecorder {
+        type Stamp = u64;
+
+        fn begin_operation(&mut self) -> Self::Stamp {
+            let stamp = self.next_stamp;
+            self.next_stamp = self.next_stamp.saturating_add(1);
+            stamp
+        }
+
+        fn finish_operation(&mut self, operation: RuntimeOperation, started: Self::Stamp) {
+            self.operations.push((operation, started));
+        }
+
+        fn event(&mut self) {
+            self.events = self.events.saturating_add(1);
+        }
+
+        fn terminal_session(&mut self) {
+            self.terminal_sessions = self.terminal_sessions.saturating_add(1);
+        }
+
+        fn suspension(&mut self) {
+            self.suspensions = self.suspensions.saturating_add(1);
+        }
+    }
+
     fn quit_event() -> Event {
         Event::Key(KeyEvent {
             code: KeyCode::Char('q'),
@@ -771,6 +829,59 @@ mod tests {
             driver
                 .calls
                 .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn runtime_recorder_observes_only_tui_work_boundaries() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.txt");
+        fs::write(&path, "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.extend([Event::FocusGained, quit_event()]);
+        let mut recorder = TraceRecorder::default();
+
+        assert_eq!(
+            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(recorder.events, 2);
+        assert_eq!(recorder.terminal_sessions, 1);
+        assert_eq!(recorder.suspensions, 0);
+        assert_eq!(
+            recorder.operations,
+            vec![
+                (RuntimeOperation::Draw, 0),
+                (RuntimeOperation::Background(BackgroundWork::LineIndex), 1),
+                (RuntimeOperation::Action, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_recorder_accumulates_across_suspension() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+        let mut recorder = TraceRecorder::default();
+
+        assert_eq!(
+            run_with_recorder(&mut app(), &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(recorder.events, 1);
+        assert_eq!(recorder.terminal_sessions, 2);
+        assert_eq!(recorder.suspensions, 1);
+        assert_eq!(
+            recorder.operations,
+            vec![
+                (RuntimeOperation::Draw, 0),
+                (RuntimeOperation::Draw, 1),
+                (RuntimeOperation::Action, 2),
+            ]
         );
     }
 
