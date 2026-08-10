@@ -983,17 +983,19 @@ impl App {
             });
         }
 
-        let layout = self.layout.as_ref().expect("usable geometry has a layout");
-        let mut reader = self.document.reader(&mut self.document_cache);
-        let located = self
-            .locator
-            .as_mut()
-            .expect("viewport locator was initialized")
-            .advance(layout, &mut reader, &mut self.row_neighborhood)?;
+        let located = {
+            let layout = self.layout.as_ref().expect("usable geometry has a layout");
+            let mut reader = self.document.reader(&mut self.document_cache);
+            self.locator
+                .as_mut()
+                .expect("viewport locator was initialized")
+                .advance(layout, &mut reader, &mut self.row_neighborhood)?
+        };
         let Some(located) = located else {
             return Ok(false);
         };
 
+        self.document.validate()?;
         Ok(self.finish_viewport_request(request, located))
     }
 
@@ -2355,7 +2357,31 @@ mod tests {
 
         assert_eq!(app.anchor, anchor.checked_add(width).unwrap());
         let height = usize::from(app.geometry.body_height().unwrap().get());
-        assert!(app.document_cache.metrics().grapheme_emissions() <= (height + 1) * (width + 1));
+        assert_eq!(
+            app.document_cache.metrics().grapheme_emissions(),
+            (height + 1) * (width + 1)
+        );
+    }
+
+    #[test]
+    fn warm_forward_frontier_scans_only_one_tail_row() {
+        let width = 16usize;
+        let mut app = reader(&"x".repeat(SOURCE_WINDOW_BYTES * 2), width as u16, 7);
+        let anchor = SourceOffset::from_usize(width * 2_000);
+        app.anchor = anchor;
+        app.document_cache = DocumentCache::default();
+
+        app.update(Action::LineDown).unwrap();
+        settle_viewport(&mut app);
+        assert_eq!(app.anchor, anchor.checked_add(width).unwrap());
+
+        app.document_cache.reset_metrics();
+        app.update(Action::LineDown).unwrap();
+        assert!(app.advance_background().unwrap());
+
+        assert_eq!(app.anchor, anchor.checked_add(width * 2).unwrap());
+        assert!(app.viewport_request.is_none());
+        assert_eq!(app.document_cache.metrics().grapheme_emissions(), width + 1);
     }
 
     #[test]
@@ -2431,6 +2457,51 @@ mod tests {
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
         assert_eq!(app.anchor, anchor);
         assert!(app.viewport_request.is_some());
+    }
+
+    #[test]
+    fn cached_forward_frontiers_validate_files_before_reuse() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-forward-frontier.txt");
+        fs::write(&path, "x".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+        let initial = SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2);
+        app.anchor = initial;
+        app.anchor_is_row_start = true;
+        app.row_neighborhood.clear();
+
+        app.update(Action::LineDown).unwrap();
+        settle_viewport(&mut app);
+        let warm_anchor = initial.checked_add(16).unwrap();
+        assert_eq!(app.anchor, warm_anchor);
+
+        app.update(Action::LineDown).unwrap();
+        let request = app.viewport_request.unwrap();
+        assert_eq!(app.cached_viewport_location(request), None);
+        fs::write(path, "y".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+
+        assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
+        assert_eq!(app.anchor, warm_anchor);
+        assert!(app.viewport_request.is_some());
+    }
+
+    #[test]
+    fn resized_forward_frontiers_match_a_cold_layout_oracle() {
+        let mut app = reader(&"x".repeat(SOURCE_WINDOW_BYTES * 2), 16, 7);
+        app.anchor = SourceOffset::from_usize(16 * 2_000);
+        app.row_neighborhood.clear();
+        app.update(Action::LineDown).unwrap();
+        settle_viewport(&mut app);
+
+        app.update(Action::Resize(Geometry::new(17, 7))).unwrap();
+        let target = app.anchor;
+        let expected = locate(&mut app, target, RowDelta::Forward(0));
+        app.document_cache.reset_metrics();
+        settle_viewport(&mut app);
+
+        assert_eq!(app.anchor, expected.anchor);
+        assert!(app.document_cache.metrics().grapheme_emissions() > 0);
     }
 
     #[test]
