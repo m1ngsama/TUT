@@ -1,13 +1,10 @@
 mod input;
+mod signals;
 mod view;
 
 use std::{
     io::{self, Stdout},
     mem::size_of,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
     time::Duration,
 };
 
@@ -20,7 +17,8 @@ use crossterm::{
 use ratatui::{
     Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, buffer::Cell, layout::Rect,
 };
-use signal_hook::{SigId, low_level};
+use signals::SuspendOutcome;
+pub(super) use signals::{ProcessSessionLease, SignalHandlers, SignalState};
 
 use crate::{
     app::{Action, App, BackgroundWork, Geometry, Outcome},
@@ -88,150 +86,14 @@ fn terminal_size_error(columns: u16, rows: u16) -> TutError {
     }
 }
 
-#[derive(Default)]
-struct PendingSignals {
-    termination: AtomicUsize,
-    suspend: AtomicBool,
+pub(super) fn acquire_session() -> Result<ProcessSessionLease, TutError> {
+    ProcessSessionLease::acquire().ok_or(TutError::Busy)
 }
 
-#[derive(Clone, Default)]
-pub(super) struct SignalState(Arc<PendingSignals>);
-
-impl SignalState {
-    fn empty() -> Self {
-        Self::default()
-    }
-
-    pub(super) fn received(&self) -> Option<ExternalSignal> {
-        match self.0.termination.load(Ordering::SeqCst) {
-            signal if signal == signal_hook::consts::signal::SIGHUP as usize => {
-                Some(ExternalSignal::Hangup)
-            }
-            signal if signal == signal_hook::consts::signal::SIGINT as usize => {
-                Some(ExternalSignal::Interrupt)
-            }
-            signal if signal == signal_hook::consts::signal::SIGQUIT as usize => {
-                Some(ExternalSignal::Quit)
-            }
-            signal if signal == signal_hook::consts::signal::SIGTERM as usize => {
-                Some(ExternalSignal::Terminate)
-            }
-            _ => None,
-        }
-    }
-
-    fn suspend_requested(&self) -> bool {
-        self.0.suspend.load(Ordering::SeqCst)
-    }
-
-    fn take_suspend(&self) -> bool {
-        self.0.suspend.swap(false, Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    fn store_raw(&self, signal: usize) {
-        let _ = self
-            .0
-            .termination
-            .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn store_suspend(&self) {
-        self.0.suspend.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn store_continue(&self) {
-        self.0.suspend.store(false, Ordering::SeqCst);
-    }
-}
-
-const SIGNAL_HANDLER_COUNT: usize = 6;
-
-pub(super) struct SignalHandlers {
-    state: SignalState,
-    ids: [Option<SigId>; SIGNAL_HANDLER_COUNT],
-}
-
-impl SignalHandlers {
-    fn install() -> io::Result<Self> {
-        use signal_hook::consts::signal::{SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP};
-
-        let state = SignalState::empty();
-        let mut ids = [None; SIGNAL_HANDLER_COUNT];
-        let mut registered = 0;
-        for (signal, value) in [
-            (SIGHUP, SIGHUP as usize),
-            (SIGINT, SIGINT as usize),
-            (SIGQUIT, SIGQUIT as usize),
-            (SIGTERM, SIGTERM as usize),
-        ] {
-            let pending = Arc::clone(&state.0);
-            // SAFETY: The handler performs only a non-panicking atomic compare-exchange.
-            let registration = unsafe {
-                low_level::register(signal, move || {
-                    let _ = pending.termination.compare_exchange(
-                        0,
-                        value,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    );
-                })
-            };
-            match registration {
-                Ok(id) => {
-                    ids[registered] = Some(id);
-                    registered += 1;
-                }
-                Err(error) => {
-                    Self::unregister(&mut ids);
-                    return Err(error);
-                }
-            }
-        }
-        for (signal, suspended) in [(SIGTSTP, true), (SIGCONT, false)] {
-            let pending = Arc::clone(&state.0);
-            // SAFETY: The handler performs only a non-panicking atomic store.
-            let registration = unsafe {
-                low_level::register(signal, move || {
-                    pending.suspend.store(suspended, Ordering::SeqCst);
-                })
-            };
-            match registration {
-                Ok(id) => {
-                    ids[registered] = Some(id);
-                    registered += 1;
-                }
-                Err(error) => {
-                    Self::unregister(&mut ids);
-                    return Err(error);
-                }
-            }
-        }
-        debug_assert_eq!(registered, SIGNAL_HANDLER_COUNT);
-        Ok(Self { state, ids })
-    }
-
-    pub(super) fn state(&self) -> &SignalState {
-        &self.state
-    }
-
-    fn unregister(ids: &mut [Option<SigId>; SIGNAL_HANDLER_COUNT]) {
-        for id in ids.iter_mut().filter_map(Option::take) {
-            low_level::unregister(id);
-        }
-    }
-}
-
-impl Drop for SignalHandlers {
-    fn drop(&mut self) {
-        Self::unregister(&mut self.ids);
-    }
-}
-
-pub(super) fn install_signal_handlers() -> Result<SignalHandlers, TutError> {
-    SignalHandlers::install().map_err(|source| TutError::Io {
+pub(super) fn install_signal_handlers(
+    lease: ProcessSessionLease,
+) -> Result<SignalHandlers, TutError> {
+    SignalHandlers::install(lease).map_err(|source| TutError::Io {
         operation: "install signal handlers",
         source,
     })
@@ -250,6 +112,21 @@ trait TerminalDriver {
     fn show_cursor(&mut self) -> io::Result<()>;
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
     fn disable_raw_mode(&mut self) -> io::Result<()>;
+}
+
+trait SuspendControl {
+    fn suspend<F>(&mut self, stop: F) -> io::Result<SuspendOutcome>
+    where
+        F: FnOnce() -> io::Result<()>;
+}
+
+impl SuspendControl for SignalHandlers {
+    fn suspend<F>(&mut self, stop: F) -> io::Result<SuspendOutcome>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        SignalHandlers::suspend(self, stop)
+    }
 }
 
 struct TerminalSession<'a, T: TerminalDriver> {
@@ -447,10 +324,11 @@ fn run_session<T: TerminalDriver, R: RuntimeRecorder>(
     event_loop(app, session.driver, signals, recorder)
 }
 
-fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder>(
+fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder, S: SuspendControl>(
     app: &mut App,
     driver: &mut T,
     signals: &SignalState,
+    suspend: &mut S,
     recorder: &mut R,
 ) -> Result<RunOutcome, TutError> {
     let mut session = TerminalSession::new(driver);
@@ -464,21 +342,40 @@ fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder>(
         if let Some(restoration) = restoration {
             return Err(restoration);
         }
-        if !signals.take_suspend() {
-            continue;
-        }
         if let Some(signal) = signals.received() {
             return Ok(RunOutcome::Signal(signal));
         }
-        let result = session.driver.suspend();
+        let result = suspend.suspend(|| session.driver.suspend());
         if let Some(signal) = signals.received() {
             return Ok(RunOutcome::Signal(signal));
         }
-        result.map_err(|source| TutError::Io {
+        let outcome = result.map_err(|source| TutError::Io {
             operation: "suspend process",
             source,
         })?;
+        if outcome == SuspendOutcome::Cancelled {
+            continue;
+        }
         recorder.suspension();
+    }
+}
+
+#[cfg(test)]
+struct ImmediateSuspendControl {
+    signals: SignalState,
+}
+
+#[cfg(test)]
+impl SuspendControl for ImmediateSuspendControl {
+    fn suspend<F>(&mut self, stop: F) -> io::Result<SuspendOutcome>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        if !self.signals.take_suspend() {
+            return Ok(SuspendOutcome::Cancelled);
+        }
+        stop()?;
+        Ok(SuspendOutcome::Continued)
     }
 }
 
@@ -489,7 +386,10 @@ fn run_with_driver<T: TerminalDriver>(
     signals: &SignalState,
 ) -> Result<RunOutcome, TutError> {
     let mut recorder = DisabledRecorder;
-    run_with_recorder(app, driver, signals, &mut recorder)
+    let mut suspend = ImmediateSuspendControl {
+        signals: signals.clone(),
+    };
+    run_with_recorder(app, driver, signals, &mut suspend, &mut recorder)
 }
 
 fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
@@ -686,7 +586,15 @@ impl TerminalDriver for CrosstermDriver {
     }
 
     fn suspend(&mut self) -> io::Result<()> {
-        low_level::emulate_default_handler(signal_hook::consts::signal::SIGTSTP)
+        // SAFETY: SIGSTOP is valid and raise has no Rust memory-safety requirements.
+        let result = unsafe { libc::raise(libc::SIGSTOP) };
+        if result == 0 {
+            Ok(())
+        } else if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        }
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
@@ -704,9 +612,10 @@ impl TerminalDriver for CrosstermDriver {
 
 pub(super) fn run(
     app: &mut App,
-    signals: &SignalState,
+    handlers: &mut SignalHandlers,
     observer: &mut Observer,
 ) -> Result<RunOutcome, TutError> {
+    let signals = handlers.state().clone();
     let mut driver = match CrosstermDriver::new() {
         Ok(driver) => driver,
         Err(source) => {
@@ -720,20 +629,20 @@ pub(super) fn run(
         }
     };
     if let Some(metrics) = observer.runtime_metrics() {
-        run_with_recorder(app, &mut driver, signals, metrics)
+        run_with_recorder(app, &mut driver, &signals, handlers, metrics)
     } else {
         let mut recorder = DisabledRecorder;
-        run_with_recorder(app, &mut driver, signals, &mut recorder)
+        run_with_recorder(app, &mut driver, &signals, handlers, &mut recorder)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs, path::Path};
+    use std::{cell::Cell as StateCell, collections::VecDeque, fs, path::Path, rc::Rc};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use libc::{SIGHUP, SIGTERM};
     use ratatui::backend::TestBackend;
-    use signal_hook::consts::signal::{SIGHUP, SIGTERM};
     use tempfile::tempdir;
 
     use super::*;
@@ -750,6 +659,7 @@ mod tests {
         inject_continue_on: Option<&'static str>,
         signals: SignalState,
         poll_timeouts: Vec<Duration>,
+        signal_handlers_active: Option<Rc<StateCell<bool>>>,
     }
 
     impl FakeDriver {
@@ -765,11 +675,19 @@ mod tests {
                 inject_continue_on: None,
                 signals: signals.clone(),
                 poll_timeouts: Vec::new(),
+                signal_handlers_active: None,
             }
         }
 
         fn call(&mut self, name: &'static str) -> io::Result<()> {
             self.calls.push(name);
+            if let Some(active) = &self.signal_handlers_active {
+                if name == "suspend" {
+                    assert!(!active.get());
+                } else if matches!(name, "size" | "enable_raw" | "enter_alt" | "hide_cursor") {
+                    assert!(active.get());
+                }
+            }
             if self.inject_on == Some(name) {
                 self.signals.store_raw(SIGTERM as usize);
             }
@@ -786,6 +704,54 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct FakeSuspendControl {
+        signals: SignalState,
+        active: Rc<StateCell<bool>>,
+        calls: Vec<&'static str>,
+        inject_termination: bool,
+        fail_rearm: bool,
+    }
+
+    impl FakeSuspendControl {
+        fn new(signals: &SignalState, active: Rc<StateCell<bool>>) -> Self {
+            Self {
+                signals: signals.clone(),
+                active,
+                calls: Vec::new(),
+                inject_termination: false,
+                fail_rearm: false,
+            }
+        }
+    }
+
+    impl SuspendControl for FakeSuspendControl {
+        fn suspend<F>(&mut self, stop: F) -> io::Result<SuspendOutcome>
+        where
+            F: FnOnce() -> io::Result<()>,
+        {
+            self.calls.push("prepare_signal_stop");
+            if self.inject_termination {
+                self.signals.store_raw(SIGTERM as usize);
+                self.calls.push("cancel_signal_stop");
+                return Ok(SuspendOutcome::Cancelled);
+            }
+            if !self.signals.take_suspend() {
+                self.calls.push("cancel_signal_stop");
+                return Ok(SuspendOutcome::Cancelled);
+            }
+            self.active.set(false);
+            self.calls.push("inherit_signal_handlers");
+            let stop_result = stop();
+            self.calls.push("rearm_signal_handlers");
+            if self.fail_rearm {
+                return Err(io::Error::other("rearm_signal_handlers"));
+            }
+            self.active.set(true);
+            stop_result?;
+            Ok(SuspendOutcome::Continued)
         }
     }
 
@@ -931,6 +897,18 @@ mod tests {
             app.advance_background().unwrap();
         }
         app
+    }
+
+    fn run_with_test_recorder<T: TerminalDriver, R: RuntimeRecorder>(
+        app: &mut App,
+        driver: &mut T,
+        signals: &SignalState,
+        recorder: &mut R,
+    ) -> Result<RunOutcome, TutError> {
+        let mut suspend = ImmediateSuspendControl {
+            signals: signals.clone(),
+        };
+        run_with_recorder(app, driver, signals, &mut suspend, recorder)
     }
 
     #[test]
@@ -1088,7 +1066,7 @@ mod tests {
         let mut app = app();
 
         assert_eq!(
-            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Normal
         );
 
@@ -1107,7 +1085,7 @@ mod tests {
         let mut app = app_from_text(Path::new("/tmp/queued-render.txt"), "x".repeat(4096));
 
         assert_eq!(
-            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(
@@ -1150,7 +1128,7 @@ mod tests {
         let mut recorder = TraceRecorder::default();
 
         assert_eq!(
-            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(recorder.events, 2);
@@ -1176,7 +1154,7 @@ mod tests {
         let mut app = ready_app();
 
         assert_eq!(
-            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Normal
         );
         assert_eq!(recorder.events, 1);
@@ -1190,6 +1168,103 @@ mod tests {
                 (RuntimeOperation::Action, 2),
             ]
         );
+    }
+
+    #[test]
+    fn signal_handlers_rearm_before_terminal_reinitialization() {
+        let signals = SignalState::empty();
+        let active = Rc::new(StateCell::new(true));
+        let mut driver = FakeDriver::new(&signals);
+        driver.signal_handlers_active = Some(Rc::clone(&active));
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+        let mut suspend = FakeSuspendControl::new(&signals, active);
+        let mut recorder = DisabledRecorder;
+
+        assert_eq!(
+            run_with_recorder(
+                &mut ready_app(),
+                &mut driver,
+                &signals,
+                &mut suspend,
+                &mut recorder,
+            )
+            .unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(
+            suspend.calls,
+            [
+                "prepare_signal_stop",
+                "inherit_signal_handlers",
+                "rearm_signal_handlers"
+            ]
+        );
+        assert_eq!(
+            driver.calls.iter().filter(|call| **call == "size").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn termination_before_signal_stop_commit_cancels_suspension() {
+        let signals = SignalState::empty();
+        let active = Rc::new(StateCell::new(true));
+        let mut driver = FakeDriver::new(&signals);
+        driver.signal_handlers_active = Some(Rc::clone(&active));
+        driver.inject_suspend_on = Some("poll");
+        let mut suspend = FakeSuspendControl::new(&signals, active);
+        suspend.inject_termination = true;
+        let mut recorder = DisabledRecorder;
+
+        assert_eq!(
+            run_with_recorder(
+                &mut ready_app(),
+                &mut driver,
+                &signals,
+                &mut suspend,
+                &mut recorder,
+            )
+            .unwrap(),
+            RunOutcome::Signal(ExternalSignal::Terminate)
+        );
+        assert_eq!(suspend.calls, ["prepare_signal_stop", "cancel_signal_stop"]);
+        assert!(!driver.calls.contains(&"suspend"));
+    }
+
+    #[test]
+    fn failed_signal_rearm_prevents_terminal_reinitialization() {
+        let signals = SignalState::empty();
+        let active = Rc::new(StateCell::new(true));
+        let mut driver = FakeDriver::new(&signals);
+        driver.signal_handlers_active = Some(Rc::clone(&active));
+        driver.inject_suspend_on = Some("poll");
+        let mut suspend = FakeSuspendControl::new(&signals, active);
+        suspend.fail_rearm = true;
+        let mut recorder = DisabledRecorder;
+
+        let error = run_with_recorder(
+            &mut ready_app(),
+            &mut driver,
+            &signals,
+            &mut suspend,
+            &mut recorder,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "failed to suspend process: rearm_signal_handlers"
+        );
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "enable_raw")
+                .count(),
+            1
+        );
+        assert_eq!(driver.calls.last(), Some(&"suspend"));
     }
 
     #[test]
@@ -1254,7 +1329,7 @@ mod tests {
             let mut app = app_from_text(Path::new("/tmp/partial-frame.txt"), "x".repeat(4096));
 
             assert_eq!(
-                run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+                run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
                 RunOutcome::Normal
             );
             assert_eq!(recorder.suspensions, 1);
@@ -1487,7 +1562,7 @@ mod tests {
         let mut app = app_from_text(Path::new("/tmp/signal-render.txt"), "x".repeat(4096));
 
         assert_eq!(
-            run_with_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
         assert_eq!(

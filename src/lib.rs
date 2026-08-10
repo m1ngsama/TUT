@@ -50,6 +50,7 @@ where
 }
 
 fn run_open(command: OpenCommand) -> Result<RunResult, TutError> {
+    let lease = tui::acquire_session()?;
     let log_file = command.log_file.or_else(|| {
         env::var_os("TUT_LOG_FILE")
             .filter(|value| !value.is_empty())
@@ -63,9 +64,14 @@ fn run_open(command: OpenCommand) -> Result<RunResult, TutError> {
                 return Err(TutError::NotATerminal);
             }
 
-            let handlers = tui::install_signal_handlers()?;
-            let document = document::load(path)?;
-            run_document(document, handlers, &mut observer, InputKind::Path)
+            let mut handlers = tui::install_signal_handlers(lease)?;
+            let result = match document::load(path) {
+                Ok(document) => {
+                    run_document(document, &mut handlers, &mut observer, InputKind::Path)
+                }
+                Err(error) => Err(error.into()),
+            };
+            finish_signal_handlers(handlers, result)
         }
         Input::StandardInput => {
             let stdin_is_terminal = io::stdin().is_terminal();
@@ -82,8 +88,14 @@ fn run_open(command: OpenCommand) -> Result<RunResult, TutError> {
                 ensure_standard_input_readable(&input)?;
                 document::load_standard_input(&mut input)?
             };
-            let handlers = tui::install_signal_handlers()?;
-            run_document(document, handlers, &mut observer, InputKind::StandardInput)
+            let mut handlers = tui::install_signal_handlers(lease)?;
+            let result = run_document(
+                document,
+                &mut handlers,
+                &mut observer,
+                InputKind::StandardInput,
+            );
+            finish_signal_handlers(handlers, result)
         }
     }
 }
@@ -111,7 +123,7 @@ fn ensure_standard_input_readable(input: &impl AsFd) -> Result<(), LoadError> {
 
 fn run_document(
     document: document::Document,
-    handlers: tui::SignalHandlers,
+    handlers: &mut tui::SignalHandlers,
     observer: &mut Observer,
     input: InputKind,
 ) -> Result<RunResult, TutError> {
@@ -141,7 +153,7 @@ fn run_document(
         if let Some(signal) = handlers.state().received() {
             Ok(RunResult::Completed(RunOutcome::Signal(signal)))
         } else {
-            tui::run(&mut app, handlers.state(), observer).map(RunResult::Completed)
+            tui::run(&mut app, handlers, observer).map(RunResult::Completed)
         }
     };
     let result = promote_run_signal(result, handlers.state());
@@ -153,6 +165,33 @@ fn run_document(
     let logging = observer.finish(outcome).map_err(TutError::from);
     let result = promote_run_signal(result, handlers.state());
     combine_run_and_log(result, logging)
+}
+
+fn finish_signal_handlers(
+    mut handlers: tui::SignalHandlers,
+    result: Result<RunResult, TutError>,
+) -> Result<RunResult, TutError> {
+    let result = promote_run_signal(result, handlers.state());
+    let restoration = handlers.restore().map_err(|source| TutError::Io {
+        operation: "restore signal handlers",
+        source,
+    });
+    let result = promote_run_signal(result, handlers.state());
+    match (result, restoration) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(RunResult::Completed(RunOutcome::Signal(signal))), Err(restoration)) => {
+            Err(TutError::SignalAndSignalHandlerRestoration {
+                signal,
+                restoration: Box::new(restoration),
+            })
+        }
+        (Ok(_), Err(restoration)) => Err(restoration),
+        (Err(primary), Err(restoration)) => Err(TutError::PrimaryAndSignalHandlerRestoration {
+            primary: Box::new(primary),
+            restoration: Box::new(restoration),
+        }),
+    }
 }
 
 fn promote_run_signal(
