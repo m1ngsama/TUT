@@ -402,6 +402,39 @@ mod pty {
             }
         }
 
+        fn write_command_with_timeout(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+            let deadline = Instant::now() + TIMEOUT;
+            while !bytes.is_empty() {
+                if Instant::now() >= deadline {
+                    self.terminate_and_reap();
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "PTY input timeout"));
+                }
+                let result = match &mut self.command_master {
+                    Some(master) => master.write(bytes),
+                    None => self.master.write(bytes),
+                };
+                match result {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    Ok(count) => bytes = &bytes[count..],
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        self.pump()?;
+                        if self.child.try_wait()?.is_some() {
+                            self.reaped = true;
+                            self.read_stderr()?;
+                            return Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "PTY child exited before accepting terminal input",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+
         fn pump(&mut self) -> io::Result<()> {
             let mut buffer = [0_u8; 8192];
             loop {
@@ -605,6 +638,17 @@ mod pty {
         assert_eq!(actual.line_discipline, expected.line_discipline);
     }
 
+    fn assert_session_terminal_restored(pty: &PtyChild) {
+        for sequence in [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT] {
+            assert!(
+                pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
+        pty.assert_restored();
+    }
+
     fn open_test_pty() -> io::Result<(File, File, CString, Termios)> {
         let master_fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
         grantpt(&master_fd)?;
@@ -759,6 +803,79 @@ mod pty {
         assert_eq!(status.code(), Some(0));
         assert!(pty.stderr_output.is_empty());
         pty.assert_restored();
+    }
+
+    #[test]
+    fn oversized_terminal_sequence_hits_a_bound_and_restores_the_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "bounded input\n").unwrap();
+        let directory = tempdir().unwrap();
+        let log = directory.path().join("session.log");
+        let mut pty = PtyChild::spawn_logged(file.path(), Some(&log), None).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+
+        let mut sequence = vec![b'1'; 64 * 1024 + 1];
+        sequence[..2].copy_from_slice(b"\x1b[");
+        pty.write_command_with_timeout(&sequence).unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(1));
+        assert!(
+            pty.stderr_output
+                == b"tut: failed to poll terminal events: terminal input sequence exceeded 65536 bytes\n"
+                || pty.stderr_output
+                    == b"tut: failed to poll terminal events: terminal input sequence did not finish within 2 seconds\n",
+            "unexpected terminal input bound: {:?}",
+            String::from_utf8_lossy(&pty.stderr_output)
+        );
+        assert_session_terminal_restored(&pty);
+        assert!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .contains("session_summary outcome=error ")
+        );
+    }
+
+    #[test]
+    fn orphan_bracketed_paste_times_out_and_restores_the_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "bounded input\n").unwrap();
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+
+        let started = Instant::now();
+        pty.master.write_all(b"\x1b[200~").unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(1));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(1_500));
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "orphan paste timeout exceeded its scheduling allowance: {elapsed:?}"
+        );
+        assert_eq!(
+            pty.stderr_output,
+            b"tut: failed to poll terminal events: terminal input sequence did not finish within 2 seconds\n"
+        );
+        assert_session_terminal_restored(&pty);
+    }
+
+    #[test]
+    fn internal_event_flood_and_unknown_csi_do_not_wedge_input() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "bounded input\n").unwrap();
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+
+        let mut input = Vec::with_capacity(4_097 * b"\x1b[1;1R".len() + 11);
+        for _ in 0..4_097 {
+            input.extend_from_slice(b"\x1b[1;1R");
+        }
+        input.extend_from_slice(b"\x1b[?997;1nq");
+        pty.write_command_with_timeout(&input).unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        assert_session_terminal_restored(&pty);
     }
 
     #[test]
