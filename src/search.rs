@@ -7,6 +7,7 @@ use crate::{
 };
 
 const SEARCH_INDEX_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = SOURCE_WINDOW_BYTES as u64;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
@@ -269,8 +270,8 @@ impl SearchIndex {
         })
     }
 
-    pub(super) fn replay(&self, visible: Range<SourceOffset>) -> Option<SearchReplay> {
-        if visible.start >= visible.end || visible.start >= self.scanned_to {
+    pub(super) fn highlights(&self, visible: Range<SourceOffset>) -> Option<SearchHighlights> {
+        if !self.complete || visible.start >= visible.end || visible.start >= self.source_end {
             return None;
         }
         let earliest = visible
@@ -279,13 +280,12 @@ impl SearchIndex {
             .unwrap_or(self.source_start)
             .max(self.source_start);
         let checkpoint = self.checkpoint_at_or_before(earliest);
-        Some(SearchReplay {
+        Some(SearchHighlights {
             visible,
             cursor: checkpoint.scan_at,
-            stop: self.scanned_to,
-            pending: Vec::new(),
-            pending_index: 0,
-            complete: false,
+            source_end: self.source_end,
+            ranges: Vec::new(),
+            complete: checkpoint.scan_at >= self.source_end,
         })
     }
 
@@ -407,60 +407,70 @@ impl SearchNavigation {
     }
 }
 
-pub(super) struct SearchReplay {
+#[derive(Debug)]
+pub(super) struct SearchHighlights {
     visible: Range<SourceOffset>,
     cursor: SourceOffset,
-    stop: SourceOffset,
-    pending: Vec<SearchRange>,
-    pending_index: usize,
+    source_end: SourceOffset,
+    ranges: Vec<SearchRange>,
     complete: bool,
 }
 
-impl SearchReplay {
-    pub(super) fn peek(
+impl SearchHighlights {
+    pub(super) const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(super) fn covers(&self, visible: &Range<SourceOffset>) -> bool {
+        self.visible == *visible
+    }
+
+    pub(super) fn ranges(&self) -> &[SearchRange] {
+        if self.complete { &self.ranges } else { &[] }
+    }
+
+    pub(super) fn advance(
         &mut self,
         reader: &mut DocumentReader<'_>,
         needle: &str,
-    ) -> Result<Option<SearchRange>, TutError> {
-        self.refill(reader, needle)?;
-        Ok(self.pending.get(self.pending_index).copied())
-    }
-
-    pub(super) fn next(
-        &mut self,
-        reader: &mut DocumentReader<'_>,
-        needle: &str,
-    ) -> Result<Option<SearchRange>, TutError> {
-        self.refill(reader, needle)?;
-        let next = self.pending.get(self.pending_index).copied();
-        self.pending_index += usize::from(next.is_some());
-        Ok(next)
-    }
-
-    fn refill(&mut self, reader: &mut DocumentReader<'_>, needle: &str) -> Result<(), TutError> {
-        while self.pending_index == self.pending.len() && !self.complete {
-            self.pending.clear();
-            self.pending_index = 0;
-            if self.cursor >= self.stop || self.cursor >= self.visible.end {
-                self.complete = true;
-                break;
-            }
-
-            self.cursor = scan_window(reader, needle, self.cursor, reader.source_end(), |range| {
-                if range.start() < self.stop
-                    && range.start() < self.visible.end
-                    && range.end() > self.visible.start
-                {
-                    if self.pending.len() == self.pending.capacity() {
-                        self.pending
-                            .try_reserve(1)
-                            .map_err(|_| SearchError::Allocation)?;
-                    }
-                    self.pending.push(range);
-                }
-                Ok(())
-            })?;
+    ) -> Result<bool, TutError> {
+        if self.complete {
+            return Ok(false);
         }
+        if self.cursor >= self.source_end || self.cursor >= self.visible.end {
+            self.complete = true;
+            return Ok(true);
+        }
+
+        self.cursor = scan_window(reader, needle, self.cursor, self.source_end, |range| {
+            if range.start() < self.visible.end && range.end() > self.visible.start {
+                self.push(range)?;
+            }
+            Ok(())
+        })?;
+        self.complete = self.cursor >= self.source_end || self.cursor >= self.visible.end;
+        Ok(self.complete)
+    }
+
+    fn push(&mut self, range: SearchRange) -> Result<(), TutError> {
+        if let Some(last) = self.ranges.last_mut()
+            && last.end() == range.start()
+        {
+            last.end = range.end();
+            return Ok(());
+        }
+        let max_ranges = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>();
+        if self.ranges.len() >= max_ranges {
+            return Err(SearchError::Allocation.into());
+        }
+        if self.ranges.len() == self.ranges.capacity() {
+            let remaining = max_ranges - self.ranges.len();
+            let additional = self.ranges.capacity().max(256).min(remaining);
+            self.ranges
+                .try_reserve_exact(additional)
+                .map_err(|_| SearchError::Allocation)?;
+        }
+        self.ranges.push(range);
         Ok(())
     }
 }
@@ -554,12 +564,27 @@ mod tests {
         needle: &str,
         visible: Range<SourceOffset>,
     ) -> Vec<SearchRange> {
-        let mut replay = index.replay(visible).unwrap();
+        let mut highlights = index.highlights(visible).unwrap();
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
+        while !highlights.is_complete() {
+            highlights.advance(&mut reader, needle).unwrap();
+        }
+        highlights.ranges().to_vec()
+    }
+
+    fn exact_matches(document: &Document, needle: &str) -> Vec<SearchRange> {
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let source_end = reader.source_end();
+        let mut cursor = reader.source_start();
         let mut matches = Vec::new();
-        while let Some(range) = replay.next(&mut reader, needle).unwrap() {
-            matches.push(range);
+        while cursor < source_end {
+            cursor = scan_window(&mut reader, needle, cursor, source_end, |range| {
+                matches.push(range);
+                Ok(())
+            })
+            .unwrap();
         }
         matches
     }
@@ -585,13 +610,9 @@ mod tests {
     #[test]
     fn builds_a_global_nonoverlapping_index() {
         let (document, index) = complete("aaaaaa", "aa");
+        assert!(index.is_complete());
         assert_eq!(
-            matches(
-                &document,
-                &index,
-                "aa",
-                SourceOffset::ZERO..SourceOffset::new(6)
-            ),
+            exact_matches(&document, "aa"),
             vec![
                 SearchRange::new(SourceOffset::new(0), SourceOffset::new(2)).unwrap(),
                 SearchRange::new(SourceOffset::new(2), SourceOffset::new(4)).unwrap(),
@@ -676,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_replay_includes_matches_crossing_its_start() {
+    fn viewport_highlights_include_matches_crossing_its_start() {
         let (document, index) = complete("abcd--abcd", "abcd");
         let visible = matches(
             &document,
@@ -685,6 +706,43 @@ mod tests {
             SourceOffset::new(3)..SourceOffset::new(7),
         );
         assert_eq!(visible.len(), 2);
+    }
+
+    #[test]
+    fn viewport_highlights_merge_adjacent_matches() {
+        let (document, index) = complete("aaaaaa", "aa");
+        assert_eq!(
+            matches(
+                &document,
+                &index,
+                "aa",
+                SourceOffset::ZERO..SourceOffset::new(6)
+            ),
+            vec![SearchRange::new(SourceOffset::ZERO, SourceOffset::new(6)).unwrap()]
+        );
+    }
+
+    #[test]
+    fn viewport_highlights_advance_one_source_window_at_a_time() {
+        let text = "x".repeat(SOURCE_WINDOW_BYTES * 2 + 17);
+        let source_end = SourceOffset::from_usize(text.len());
+        let (document, index) = complete(&text, "absent");
+        let mut highlights = index.highlights(SourceOffset::ZERO..source_end).unwrap();
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+
+        assert!(!highlights.advance(&mut reader, "absent").unwrap());
+        assert_eq!(
+            highlights.cursor,
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES)
+        );
+        assert!(!highlights.advance(&mut reader, "absent").unwrap());
+        assert_eq!(
+            highlights.cursor,
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2)
+        );
+        assert!(highlights.advance(&mut reader, "absent").unwrap());
+        assert!(highlights.is_complete());
     }
 
     #[test]
@@ -779,11 +837,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_replay_never_reads_beyond_the_committed_frontier() {
+    fn incomplete_indexes_do_not_create_viewport_highlights() {
         let mut text = "cat".to_owned();
         text.push_str(&"x".repeat(SOURCE_WINDOW_BYTES * 2));
         text.push_str("cat");
-        let source_end = SourceOffset::from_usize(text.len());
         let document = Document::from_text(Path::new("search.txt"), text);
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
@@ -792,9 +849,10 @@ mod tests {
             .unwrap();
         index.advance(&mut reader, "cat").unwrap();
 
-        assert_eq!(
-            matches(&document, &index, "cat", SourceOffset::ZERO..source_end),
-            vec![SearchRange::new(SourceOffset::ZERO, SourceOffset::new(3)).unwrap()]
+        assert!(
+            index
+                .highlights(SourceOffset::ZERO..document.source_end())
+                .is_none()
         );
     }
 

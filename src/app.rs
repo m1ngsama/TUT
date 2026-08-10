@@ -11,7 +11,9 @@ use crate::{
         REPLACEMENT_CHARACTER, ViewportLayout, ensure_viewport_layout, progress_percent,
     },
     line_index::LinePosition,
-    search::{MAX_SEARCH_QUERY_BYTES, SearchIndex, SearchNavigation, SearchRange, SearchReplay},
+    search::{
+        MAX_SEARCH_QUERY_BYTES, SearchHighlights, SearchIndex, SearchNavigation, SearchRange,
+    },
     source::SourceOffset,
 };
 
@@ -225,6 +227,7 @@ pub(super) struct App {
     current_match: Option<SearchRange>,
     navigation: Option<SearchNavigation>,
     pending_navigation: i64,
+    highlights: Option<SearchHighlights>,
     search_turn: bool,
 }
 
@@ -250,6 +253,7 @@ impl App {
             current_match: None,
             navigation: None,
             pending_navigation: 0,
+            highlights: None,
             search_turn: true,
         }
     }
@@ -306,6 +310,7 @@ impl App {
 
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
         let viewport = self.viewport()?;
+        self.prepare_search_highlights(viewport);
         let line = self.line_position_for(viewport)?;
         let progress = self.progress_for(viewport);
         let rows = self.build_render_rows(viewport)?;
@@ -318,6 +323,33 @@ impl App {
             total_lines: line.and_then(LinePosition::total),
             status: self.search_status(),
         })
+    }
+
+    fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) {
+        let Some(viewport) = viewport else {
+            self.highlights = None;
+            return;
+        };
+        let visible = viewport.first_visible_start..viewport.visible_end;
+        if self
+            .highlights
+            .as_ref()
+            .is_some_and(|highlights| highlights.covers(&visible))
+        {
+            return;
+        }
+        self.highlights = None;
+        if !matches!(self.mode, Mode::Reading) {
+            return;
+        }
+        let Some(index) = self
+            .search_index
+            .as_ref()
+            .filter(|index| index.is_complete() && index.has_matches())
+        else {
+            return;
+        };
+        self.highlights = index.highlights(visible);
     }
 
     fn line_position_for(
@@ -339,7 +371,11 @@ impl App {
                     .as_ref()
                     .is_some_and(|index| !index.is_complete())
                     || self.navigation.is_some()
-                    || self.pending_navigation != 0))
+                    || self.pending_navigation != 0
+                    || self
+                        .highlights
+                        .as_ref()
+                        .is_some_and(|highlights| !highlights.is_complete())))
     }
 
     pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
@@ -349,7 +385,11 @@ impl App {
                 .as_ref()
                 .is_some_and(|index| !index.is_complete())
                 || self.navigation.is_some()
-                || self.pending_navigation != 0);
+                || self.pending_navigation != 0
+                || self
+                    .highlights
+                    .as_ref()
+                    .is_some_and(|highlights| !highlights.is_complete()));
         let line_pending = !self.document.line_index_complete();
         if search_pending && (!line_pending || self.search_turn) {
             self.search_turn = false;
@@ -383,7 +423,11 @@ impl App {
         } else {
             if self.navigation.is_none() {
                 if self.pending_navigation == 0 {
-                    return Ok(false);
+                    let Some(highlights) = self.highlights.as_mut() else {
+                        return Ok(false);
+                    };
+                    let mut reader = self.document.reader(&mut self.search_cache);
+                    return highlights.advance(&mut reader, &self.committed_query);
                 }
                 let Some(current) = self.current_match else {
                     let changed = self.pending_navigation != 0;
@@ -583,6 +627,7 @@ impl App {
         self.current_match = None;
         self.navigation = None;
         self.pending_navigation = 0;
+        self.highlights = None;
         true
     }
 
@@ -598,6 +643,7 @@ impl App {
             self.current_match = None;
             self.navigation = None;
             self.pending_navigation = 0;
+            self.highlights = None;
             return Ok(true);
         }
 
@@ -614,6 +660,7 @@ impl App {
         self.current_match = None;
         self.navigation = None;
         self.pending_navigation = 0;
+        self.highlights = None;
         self.search_turn = true;
         Ok(true)
     }
@@ -659,24 +706,20 @@ impl App {
         };
         let layout = self.layout.as_ref().expect("viewport has a layout");
         let visible = viewport.first_visible_start..viewport.visible_end;
-        let mut matches =
-            MatchCursor::for_viewport(self.search_index.as_ref(), self.current_match, visible);
+        let ranges = self
+            .highlights
+            .as_ref()
+            .filter(|highlights| highlights.covers(&visible))
+            .map_or(&[][..], SearchHighlights::ranges);
+        let mut matches = MatchCursor::new(ranges, self.current_match);
         let mut rows = Vec::new();
         rows.try_reserve_exact(viewport.visible_rows)
             .map_err(|_| TutError::Allocation("visible rows"))?;
 
         let mut start = viewport.first_visible_start;
         let mut reader = self.document.reader(&mut self.document_cache);
-        let mut search_reader = self.document.reader(&mut self.search_cache);
         for row_number in 0..viewport.visible_rows {
-            let (row, next) = build_render_row(
-                layout,
-                &mut reader,
-                &mut search_reader,
-                &self.committed_query,
-                start,
-                &mut matches,
-            )?;
+            let (row, next) = build_render_row(layout, &mut reader, start, &mut matches)?;
             rows.push(row);
             if row_number + 1 < viewport.visible_rows {
                 start = next.expect("non-final visible rows have successors");
@@ -689,15 +732,13 @@ impl App {
 fn build_render_row(
     layout: &ViewportLayout,
     reader: &mut DocumentReader<'_>,
-    search_reader: &mut DocumentReader<'_>,
-    query: &str,
     start: SourceOffset,
-    matches: &mut MatchCursor,
+    matches: &mut MatchCursor<'_>,
 ) -> Result<(RenderRow, Option<SourceOffset>), TutError> {
     let mut text = String::new();
     let mut spans = Vec::new();
     let next = layout.visit_projected_row(reader, start, |atom| {
-        let highlight = matches.role_for(search_reader, query, atom.source())?;
+        let highlight = matches.role_for(atom.source());
         if spans.len() == spans.capacity() {
             spans
                 .try_reserve(1)
@@ -710,52 +751,46 @@ fn build_render_row(
     Ok((RenderRow { text, spans }, next))
 }
 
-struct MatchCursor {
-    pending: Option<SearchReplay>,
+struct MatchCursor<'a> {
+    ranges: &'a [SearchRange],
+    next: usize,
     spanning: Option<SearchRange>,
     current: Option<SearchRange>,
 }
 
-impl MatchCursor {
-    fn for_viewport(
-        search_index: Option<&SearchIndex>,
-        current: Option<SearchRange>,
-        visible: Range<SourceOffset>,
-    ) -> Self {
+impl<'a> MatchCursor<'a> {
+    fn new(ranges: &'a [SearchRange], current: Option<SearchRange>) -> Self {
         Self {
-            pending: search_index.and_then(|index| index.replay(visible)),
+            ranges,
+            next: 0,
             spanning: None,
             current,
         }
     }
 
-    fn role_for(
-        &mut self,
-        reader: &mut DocumentReader<'_>,
-        query: &str,
-        atom: GraphemeRange,
-    ) -> Result<Highlight, TutError> {
-        let mut role = Highlight::None;
+    fn role_for(&mut self, atom: GraphemeRange) -> Highlight {
+        let mut role = self.current.map_or(Highlight::None, |current| {
+            if intersects(current, atom) {
+                Highlight::Current
+            } else {
+                Highlight::None
+            }
+        });
         if let Some(active) = self.spanning.take() {
             if intersects(active, atom) {
                 role = promote(role, active, self.current);
             }
             if active.end() > atom.end() {
                 self.spanning = Some(active);
-                return Ok(role);
+                return role;
             }
         }
 
-        let Some(pending) = &mut self.pending else {
-            return Ok(role);
-        };
-        while let Some(next) = pending.peek(reader, query)? {
-            if next.start() >= atom.end() {
+        while let Some(&range) = self.ranges.get(self.next) {
+            if range.start() >= atom.end() {
                 break;
             }
-            let range = pending
-                .next(reader, query)?
-                .expect("peeked search match exists");
+            self.next += 1;
             if intersects(range, atom) {
                 role = promote(role, range, self.current);
             }
@@ -764,7 +799,7 @@ impl MatchCursor {
                 break;
             }
         }
-        Ok(role)
+        role
     }
 }
 
@@ -1007,6 +1042,14 @@ mod tests {
     fn render_state_owns_rows_and_marks_all_matches() {
         let mut app = reader("cat cat", 16, 4);
         commit(&mut app, "cat");
+        {
+            let state = app.render_state().unwrap();
+            assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
+            assert_eq!(state.rows[0].spans[4].highlight, Highlight::None);
+        }
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
         let state = app.render_state().unwrap();
         assert_eq!(state.rows[0].spans[0].highlight, Highlight::Current);
         assert_eq!(state.rows[0].spans[4].highlight, Highlight::Match);
