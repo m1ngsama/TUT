@@ -41,25 +41,31 @@ impl RowNeighborhood {
         self.edges.clear();
     }
 
-    pub(super) fn locate_move(
+    pub(super) fn locate_target(
         &self,
         key: (DocumentId, ContentWidth),
         source_start: SourceOffset,
-        anchor: SourceOffset,
+        source_end: SourceOffset,
+        target: SourceOffset,
         delta: RowDelta,
         height: BodyHeight,
     ) -> Option<LocatedViewport> {
-        if self.key != Some(key) {
+        if self.key != Some(key) || target < source_start || target > source_end {
             return None;
         }
-        let anchor_index = self
-            .edges
-            .binary_search_by_key(&anchor, |edge| edge.start)
-            .ok()?;
+        let target_index = match self.edges.binary_search_by_key(&target, |edge| edge.start) {
+            Ok(index) => index,
+            Err(0) => return None,
+            Err(index) => index - 1,
+        };
+        let target_edge = self.edges.get(target_index)?;
+        if target_edge.next.is_some_and(|next| target >= next) {
+            return None;
+        }
         let candidate_index = match delta {
             RowDelta::Backward(amount) => {
-                if amount <= anchor_index {
-                    anchor_index - amount
+                if amount <= target_index {
+                    target_index - amount
                 } else if self.edges.front()?.start == source_start {
                     0
                 } else {
@@ -67,7 +73,7 @@ impl RowNeighborhood {
                 }
             }
             RowDelta::Forward(amount) => {
-                let mut index = anchor_index;
+                let mut index = target_index;
                 for _ in 0..amount {
                     let Some(next) = self.edges.get(index)?.next else {
                         break;
@@ -556,21 +562,190 @@ mod tests {
         let height = BodyHeight::new(3).unwrap();
 
         assert_eq!(
-            rows.locate_move(key, offset(0), offset(0), RowDelta::Forward(2), height),
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(6),
+                offset(0),
+                RowDelta::Forward(2),
+                height,
+            ),
             Some(LocatedViewport {
                 anchor: offset(2),
                 at_end: false,
             })
         );
         assert_eq!(
-            rows.locate_move(key, offset(0), offset(4), RowDelta::Backward(2), height),
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(6),
+                offset(4),
+                RowDelta::Backward(2),
+                height,
+            ),
             Some(LocatedViewport {
                 anchor: offset(2),
                 at_end: false,
             })
         );
         assert_eq!(
-            rows.locate_move(key, offset(0), offset(0), RowDelta::Forward(20), height,),
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(6),
+                offset(0),
+                RowDelta::Forward(20),
+                height,
+            ),
+            Some(LocatedViewport {
+                anchor: offset(3),
+                at_end: true,
+            })
+        );
+    }
+
+    #[test]
+    fn row_neighborhood_locates_half_open_targets_and_bounded_eof() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+        rows.observe(key, offset(3), Some(offset(7))).unwrap();
+        rows.observe(key, offset(7), Some(offset(12))).unwrap();
+        rows.observe(key, offset(12), None).unwrap();
+        let height = BodyHeight::new(1).unwrap();
+
+        for (target, anchor, at_end) in [
+            (3, 3, false),
+            (6, 3, false),
+            (7, 7, false),
+            (11, 7, false),
+            (12, 12, true),
+            (15, 12, true),
+        ] {
+            assert_eq!(
+                rows.locate_target(
+                    key,
+                    offset(3),
+                    offset(15),
+                    offset(target),
+                    RowDelta::Forward(0),
+                    height,
+                ),
+                Some(LocatedViewport {
+                    anchor: offset(anchor),
+                    at_end,
+                }),
+                "target={target}"
+            );
+        }
+        for target in [2, 16] {
+            assert_eq!(
+                rows.locate_target(
+                    key,
+                    offset(3),
+                    offset(15),
+                    offset(target),
+                    RowDelta::Forward(0),
+                    height,
+                ),
+                None,
+                "target={target}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_neighborhood_rejects_unknown_boundaries_and_moves_from_containing_rows() {
+        let mut rows = RowNeighborhood::default();
+        let key = row_key(16);
+        rows.observe(key, offset(0), Some(offset(4))).unwrap();
+        rows.observe(key, offset(4), Some(offset(8))).unwrap();
+        rows.observe(key, offset(8), Some(offset(12))).unwrap();
+
+        assert_eq!(
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(15),
+                offset(11),
+                RowDelta::Forward(0),
+                BodyHeight::new(1).unwrap(),
+            ),
+            Some(LocatedViewport {
+                anchor: offset(8),
+                at_end: false,
+            })
+        );
+        for target in [12, 13] {
+            assert_eq!(
+                rows.locate_target(
+                    key,
+                    offset(0),
+                    offset(15),
+                    offset(target),
+                    RowDelta::Forward(0),
+                    BodyHeight::new(1).unwrap(),
+                ),
+                None,
+                "target={target}"
+            );
+        }
+
+        rows.observe(key, offset(12), None).unwrap();
+        assert_eq!(
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(15),
+                offset(6),
+                RowDelta::Backward(1),
+                BodyHeight::new(2).unwrap(),
+            ),
+            Some(LocatedViewport {
+                anchor: offset(0),
+                at_end: false,
+            })
+        );
+        assert_eq!(
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(15),
+                offset(6),
+                RowDelta::Forward(1),
+                BodyHeight::new(2).unwrap(),
+            ),
+            Some(LocatedViewport {
+                anchor: offset(8),
+                at_end: true,
+            })
+        );
+        assert_eq!(
+            rows.locate_target(
+                key,
+                offset(0),
+                offset(15),
+                offset(15),
+                RowDelta::Forward(0),
+                BodyHeight::new(3).unwrap(),
+            ),
+            Some(LocatedViewport {
+                anchor: offset(4),
+                at_end: true,
+            })
+        );
+
+        let mut empty = RowNeighborhood::default();
+        empty.observe(key, offset(3), None).unwrap();
+        assert_eq!(
+            empty.locate_target(
+                key,
+                offset(3),
+                offset(3),
+                offset(3),
+                RowDelta::Forward(0),
+                BodyHeight::new(5).unwrap(),
+            ),
             Some(LocatedViewport {
                 anchor: offset(3),
                 at_end: true,
@@ -614,9 +789,10 @@ mod tests {
 
         let other_width = (key.0, ContentWidth::new(17).unwrap());
         assert_eq!(
-            rows.locate_move(
+            rows.locate_target(
                 other_width,
                 offset(0),
+                offset(1),
                 offset(0),
                 RowDelta::Forward(1),
                 BodyHeight::new(1).unwrap(),
@@ -626,9 +802,10 @@ mod tests {
 
         let other_document = row_key(16);
         assert_eq!(
-            rows.locate_move(
+            rows.locate_target(
                 other_document,
                 offset(0),
+                offset(1),
                 offset(0),
                 RowDelta::Forward(1),
                 BodyHeight::new(1).unwrap(),
