@@ -152,6 +152,8 @@ struct SearchIndex {
     initial_selection: Option<SearchRange>,
     selection_delivered: bool,
     complete: bool,
+    #[cfg(test)]
+    checkpoint_reserve_attempts: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,8 +423,9 @@ impl SearchIndex {
         let source_end = reader.source_end();
         let selection_anchor = selection_anchor.clamp(source_start, source_end);
         let mut checkpoints = Vec::new();
+        let initial_reservation = initial_checkpoint_reservation(source_start, source_end, limits);
         checkpoints
-            .try_reserve_exact(INITIAL_CHECKPOINT_RESERVATION.min(limits.max_checkpoints))
+            .try_reserve_exact(initial_reservation)
             .map_err(|_| SearchError::Allocation)?;
         checkpoints.push(SearchCheckpoint {
             scan_at: source_start,
@@ -444,6 +447,8 @@ impl SearchIndex {
             initial_selection: None,
             selection_delivered: false,
             complete: source_start == source_end,
+            #[cfg(test)]
+            checkpoint_reserve_attempts: 1,
         })
     }
 
@@ -702,6 +707,10 @@ impl SearchIndex {
         }
         let remaining = self.max_checkpoints - self.checkpoints.len();
         let additional = self.checkpoints.capacity().max(1).min(remaining);
+        #[cfg(test)]
+        {
+            self.checkpoint_reserve_attempts += 1;
+        }
         self.checkpoints
             .try_reserve_exact(additional)
             .map_err(|_| SearchError::Allocation)?;
@@ -714,6 +723,22 @@ impl SearchIndex {
             .partition_point(|checkpoint| checkpoint.scan_at <= offset);
         self.checkpoints[insertion.saturating_sub(1)]
     }
+}
+
+fn initial_checkpoint_reservation(
+    source_start: SourceOffset,
+    source_end: SourceOffset,
+    limits: SearchIndexLimits,
+) -> usize {
+    let source_len = source_end.get() - source_start.get();
+    let checkpoints = source_len
+        .checked_div(limits.initial_interval_bytes)
+        .expect("search checkpoint intervals are nonzero")
+        .saturating_add(1);
+    usize::try_from(checkpoints)
+        .unwrap_or(usize::MAX)
+        .min(INITIAL_CHECKPOINT_RESERVATION)
+        .min(limits.max_checkpoints)
 }
 
 impl MatchBlock {
@@ -1260,7 +1285,7 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
-    use crate::document::{Document, DocumentCache};
+    use crate::document::{Document, DocumentCache, MAX_FILE_BYTES};
     use tempfile::tempdir;
 
     fn complete_at(
@@ -1601,6 +1626,52 @@ mod tests {
                 .start(),
             SourceOffset::new(3)
         );
+    }
+
+    #[test]
+    fn initial_checkpoint_capacity_follows_the_immutable_source_range() {
+        let interval = INITIAL_CHECKPOINT_INTERVAL_BYTES;
+        let limits = SearchIndexLimits::DEFAULT;
+        let start = SourceOffset::new(3);
+        let reservation = |source_len| {
+            initial_checkpoint_reservation(
+                start,
+                SourceOffset::new(start.get() + source_len),
+                limits,
+            )
+        };
+
+        assert_eq!(reservation(0), 1);
+        assert_eq!(reservation(interval - 1), 1);
+        assert_eq!(reservation(interval), 2);
+        assert_eq!(reservation(2 * interval - 1), 2);
+        assert_eq!(reservation(MAX_FILE_BYTES), 513);
+        assert_eq!(
+            initial_checkpoint_reservation(
+                SourceOffset::ZERO,
+                SourceOffset::new(100),
+                SearchIndexLimits::new(1, 4).unwrap(),
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn maximum_sources_complete_without_growing_the_checkpoint_allocation() {
+        let source_len = usize::try_from(MAX_FILE_BYTES).unwrap();
+        let document = Document::from_text(Path::new("maximum-search.txt"), "x".repeat(source_len));
+        let mut cache = DocumentCache::default();
+        let mut reader = document.reader(&mut cache);
+        let mut index = SearchIndex::new(&reader, "z", SourceOffset::ZERO)
+            .unwrap()
+            .unwrap();
+
+        while !index.is_complete() {
+            index.advance(&mut reader, "z").unwrap();
+        }
+
+        assert_eq!(index.checkpoints.len(), 513);
+        assert_eq!(index.checkpoint_reserve_attempts, 1);
     }
 
     #[test]
