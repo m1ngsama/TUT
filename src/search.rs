@@ -8,6 +8,8 @@ use crate::{
 
 const SEARCH_INDEX_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_DISPLAY_HIGHLIGHT_RANGES: usize =
+    SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>();
 const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = SOURCE_WINDOW_BYTES as u64;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
@@ -180,7 +182,7 @@ pub(super) struct SearchSession {
     navigation: Option<SearchNavigation>,
     match_block: Option<MatchBlock>,
     pending_navigation: i64,
-    highlights: Option<SearchHighlights>,
+    highlights: SearchHighlightState,
     jump_pending: bool,
 }
 
@@ -207,7 +209,7 @@ impl SearchSession {
             navigation: None,
             match_block: None,
             pending_navigation: 0,
-            highlights: None,
+            highlights: SearchHighlightState::default(),
             jump_pending,
         }))
     }
@@ -230,12 +232,15 @@ impl SearchSession {
 
     pub(super) const fn has_work(&self) -> bool {
         self.is_searching()
-            || matches!(&self.highlights, Some(highlights) if !highlights.is_complete())
+            || matches!(
+                &self.highlights,
+                SearchHighlightState::Ready(highlights) if !highlights.is_complete()
+            )
     }
 
     pub(super) fn highlight_ranges(&self, visible: &Range<SourceOffset>) -> &[SearchRange] {
         self.highlights
-            .as_ref()
+            .ready()
             .filter(|highlights| highlights.covers(visible))
             .map_or(&[], SearchHighlights::ranges)
     }
@@ -245,27 +250,35 @@ impl SearchSession {
         visible: Range<SourceOffset>,
         targets: impl IntoIterator<Item = SearchRange>,
     ) -> Result<(), TutError> {
-        if self
-            .highlights
-            .as_ref()
-            .is_some_and(|highlights| highlights.covers(&visible))
-        {
+        if self.highlights.covers(&visible) {
             return Ok(());
         }
-        let storage = self.highlights.take().map_or_else(
-            SearchHighlightStorage::default,
-            SearchHighlights::into_storage,
-        );
-        self.highlights = if self.index.is_complete() && self.index.has_matches() {
-            self.index.display_highlights(visible, targets, storage)?
-        } else {
-            None
+        let storage = self.highlights.take_storage();
+        if !self.index.is_complete() || !self.index.has_matches() {
+            self.highlights = SearchHighlightState::Absent(storage);
+            return Ok(());
+        }
+        self.highlights = match self
+            .index
+            .display_highlights(visible.clone(), targets, storage)?
+        {
+            DisplayHighlightPreparation::Unavailable(storage) => {
+                SearchHighlightState::Absent(storage)
+            }
+            DisplayHighlightPreparation::Ready(highlights) => {
+                SearchHighlightState::Ready(highlights)
+            }
+            DisplayHighlightPreparation::Disabled(storage) => {
+                SearchHighlightState::Disabled { visible, storage }
+            }
         };
         Ok(())
     }
 
     pub(super) fn invalidate_highlights(&mut self) {
-        self.highlights = None;
+        let mut storage = self.highlights.take_storage();
+        storage.ranges.clear();
+        self.highlights = SearchHighlightState::Absent(storage);
     }
 
     pub(super) fn cancel_motion(&mut self) -> bool {
@@ -316,7 +329,7 @@ impl SearchSession {
         } else {
             if self.navigation.is_none() {
                 if self.pending_navigation == 0 {
-                    let Some(highlights) = self.highlights.as_mut() else {
+                    let Some(highlights) = self.highlights.ready_mut() else {
                         return Ok(SearchStep {
                             changed: false,
                             jump: None,
@@ -391,6 +404,26 @@ impl SearchSession {
     #[cfg(test)]
     pub(super) const fn has_cached_block(&self) -> bool {
         self.match_block.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn highlights_disabled_for(&self, visible: &Range<SourceOffset>) -> bool {
+        matches!(
+            &self.highlights,
+            SearchHighlightState::Disabled {
+                visible: disabled,
+                ..
+            } if disabled == visible
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) const fn highlight_reserve_attempts(&self) -> usize {
+        match &self.highlights {
+            SearchHighlightState::Absent(storage)
+            | SearchHighlightState::Disabled { storage, .. } => storage.reserve_attempts,
+            SearchHighlightState::Ready(highlights) => highlights.storage.reserve_attempts,
+        }
     }
 }
 
@@ -597,12 +630,16 @@ impl SearchIndex {
         visible: Range<SourceOffset>,
         targets: impl IntoIterator<Item = SearchRange>,
         mut storage: SearchHighlightStorage,
-    ) -> Result<Option<SearchHighlights>, TutError> {
+    ) -> Result<DisplayHighlightPreparation, TutError> {
         if !self.highlightable(&visible) {
-            return Ok(None);
+            return Ok(DisplayHighlightPreparation::Unavailable(storage));
         }
         storage.ranges.clear();
-        for target in targets {
+        let mut targets = targets.into_iter();
+        if targets.size_hint().0 > MAX_DISPLAY_HIGHLIGHT_RANGES {
+            return Ok(DisplayHighlightPreparation::Disabled(storage));
+        }
+        for target in &mut targets {
             debug_assert!(target.start() < visible.end && target.end() > visible.start);
             debug_assert!(
                 storage
@@ -611,15 +648,16 @@ impl SearchIndex {
                     .is_none_or(|last: &SearchRange| { last.end() <= target.start() })
             );
             if !reserve_display_target(&mut storage)? {
-                return Ok(None);
+                storage.ranges.clear();
+                return Ok(DisplayHighlightPreparation::Disabled(storage));
             }
             storage.ranges.push(target);
         }
-        Ok(self.make_highlights(
+        Ok(DisplayHighlightPreparation::Ready(self.new_highlights(
             visible,
             storage,
             HighlightMode::Display { read: 0, write: 0 },
-        ))
+        )))
     }
 
     fn highlightable(&self, visible: &Range<SourceOffset>) -> bool {
@@ -629,6 +667,7 @@ impl SearchIndex {
             && visible.end > self.source_start
     }
 
+    #[cfg(test)]
     fn make_highlights(
         &self,
         visible: Range<SourceOffset>,
@@ -638,6 +677,15 @@ impl SearchIndex {
         if !self.highlightable(&visible) {
             return None;
         }
+        Some(self.new_highlights(visible, storage, mode))
+    }
+
+    fn new_highlights(
+        &self,
+        visible: Range<SourceOffset>,
+        storage: SearchHighlightStorage,
+        mode: HighlightMode,
+    ) -> SearchHighlights {
         let earliest = visible
             .start
             .checked_sub(self.query_len.saturating_sub(1))
@@ -658,7 +706,7 @@ impl SearchIndex {
         if checkpoint.scan_at >= self.source_end {
             highlights.finish();
         }
-        Some(highlights)
+        highlights
     }
 
     fn record_checkpoint(&mut self) -> Result<(), TutError> {
@@ -1037,6 +1085,62 @@ impl SearchNavigation {
 }
 
 #[derive(Debug)]
+enum SearchHighlightState {
+    Absent(SearchHighlightStorage),
+    Ready(SearchHighlights),
+    Disabled {
+        visible: Range<SourceOffset>,
+        storage: SearchHighlightStorage,
+    },
+}
+
+impl Default for SearchHighlightState {
+    fn default() -> Self {
+        Self::Absent(SearchHighlightStorage::default())
+    }
+}
+
+impl SearchHighlightState {
+    fn covers(&self, visible: &Range<SourceOffset>) -> bool {
+        match self {
+            Self::Absent(_) => false,
+            Self::Ready(highlights) => highlights.covers(visible),
+            Self::Disabled {
+                visible: disabled, ..
+            } => disabled == visible,
+        }
+    }
+
+    const fn ready(&self) -> Option<&SearchHighlights> {
+        match self {
+            Self::Ready(highlights) => Some(highlights),
+            Self::Absent(_) | Self::Disabled { .. } => None,
+        }
+    }
+
+    const fn ready_mut(&mut self) -> Option<&mut SearchHighlights> {
+        match self {
+            Self::Ready(highlights) => Some(highlights),
+            Self::Absent(_) | Self::Disabled { .. } => None,
+        }
+    }
+
+    fn take_storage(&mut self) -> SearchHighlightStorage {
+        match std::mem::take(self) {
+            Self::Absent(storage) | Self::Disabled { storage, .. } => storage,
+            Self::Ready(highlights) => highlights.into_storage(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DisplayHighlightPreparation {
+    Unavailable(SearchHighlightStorage),
+    Ready(SearchHighlights),
+    Disabled(SearchHighlightStorage),
+}
+
+#[derive(Debug)]
 struct SearchHighlights {
     document_id: DocumentId,
     visible: Range<SourceOffset>,
@@ -1054,6 +1158,8 @@ struct SearchHighlightStorage {
     ranges: Vec<SearchRange>,
     #[cfg(test)]
     reserve_attempts: usize,
+    #[cfg(test)]
+    fail_reserve: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1206,16 +1312,19 @@ fn reserve_highlight_range(storage: &mut SearchHighlightStorage) -> Result<(), T
 
 fn reserve_display_target(storage: &mut SearchHighlightStorage) -> Result<bool, TutError> {
     let ranges = &mut storage.ranges;
-    let max_ranges = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>();
-    if ranges.len() >= max_ranges {
+    if ranges.len() >= MAX_DISPLAY_HIGHLIGHT_RANGES {
         return Ok(false);
     }
     if ranges.len() == ranges.capacity() {
         #[cfg(test)]
         {
             storage.reserve_attempts = storage.reserve_attempts.saturating_add(1);
+            if storage.fail_reserve {
+                storage.fail_reserve = false;
+                return Err(SearchError::Allocation.into());
+            }
         }
-        let remaining = max_ranges - ranges.len();
+        let remaining = MAX_DISPLAY_HIGHLIGHT_RANGES - ranges.len();
         let additional = ranges.capacity().max(256).min(remaining);
         ranges
             .try_reserve_exact(additional)
@@ -1282,7 +1391,7 @@ fn scan_window(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{cell::Cell, fs, path::Path};
 
     use super::*;
     use crate::document::{Document, DocumentCache, MAX_FILE_BYTES};
@@ -1385,6 +1494,29 @@ mod tests {
             let mut reader = document.reader(cache);
             session.advance(&mut reader).unwrap();
         }
+    }
+
+    fn complete_session(
+        document: &Document,
+        cache: &mut DocumentCache,
+        query: &str,
+    ) -> SearchSession {
+        let mut session = {
+            let reader = document.reader(cache);
+            SearchSession::new(&reader, query.to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        settle_session(document, cache, &mut session);
+        session
+    }
+
+    fn display_target(start: usize) -> SearchRange {
+        SearchRange::new(
+            SourceOffset::from_usize(start),
+            SourceOffset::from_usize(start + 1),
+        )
+        .unwrap()
     }
 
     fn request_session_navigation(
@@ -1804,7 +1936,7 @@ mod tests {
             session
                 .prepare_highlights(visible.clone(), [target])
                 .unwrap();
-            let pending = session.highlights.as_ref().unwrap();
+            let pending = session.highlights.ready().unwrap();
             assert!(!pending.is_complete());
             let allocation = pending.storage.ranges.as_ptr();
             let capacity = pending.storage.ranges.capacity();
@@ -1815,7 +1947,7 @@ mod tests {
             session
                 .prepare_highlights(visible.clone(), std::iter::once_with(|| unreachable!()))
                 .unwrap();
-            let unchanged = session.highlights.as_ref().unwrap();
+            let unchanged = session.highlights.ready().unwrap();
             assert_eq!(unchanged.storage.ranges.as_ptr(), allocation);
             assert_eq!(unchanged.storage.ranges.capacity(), capacity);
             assert_eq!(unchanged.storage.reserve_attempts, 1);
@@ -2008,14 +2140,16 @@ mod tests {
         let source_end = SourceOffset::from_usize(text.len());
         let target = SearchRange::new(SourceOffset::ZERO, source_end).unwrap();
         let (document, index) = complete(&text, "a");
-        let mut highlights = index
+        let DisplayHighlightPreparation::Ready(mut highlights) = index
             .display_highlights(
                 SourceOffset::ZERO..source_end,
                 [target],
                 SearchHighlightStorage::default(),
             )
             .unwrap()
-            .unwrap();
+        else {
+            panic!("visible targets should prepare highlights");
+        };
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
         let mut block = None;
@@ -2029,34 +2163,174 @@ mod tests {
 
     #[test]
     fn excessive_display_targets_disable_optional_highlights() {
-        let target_count = SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES / size_of::<SearchRange>() + 1;
+        let target_count = MAX_DISPLAY_HIGHLIGHT_RANGES + 1;
         let text = "x".repeat(target_count);
         let source_end = SourceOffset::from_usize(text.len());
         let (_, index) = complete(&text, "z");
         let seed = SearchRange::new(SourceOffset::ZERO, SourceOffset::new(1)).unwrap();
-        let storage = index
+        let DisplayHighlightPreparation::Ready(seed) = index
             .display_highlights(
                 SourceOffset::ZERO..source_end,
                 [seed],
                 SearchHighlightStorage::default(),
             )
             .unwrap()
-            .unwrap()
-            .into_storage();
-        let targets = (0..target_count).map(|start| {
-            SearchRange::new(
-                SourceOffset::from_usize(start),
-                SourceOffset::from_usize(start + 1),
-            )
-            .unwrap()
-        });
+        else {
+            panic!("the seed target should prepare highlights");
+        };
+        let storage = seed.into_storage();
+        let targets = (0..target_count).filter(|_| true).map(display_target);
 
-        assert!(
-            index
-                .display_highlights(SourceOffset::ZERO..source_end, targets, storage,)
+        let DisplayHighlightPreparation::Disabled(storage) = index
+            .display_highlights(SourceOffset::ZERO..source_end, targets, storage)
+            .unwrap()
+        else {
+            panic!("excessive targets should disable optional highlights");
+        };
+        assert!(storage.ranges.is_empty());
+        assert!(storage.ranges.capacity() >= MAX_DISPLAY_HIGHLIGHT_RANGES);
+        assert!(storage.reserve_attempts > 0);
+    }
+
+    #[test]
+    fn sessions_cache_exact_overbudget_highlights_without_visiting_targets() {
+        let target_count = MAX_DISPLAY_HIGHLIGHT_RANGES + 1;
+        let document = Document::from_text(Path::new("overbudget.txt"), "x".repeat(target_count));
+        let visible = document.source_start()..document.source_end();
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let visits = Cell::new(0);
+        let targets = (0..target_count)
+            .inspect(|_| visits.set(visits.get() + 1))
+            .map(display_target);
+
+        session
+            .prepare_highlights(visible.clone(), targets)
+            .unwrap();
+
+        assert_eq!(visits.get(), 0);
+        let SearchHighlightState::Disabled {
+            visible: disabled,
+            storage,
+        } = &session.highlights
+        else {
+            panic!("the overbudget viewport should be cached as disabled");
+        };
+        assert_eq!(disabled, &visible);
+        assert!(storage.ranges.is_empty());
+        assert_eq!(storage.ranges.capacity(), 0);
+        assert_eq!(storage.reserve_attempts, 0);
+        session
+            .prepare_highlights(
+                visible.clone(),
+                std::iter::once_with(|| panic!("cached targets must not be visited")),
+            )
+            .unwrap();
+        assert!(session.highlight_ranges(&visible).is_empty());
+    }
+
+    #[test]
+    fn disabled_highlights_retry_after_visible_changes_and_invalidation() {
+        let target_count = MAX_DISPLAY_HIGHLIGHT_RANGES + 1;
+        let document = Document::from_text(Path::new("overbudget.txt"), "x".repeat(target_count));
+        let whole = document.source_start()..document.source_end();
+        let small = SourceOffset::ZERO..SourceOffset::new(1);
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        session
+            .prepare_highlights(whole.clone(), (0..target_count).map(display_target))
+            .unwrap();
+
+        let visits = Cell::new(0);
+        session
+            .prepare_highlights(
+                small.clone(),
+                std::iter::once(display_target(0)).inspect(|_| visits.set(visits.get() + 1)),
+            )
+            .unwrap();
+        assert_eq!(visits.get(), 1);
+        assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
+
+        session
+            .prepare_highlights(whole.clone(), (0..target_count).map(display_target))
+            .unwrap();
+        assert!(matches!(
+            session.highlights,
+            SearchHighlightState::Disabled { .. }
+        ));
+        session.invalidate_highlights();
+        let visits = Cell::new(0);
+        session
+            .prepare_highlights(
+                whole,
+                std::iter::once(display_target(0)).inspect(|_| visits.set(visits.get() + 1)),
+            )
+            .unwrap();
+        assert_eq!(visits.get(), 1);
+        assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
+    }
+
+    #[test]
+    fn incomplete_indexes_never_cache_highlight_budget_rejections() {
+        let text = "x".repeat(SOURCE_WINDOW_BYTES + 1);
+        let document = Document::from_text(Path::new("incomplete.txt"), text);
+        let visible = document.source_start()..document.source_end();
+        let mut cache = DocumentCache::default();
+        let mut session = {
+            let reader = document.reader(&mut cache);
+            SearchSession::new(&reader, "x".to_owned(), SourceOffset::ZERO)
                 .unwrap()
-                .is_none()
-        );
+                .unwrap()
+        };
+        assert!(!session.index_complete());
+        session
+            .prepare_highlights(
+                visible.clone(),
+                std::iter::repeat_with(|| panic!("incomplete indexes must not visit targets"))
+                    .take(MAX_DISPLAY_HIGHLIGHT_RANGES + 1),
+            )
+            .unwrap();
+        assert!(matches!(
+            session.highlights,
+            SearchHighlightState::Absent(_)
+        ));
+
+        settle_session(&document, &mut cache, &mut session);
+        let visits = Cell::new(0);
+        session
+            .prepare_highlights(
+                visible,
+                std::iter::once(display_target(0)).inspect(|_| visits.set(visits.get() + 1)),
+            )
+            .unwrap();
+        assert_eq!(visits.get(), 1);
+        assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
+    }
+
+    #[test]
+    fn allocation_errors_never_disable_future_highlight_preparation() {
+        let document = Document::from_text(Path::new("allocation.txt"), "x".to_owned());
+        let visible = document.source_start()..document.source_end();
+        let mut cache = DocumentCache::default();
+        let mut session = complete_session(&document, &mut cache, "x");
+        let SearchHighlightState::Absent(storage) = &mut session.highlights else {
+            panic!("unprepared sessions should retain absent highlight storage");
+        };
+        storage.fail_reserve = true;
+
+        assert!(matches!(
+            session.prepare_highlights(visible.clone(), [display_target(0)]),
+            Err(TutError::Search(SearchError::Allocation))
+        ));
+        assert!(matches!(
+            session.highlights,
+            SearchHighlightState::Absent(_)
+        ));
+
+        session
+            .prepare_highlights(visible, [display_target(0)])
+            .unwrap();
+        assert!(matches!(session.highlights, SearchHighlightState::Ready(_)));
     }
 
     #[test]
