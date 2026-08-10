@@ -13,7 +13,7 @@ use crate::{
     },
     line_index::LinePosition,
     locator::{LocatedViewport, RowDelta, RowNeighborhood, ViewportLocator, source_row_bound},
-    search::{MAX_SEARCH_QUERY_BYTES, SearchRange, SearchSession},
+    search::{MAX_SEARCH_QUERY_BYTES, SearchHighlightKey, SearchRange, SearchSession},
     source::SourceOffset,
 };
 
@@ -735,10 +735,12 @@ impl App {
             self.line_position_for(viewport)?
         };
         let progress = self.progress_for(viewport);
-        let (ranges, current) = if let Some(viewport) = viewport {
-            let visible = viewport.first_visible_start..viewport.visible_end;
+        let (ranges, current) = if viewport.is_some() {
+            let key = self
+                .current_search_highlight_key()
+                .expect("visible viewports retain a cached render body");
             self.search.as_ref().map_or((&[][..], None), |search| {
-                (search.highlight_ranges(&visible), search.current_match())
+                (search.highlight_ranges(key), search.current_match())
             })
         } else {
             (&[][..], None)
@@ -758,38 +760,37 @@ impl App {
     }
 
     fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) -> Result<(), TutError> {
-        let Some(viewport) = viewport else {
+        let Some(_) = viewport else {
             if let Some(search) = &mut self.search {
                 search.invalidate_highlights();
             }
             return Ok(());
         };
-        let visible = viewport.first_visible_start..viewport.visible_end;
         if !matches!(self.mode, Mode::Reading) {
             if let Some(search) = &mut self.search {
                 search.invalidate_highlights();
             }
             return Ok(());
         }
-        let key = self.render_key();
-        let rows = match &self.render_body {
-            RenderBody::Cached(cache)
-                if cache.geometry == key.geometry && cache.anchor == key.anchor =>
-            {
-                &cache.rows
-            }
-            RenderBody::Empty | RenderBody::Cached(_) | RenderBody::Scanning(_) => {
-                unreachable!("visible viewport retains rendered rows")
-            }
-        };
+        let key = self
+            .current_search_highlight_key()
+            .expect("visible viewports retain rendered rows");
         let Some(search) = &mut self.search else {
             return Ok(());
         };
-        let targets = rows.spans.iter().map(|span| {
-            SearchRange::new(span.source.start(), span.source.end())
-                .expect("render spans retain nonempty source ranges")
-        });
-        search.prepare_highlights(visible, targets)
+        search.prepare_highlights(key);
+        Ok(())
+    }
+
+    fn current_search_highlight_key(&self) -> Option<SearchHighlightKey> {
+        let cache = self.current_render_cache()?;
+        Some(SearchHighlightKey::new(
+            cache.geometry.columns,
+            cache.geometry.rows,
+            cache.anchor,
+            cache.viewport.visible_end,
+            cache.rows.spans.len(),
+        ))
     }
 
     fn line_position_for(
@@ -928,6 +929,23 @@ impl App {
         self.background_work().is_some()
     }
 
+    #[cfg(test)]
+    pub(super) fn pending_highlight_cursors(&self) -> Option<(usize, usize, Option<usize>)> {
+        self.search
+            .as_ref()
+            .and_then(SearchSession::pending_highlight_cursors)
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_highlight_count(&self) -> usize {
+        let Some(key) = self.current_search_highlight_key() else {
+            return 0;
+        };
+        self.search
+            .as_ref()
+            .map_or(0, |search| search.highlight_ranges(key).len())
+    }
+
     pub(super) fn advance_background(&mut self) -> Result<bool, TutError> {
         let Some(schedule) = self.background_schedule() else {
             return Ok(false);
@@ -1010,10 +1028,26 @@ impl App {
     }
 
     fn advance_search(&mut self) -> Result<bool, TutError> {
+        let key = self
+            .current_search_highlight_key()
+            .expect("search work runs against a cached render body");
+        let spans = match &self.render_body {
+            RenderBody::Cached(cache) => &cache.rows.spans,
+            RenderBody::Empty | RenderBody::Scanning(_) => {
+                unreachable!("search work runs against a cached render body")
+            }
+        };
         let Some(search) = self.search.as_mut() else {
             return Ok(false);
         };
         let mut reader = self.document.reader(&mut self.search_cache);
+        if !search.is_searching() {
+            return search.advance_highlights(&mut reader, key, |index| {
+                let source = spans[index].source;
+                SearchRange::new(source.start(), source.end())
+                    .expect("render spans retain nonempty source ranges")
+            });
+        }
         let step = search.advance(&mut reader)?;
         let mut changed = step.changed();
         if let Some(selected) = step.jump()
@@ -3315,6 +3349,43 @@ mod tests {
         let row = highlighted_row(&state, 0);
         assert_eq!(row[0], ("c".to_owned(), Highlight::Current));
         assert_eq!(row[4], ("c".to_owned(), Highlight::Match));
+    }
+
+    #[test]
+    fn exact_cap_dense_frame_starts_without_target_visits_or_reservations() {
+        let text = "x\0".repeat(131_072);
+        let mut app = reader(&text, 4096, 67);
+        commit(&mut app, "x");
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.highlight_reserve_attempts(), 0);
+        assert!(search.pending_highlight_cursors().is_none());
+
+        {
+            let state = app.render_state().unwrap();
+            let span_count = state.rows.iter().map(|row| row.spans.len()).sum::<usize>();
+            assert_eq!(span_count, crate::search::MAX_DISPLAY_HIGHLIGHT_RANGES);
+            assert!(state.rows.ranges.is_empty());
+        }
+        let search = app.search.as_ref().unwrap();
+        assert!(search.pending_highlight_cursors().is_some());
+        assert_eq!(search.highlight_reserve_attempts(), 0);
+
+        settle(&mut app);
+        let state = app.render_state().unwrap();
+        let mut cursor = state.rows.highlight_cursor();
+        let mut current = 0;
+        let mut matches = 0;
+        let mut plain = 0;
+        for row in state.rows.iter() {
+            for span in row.spans {
+                match cursor.role_for(span.source()) {
+                    Highlight::Current => current += 1,
+                    Highlight::Match => matches += 1,
+                    Highlight::None => plain += 1,
+                }
+            }
+        }
+        assert_eq!((current, matches, plain), (1, 131_071, 131_072));
     }
 
     #[test]

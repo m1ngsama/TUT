@@ -866,6 +866,7 @@ mod tests {
         suspensions: u64,
         suspend_after_render: Option<SignalState>,
         terminate_after_render: Option<SignalState>,
+        terminate_after_search: Option<SignalState>,
     }
 
     impl RuntimeRecorder for TraceRecorder {
@@ -890,6 +891,13 @@ mod tests {
                 operation,
                 RuntimeOperation::Background(BackgroundWork::Render)
             ) && let Some(signals) = self.terminate_after_render.take()
+            {
+                signals.store_raw(SIGTERM as usize);
+            }
+            if matches!(
+                operation,
+                RuntimeOperation::Background(BackgroundWork::Search)
+            ) && let Some(signals) = self.terminate_after_search.take()
             {
                 signals.store_raw(SIGTERM as usize);
             }
@@ -936,6 +944,25 @@ mod tests {
         while !app.frame_ready() {
             app.advance_background().unwrap();
         }
+        app
+    }
+
+    fn merge_pending_app() -> App {
+        let mut app = app_from_text(Path::new("/tmp/highlights.txt"), "x x".to_owned());
+        app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+        while !app.frame_ready() {
+            app.advance_background().unwrap();
+        }
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchInsert('x')).unwrap();
+        app.update(Action::SearchCommit).unwrap();
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+        app.render_state().unwrap();
+        assert!(app.pending_highlight_cursors().is_some());
+        assert!(!app.advance_background().unwrap());
+        assert_eq!(app.pending_highlight_cursors(), Some((0, 0, None)));
         app
     }
 
@@ -1780,6 +1807,110 @@ mod tests {
         assert_eq!(
             driver.poll_timeouts,
             [BACKGROUND_POLL, BACKGROUND_POLL, BACKGROUND_POLL, MAX_POLL,]
+        );
+    }
+
+    #[test]
+    fn queued_quit_preempts_a_highlight_merge_step() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(quit_event());
+        let mut recorder = TraceRecorder::default();
+        let mut app = merge_pending_app();
+        let before = app.pending_highlight_cursors();
+
+        assert!(matches!(
+            event_loop(&mut app, &mut driver, &signals, &mut recorder),
+            Primary::Normal
+        ));
+        assert_eq!(app.pending_highlight_cursors(), before);
+        assert!(recorder.operations.iter().all(|(operation, _)| !matches!(
+            operation,
+            RuntimeOperation::Background(BackgroundWork::Search)
+        )));
+        assert_eq!(recorder.events, 1);
+    }
+
+    #[test]
+    fn continuous_terminal_events_do_not_starve_highlight_phases() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.extend([
+            Event::FocusGained,
+            Event::FocusGained,
+            Event::FocusGained,
+            Event::FocusGained,
+            Event::FocusGained,
+            quit_event(),
+        ]);
+        let mut recorder = TraceRecorder::default();
+        let mut app = merge_pending_app();
+
+        assert!(matches!(
+            event_loop(&mut app, &mut driver, &signals, &mut recorder),
+            Primary::Normal
+        ));
+        assert_eq!(app.pending_highlight_cursors(), None);
+        assert_eq!(app.published_highlight_count(), 2);
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| matches!(
+                    operation,
+                    RuntimeOperation::Background(BackgroundWork::Search)
+                ))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn queued_signal_preempts_a_highlight_merge_step() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.inject_on = Some("poll");
+        let mut recorder = TraceRecorder::default();
+        let mut app = merge_pending_app();
+        let before = app.pending_highlight_cursors();
+
+        assert!(matches!(
+            event_loop(&mut app, &mut driver, &signals, &mut recorder),
+            Primary::Signal(ExternalSignal::Terminate)
+        ));
+        assert_eq!(app.pending_highlight_cursors(), before);
+        assert!(recorder.operations.iter().all(|(operation, _)| !matches!(
+            operation,
+            RuntimeOperation::Background(BackgroundWork::Search)
+        )));
+    }
+
+    #[test]
+    fn one_event_loop_turn_runs_at_most_one_highlight_phase() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        let mut recorder = TraceRecorder {
+            terminate_after_search: Some(signals.clone()),
+            ..TraceRecorder::default()
+        };
+        let mut app = merge_pending_app();
+        let before = app.pending_highlight_cursors();
+
+        assert!(matches!(
+            event_loop(&mut app, &mut driver, &signals, &mut recorder),
+            Primary::Signal(ExternalSignal::Terminate)
+        ));
+        assert_ne!(app.pending_highlight_cursors(), before);
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| matches!(
+                    operation,
+                    RuntimeOperation::Background(BackgroundWork::Search)
+                ))
+                .count(),
+            1
         );
     }
 
