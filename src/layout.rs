@@ -405,6 +405,7 @@ impl ViewportLayout {
         self.clamp_to_last_viewport(reader, current)
     }
 
+    #[cfg(test)]
     pub(super) fn visible_extent(
         &self,
         reader: &mut DocumentReader<'_>,
