@@ -12,7 +12,10 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        is_raw_mode_enabled,
+    },
 };
 use ratatui::{
     Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, buffer::Cell, layout::Rect,
@@ -100,6 +103,7 @@ pub(super) fn install_signal_handlers(
 }
 
 trait TerminalDriver {
+    fn raw_mode_enabled(&mut self) -> io::Result<bool>;
     fn size(&mut self) -> io::Result<(u16, u16)>;
     fn resize(&mut self, size: TerminalSize) -> io::Result<()>;
     fn enable_raw_mode(&mut self) -> io::Result<()>;
@@ -240,6 +244,25 @@ fn retain_first(first: &mut Option<TutError>, operation: &'static str, result: i
     }
 }
 
+fn preflight_terminal<T: TerminalDriver>(
+    driver: &mut T,
+    signals: &SignalState,
+) -> Result<(), Primary> {
+    check_control(signals)?;
+    let result = driver.raw_mode_enabled();
+    check_control(signals)?;
+    let enabled = result.map_err(|source| {
+        Primary::Error(TutError::Io {
+            operation: "query raw mode",
+            source,
+        })
+    })?;
+    if enabled {
+        return Err(Primary::Error(TutError::TerminalInUse));
+    }
+    Ok(())
+}
+
 fn promote_termination(primary: Primary, signals: &SignalState) -> Primary {
     match (primary, signals.received()) {
         (Primary::Normal | Primary::Suspend, Some(signal)) => Primary::Signal(signal),
@@ -310,6 +333,9 @@ fn run_session<T: TerminalDriver, R: RuntimeRecorder>(
     signals: &SignalState,
     recorder: &mut R,
 ) -> Primary {
+    if let Err(primary) = preflight_terminal(session.driver, signals) {
+        return primary;
+    }
     let size = match refresh_geometry(app, session.driver, signals) {
         Ok(size) => size,
         Err(primary) => return primary,
@@ -542,6 +568,10 @@ impl CrosstermDriver {
 }
 
 impl TerminalDriver for CrosstermDriver {
+    fn raw_mode_enabled(&mut self) -> io::Result<bool> {
+        is_raw_mode_enabled()
+    }
+
     fn size(&mut self) -> io::Result<(u16, u16)> {
         let size = self.terminal.size()?;
         Ok((size.width, size.height))
@@ -651,6 +681,7 @@ mod tests {
     struct FakeDriver {
         calls: Vec<&'static str>,
         failures: Vec<&'static str>,
+        raw_modes: VecDeque<bool>,
         sizes: VecDeque<(u16, u16)>,
         resizes: Vec<TerminalSize>,
         events: VecDeque<Event>,
@@ -667,6 +698,7 @@ mod tests {
             Self {
                 calls: Vec::new(),
                 failures: Vec::new(),
+                raw_modes: VecDeque::new(),
                 sizes: VecDeque::new(),
                 resizes: Vec::new(),
                 events: VecDeque::new(),
@@ -684,7 +716,10 @@ mod tests {
             if let Some(active) = &self.signal_handlers_active {
                 if name == "suspend" {
                     assert!(!active.get());
-                } else if matches!(name, "size" | "enable_raw" | "enter_alt" | "hide_cursor") {
+                } else if matches!(
+                    name,
+                    "raw_enabled" | "size" | "enable_raw" | "enter_alt" | "hide_cursor"
+                ) {
                     assert!(active.get());
                 }
             }
@@ -756,6 +791,11 @@ mod tests {
     }
 
     impl TerminalDriver for FakeDriver {
+        fn raw_mode_enabled(&mut self) -> io::Result<bool> {
+            self.call("raw_enabled")?;
+            Ok(self.raw_modes.pop_front().unwrap_or(false))
+        }
+
         fn size(&mut self) -> io::Result<(u16, u16)> {
             self.call("size")?;
             Ok(self.sizes.pop_front().unwrap_or((20, 4)))
@@ -975,7 +1015,7 @@ mod tests {
             error.message(),
             "terminal size 65535x65535 exceeds the 524288-cell limit"
         );
-        assert_eq!(driver.calls, ["size"]);
+        assert_eq!(driver.calls, ["raw_enabled", "size"]);
         assert!(driver.resizes.is_empty());
         assert!(application.terminal_too_small());
     }
@@ -991,7 +1031,48 @@ mod tests {
             run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
-        assert_eq!(driver.calls, ["size"]);
+        assert_eq!(driver.calls, ["raw_enabled", "size"]);
+        assert!(driver.resizes.is_empty());
+    }
+
+    #[test]
+    fn owned_raw_mode_is_rejected_without_terminal_mutation() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.raw_modes.push_back(true);
+
+        let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
+
+        assert!(matches!(error, TutError::TerminalInUse));
+        assert_eq!(driver.calls, ["raw_enabled"]);
+        assert!(driver.resizes.is_empty());
+    }
+
+    #[test]
+    fn terminating_signal_during_raw_mode_preflight_wins() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.raw_modes.push_back(true);
+        driver.inject_on = Some("raw_enabled");
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Signal(ExternalSignal::Terminate)
+        );
+        assert_eq!(driver.calls, ["raw_enabled"]);
+        assert!(driver.resizes.is_empty());
+    }
+
+    #[test]
+    fn raw_mode_query_failure_precedes_terminal_mutation() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.failures.push("raw_enabled");
+
+        let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
+
+        assert_eq!(error.message(), "failed to query raw mode: raw_enabled");
+        assert_eq!(driver.calls, ["raw_enabled"]);
         assert!(driver.resizes.is_empty());
     }
 
@@ -1038,8 +1119,9 @@ mod tests {
             RunOutcome::Normal
         );
         assert_eq!(
-            &driver.calls[..6],
+            &driver.calls[..7],
             [
+                "raw_enabled",
                 "size",
                 "enable_raw",
                 "enter_alt",
@@ -1054,6 +1136,45 @@ mod tests {
             driver
                 .calls
                 .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn sequential_sessions_each_acquire_and_release_raw_mode() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+
+        for _ in 0..2 {
+            driver.events.push_back(quit_event());
+            assert_eq!(
+                run_with_driver(&mut ready_app(), &mut driver, &signals).unwrap(),
+                RunOutcome::Normal
+            );
+        }
+
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "raw_enabled")
+                .count(),
+            2
+        );
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "enable_raw")
+                .count(),
+            2
+        );
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "disable_raw")
+                .count(),
+            2
         );
     }
 
@@ -1160,6 +1281,14 @@ mod tests {
         assert_eq!(recorder.events, 1);
         assert_eq!(recorder.terminal_sessions, 2);
         assert_eq!(recorder.suspensions, 1);
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "raw_enabled")
+                .count(),
+            2
+        );
         assert_eq!(
             recorder.operations,
             vec![
@@ -1285,6 +1414,7 @@ mod tests {
             "leave_alt",
             "disable_raw",
             "suspend",
+            "raw_enabled",
             "size",
             "enable_raw",
             "enter_alt",
@@ -1357,6 +1487,55 @@ mod tests {
             .update(Action::Resize(Geometry::new(2048, 4)))
             .unwrap();
         assert_eq!(discarded_steps, remaining_render_steps(&mut fresh));
+    }
+
+    #[test]
+    fn resumed_session_rechecks_raw_mode_before_reinitialization() {
+        let signals = SignalState::empty();
+        let active = Rc::new(StateCell::new(true));
+        let mut driver = FakeDriver::new(&signals);
+        driver.signal_handlers_active = Some(Rc::clone(&active));
+        driver.raw_modes.extend([false, true]);
+        driver.inject_suspend_on = Some("poll");
+        let mut suspend = FakeSuspendControl::new(&signals, active);
+        let mut recorder = TraceRecorder::default();
+
+        let error = run_with_recorder(
+            &mut app(),
+            &mut driver,
+            &signals,
+            &mut suspend,
+            &mut recorder,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TutError::TerminalInUse));
+        assert_eq!(recorder.terminal_sessions, 1);
+        assert_eq!(recorder.suspensions, 1);
+        assert_eq!(
+            suspend.calls,
+            [
+                "prepare_signal_stop",
+                "inherit_signal_handlers",
+                "rearm_signal_handlers"
+            ]
+        );
+        assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
+        assert!(driver.calls.ends_with(&[
+            "show_cursor",
+            "leave_alt",
+            "disable_raw",
+            "suspend",
+            "raw_enabled"
+        ]));
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "enable_raw")
+                .count(),
+            1
+        );
     }
 
     #[test]
