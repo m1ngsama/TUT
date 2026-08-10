@@ -677,20 +677,20 @@ impl App {
                 .as_ref()
                 .expect("usable geometry has a layout")
                 .row_cache_key();
-            if request.is_move()
-                && self.anchor_is_row_start
-                && let Some(located) = self.row_neighborhood.locate_move(
-                    row_key,
-                    self.document.source_start(),
-                    target,
-                    delta,
-                    height,
-                )
-            {
+            if let Some(located) = self.row_neighborhood.locate_target(
+                row_key,
+                self.document.source_start(),
+                self.document.source_end(),
+                target,
+                delta,
+                height,
+            ) {
                 self.document.validate()?;
                 return Ok(self.finish_viewport_request(request, located));
             }
-            self.locator = Some(if request.is_move() && self.anchor_is_row_start {
+            let target_is_known_row_start =
+                request.is_move() && self.anchor_is_row_start && target == self.anchor;
+            self.locator = Some(if target_is_known_row_start {
                 ViewportLocator::from_row_start(target, delta, height)?
             } else {
                 ViewportLocator::new(target, delta, height)?
@@ -1259,6 +1259,36 @@ mod tests {
 
     const BACKGROUND_STEP_LIMIT: usize = 100_000;
 
+    #[derive(Debug, Clone, Copy)]
+    enum ViewportRequestCase {
+        Move,
+        End,
+        Search,
+        Reflow,
+    }
+
+    impl ViewportRequestCase {
+        const ALL: [Self; 4] = [Self::Move, Self::End, Self::Search, Self::Reflow];
+
+        fn request(self, app: &mut App) -> ViewportRequest {
+            let target = SourceOffset::new(35);
+            match self {
+                Self::Move => {
+                    app.anchor = target;
+                    app.anchor_is_row_start = false;
+                    ViewportRequest::Move {
+                        target,
+                        delta: RowDelta::Forward(1),
+                        follow_end: FollowEndPolicy::AtEnd,
+                    }
+                }
+                Self::End => ViewportRequest::End,
+                Self::Search => ViewportRequest::Search { target },
+                Self::Reflow => ViewportRequest::Reflow { target },
+            }
+        }
+    }
+
     fn reader(text: &str, columns: u16, rows: u16) -> App {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), text.to_owned());
         app.update(Action::Resize(Geometry::new(columns, rows)))
@@ -1341,6 +1371,22 @@ mod tests {
         panic!("viewport locator exceeded the test step limit");
     }
 
+    fn cache_location(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
+        let height = app.geometry.body_height().unwrap();
+        let mut locator = ViewportLocator::new(target, delta, height).unwrap();
+        for _ in 0..BACKGROUND_STEP_LIMIT {
+            let layout = app.layout.as_ref().unwrap();
+            let mut reader = app.document.reader(&mut app.document_cache);
+            if let Some(located) = locator
+                .advance(layout, &mut reader, &mut app.row_neighborhood)
+                .unwrap()
+            {
+                return located;
+            }
+        }
+        panic!("viewport cache priming exceeded the test step limit");
+    }
+
     #[test]
     fn navigation_clamps_and_preserves_end_following_across_reflow() {
         let mut app = reader("0123456789abcdef", 16, 4);
@@ -1406,6 +1452,27 @@ mod tests {
         assert_eq!(app.anchor, expected);
         assert!(app.follow_end);
         assert!(app.locator.is_none());
+    }
+
+    #[test]
+    fn revisiting_document_end_on_a_long_line_uses_no_grapheme_scans() {
+        let text = "x".repeat(SOURCE_WINDOW_BYTES * 2 + 17);
+        let mut app = reader(&text, 16, 7);
+        app.update(Action::DocumentEnd).unwrap();
+        settle(&mut app);
+        let end_anchor = app.anchor;
+
+        app.update(Action::DocumentStart).unwrap();
+        app.document_cache.reset_metrics();
+        app.update(Action::DocumentEnd).unwrap();
+
+        assert!(app.advance_background().unwrap());
+        assert_eq!(app.anchor, end_anchor);
+        assert!(app.follow_end);
+        assert!(app.viewport_request.is_none());
+        assert!(app.locator.is_none());
+        assert_eq!(app.document_cache.metrics().grapheme_emissions(), 0);
+        assert_eq!(app.document_cache.metrics().grapheme_window_calls(), 0);
     }
 
     #[test]
@@ -1478,7 +1545,38 @@ mod tests {
     }
 
     #[test]
-    fn deep_reflow_and_search_remain_background_while_cached_moves_are_immediate() {
+    fn absolute_row_cache_matches_the_locator_for_every_viewport_request() {
+        let text = "x".repeat(83);
+        for case in ViewportRequestCase::ALL {
+            let mut app = reader(&text, 16, 7);
+            let request = case.request(&mut app);
+            let height = app.geometry.body_height().unwrap();
+            let (target, delta) = request.locator_parameters(app.document.source_end(), height);
+            let expected = cache_location(&mut app, target, delta);
+            app.viewport_request = Some(request);
+            app.locator = None;
+            app.document_cache.reset_metrics();
+
+            app.advance_viewport_locator().unwrap();
+
+            assert_eq!(app.anchor, expected.anchor, "case={case:?}");
+            assert_eq!(
+                app.follow_end,
+                request.follows_end(expected.at_end),
+                "case={case:?}"
+            );
+            assert!(app.viewport_request.is_none(), "case={case:?}");
+            assert!(app.locator.is_none(), "case={case:?}");
+            assert_eq!(
+                app.document_cache.metrics().grapheme_emissions(),
+                0,
+                "case={case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_reflow_remains_background_while_cached_moves_and_searches_are_immediate() {
         let match_start = SOURCE_WINDOW_BYTES * 2;
         let mut text = "x".repeat(match_start);
         text.push_str("needle");
@@ -1516,11 +1614,11 @@ mod tests {
             app.viewport_request,
             Some(ViewportRequest::Search { .. })
         ));
-        let before_search = app.anchor;
-        assert!(!app.advance_background().unwrap());
-        assert_eq!(app.anchor, before_search);
-        settle(&mut app);
+        app.document_cache.reset_metrics();
+        assert!(app.advance_background().unwrap());
         assert_eq!(app.anchor, SourceOffset::from_usize(131_020));
+        assert!(app.viewport_request.is_none());
+        assert_eq!(app.document_cache.metrics().grapheme_emissions(), 0);
     }
 
     #[test]
@@ -2126,6 +2224,49 @@ mod tests {
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
         assert!(app.locator.is_none());
+    }
+
+    #[test]
+    fn absolute_row_cache_rejects_file_changes_for_every_viewport_request() {
+        let directory = tempdir().unwrap();
+        for case in ViewportRequestCase::ALL {
+            let path = directory.path().join(format!("changing-{case:?}.txt"));
+            fs::write(&path, "x".repeat(83)).unwrap();
+            let mut app = App::new(crate::document::load(path.clone()).unwrap());
+            app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
+            let request = case.request(&mut app);
+            let height = app.geometry.body_height().unwrap();
+            let (target, delta) = request.locator_parameters(app.document.source_end(), height);
+            let expected = cache_location(&mut app, target, delta);
+            let key = app.layout.as_ref().unwrap().row_cache_key();
+            assert_eq!(
+                app.row_neighborhood.locate_target(
+                    key,
+                    app.document.source_start(),
+                    app.document.source_end(),
+                    target,
+                    delta,
+                    height,
+                ),
+                Some(expected),
+                "case={case:?}"
+            );
+            app.viewport_request = Some(request);
+            app.locator = None;
+            let old_anchor = app.anchor;
+            let old_follow_end = app.follow_end;
+
+            fs::write(&path, "y".repeat(83)).unwrap();
+
+            assert!(
+                matches!(app.advance_viewport_locator(), Err(TutError::Load(_))),
+                "case={case:?}"
+            );
+            assert_eq!(app.anchor, old_anchor, "case={case:?}");
+            assert_eq!(app.follow_end, old_follow_end, "case={case:?}");
+            assert_eq!(app.viewport_request, Some(request), "case={case:?}");
+            assert!(app.locator.is_none(), "case={case:?}");
+        }
     }
 
     #[test]
