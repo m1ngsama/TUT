@@ -3,6 +3,7 @@ mod view;
 
 use std::{
     io::{self, Stdout},
+    mem::size_of,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -16,7 +17,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, buffer::Cell, layout::Rect,
+};
 use signal_hook::{SigId, low_level};
 
 use crate::{
@@ -27,6 +30,63 @@ use crate::{
 
 const MAX_POLL: Duration = Duration::from_millis(100);
 const BACKGROUND_POLL: Duration = Duration::from_millis(1);
+const MAX_TERMINAL_CELLS: u64 = 512 * 1024;
+const MAX_TERMINAL_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSize {
+    width: u16,
+    height: u16,
+}
+
+impl TerminalSize {
+    fn new(width: u16, height: u16) -> Result<Self, TutError> {
+        let cells = u64::from(width)
+            .checked_mul(u64::from(height))
+            .ok_or_else(|| terminal_size_error(width, height))?;
+        let cell_bytes = u64::try_from(size_of::<Cell>())
+            .expect("terminal cell sizes fit unsigned 64-bit integers");
+        let buffer_bytes = cells
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_mul(cell_bytes))
+            .ok_or_else(|| terminal_size_error(width, height))?;
+        if cells > MAX_TERMINAL_CELLS || buffer_bytes > MAX_TERMINAL_BUFFER_BYTES {
+            return Err(terminal_size_error(width, height));
+        }
+        Ok(Self { width, height })
+    }
+
+    const fn geometry(self) -> Geometry {
+        Geometry::new(self.width, self.height)
+    }
+
+    const fn area(self) -> Rect {
+        Rect::new(0, 0, self.width, self.height)
+    }
+
+    #[cfg(test)]
+    fn buffer_bytes(self) -> u64 {
+        u64::from(self.width)
+            * u64::from(self.height)
+            * 2
+            * u64::try_from(size_of::<Cell>())
+                .expect("terminal cell sizes fit unsigned 64-bit integers")
+    }
+}
+
+fn terminal_cell_limit() -> u64 {
+    let cell_bytes =
+        u64::try_from(size_of::<Cell>()).expect("terminal cell sizes fit unsigned 64-bit integers");
+    MAX_TERMINAL_CELLS.min(MAX_TERMINAL_BUFFER_BYTES / (2 * cell_bytes))
+}
+
+fn terminal_size_error(columns: u16, rows: u16) -> TutError {
+    TutError::TerminalTooLarge {
+        columns,
+        rows,
+        cell_limit: terminal_cell_limit(),
+    }
+}
 
 #[derive(Default)]
 struct PendingSignals {
@@ -169,13 +229,13 @@ pub(super) fn install_signal_handlers() -> Result<SignalHandlers, TutError> {
 
 trait TerminalDriver {
     fn size(&mut self) -> io::Result<(u16, u16)>;
+    fn resize(&mut self, size: TerminalSize) -> io::Result<()>;
     fn enable_raw_mode(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
     fn hide_cursor(&mut self) -> io::Result<()>;
     fn draw(&mut self, app: &mut App) -> Result<(), TutError>;
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read(&mut self) -> io::Result<Event>;
-    fn force_redraw(&mut self) -> io::Result<()>;
     fn suspend(&mut self) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
@@ -322,7 +382,7 @@ fn refresh_geometry<T: TerminalDriver>(
     app: &mut App,
     driver: &mut T,
     signals: &SignalState,
-) -> Result<(), Primary> {
+) -> Result<TerminalSize, Primary> {
     check_control(signals)?;
     let size_result = driver.size();
     check_control(signals)?;
@@ -332,37 +392,47 @@ fn refresh_geometry<T: TerminalDriver>(
             source,
         })
     })?;
-    let resize_result = app.update(Action::Resize(Geometry::new(width, height)));
+    let validated = TerminalSize::new(width, height);
+    check_control(signals)?;
+    let size = validated.map_err(Primary::Error)?;
+    let resize_result = app.update(Action::Resize(size.geometry()));
     check_control(signals)?;
     resize_result.map_err(Primary::Error)?;
-    Ok(())
+    Ok(size)
+}
+
+fn resize_terminal<T: TerminalDriver>(
+    driver: &mut T,
+    size: TerminalSize,
+    signals: &SignalState,
+) -> Result<(), Primary> {
+    check_control(signals)?;
+    let result = driver.resize(size);
+    check_control(signals)?;
+    result.map_err(|source| {
+        Primary::Error(TutError::Io {
+            operation: "resize terminal viewport",
+            source,
+        })
+    })
 }
 
 fn run_session<T: TerminalDriver, R: RuntimeRecorder>(
     app: &mut App,
     session: &mut TerminalSession<'_, T>,
     signals: &SignalState,
-    force_redraw: bool,
     recorder: &mut R,
 ) -> Primary {
-    if let Err(primary) = refresh_geometry(app, session.driver, signals) {
-        return primary;
-    }
+    let size = match refresh_geometry(app, session.driver, signals) {
+        Ok(size) => size,
+        Err(primary) => return primary,
+    };
     if let Err(primary) = session.initialize(signals) {
         return primary;
     }
     recorder.terminal_session();
-    if force_redraw {
-        let result = session.driver.force_redraw();
-        if let Err(primary) = check_control(signals) {
-            return primary;
-        }
-        if let Err(source) = result {
-            return Primary::Error(TutError::Io {
-                operation: "reset terminal for redraw",
-                source,
-            });
-        }
+    if let Err(primary) = resize_terminal(session.driver, size, signals) {
+        return primary;
     }
     event_loop(app, session.driver, signals, recorder)
 }
@@ -374,9 +444,8 @@ fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder>(
     recorder: &mut R,
 ) -> Result<RunOutcome, TutError> {
     let mut session = TerminalSession::new(driver);
-    let mut resumed = false;
     loop {
-        let primary = run_session(app, &mut session, signals, resumed, recorder);
+        let primary = run_session(app, &mut session, signals, recorder);
         let restoration = session.restore();
         let primary = promote_termination(primary, signals);
         if !matches!(primary, Primary::Suspend) {
@@ -386,7 +455,6 @@ fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder>(
             return Err(restoration);
         }
         if !signals.take_suspend() {
-            resumed = true;
             continue;
         }
         if let Some(signal) = signals.received() {
@@ -401,7 +469,6 @@ fn run_with_recorder<T: TerminalDriver, R: RuntimeRecorder>(
             source,
         })?;
         recorder.suspension();
-        resumed = true;
     }
 }
 
@@ -488,7 +555,32 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             return primary;
         }
 
-        if let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) {
+        if let Event::Resize(width, height) = event {
+            let validated = TerminalSize::new(width, height);
+            if let Err(primary) = check_control(signals) {
+                return primary;
+            }
+            let size = match validated {
+                Ok(size) => size,
+                Err(error) => return Primary::Error(error),
+            };
+            let started = recorder.begin_operation();
+            let result = app.update(Action::Resize(size.geometry()));
+            recorder.finish_operation(RuntimeOperation::Action, started);
+            if let Err(primary) = check_control(signals) {
+                return primary;
+            }
+            match result {
+                Ok(Outcome::Changed | Outcome::Unchanged) => {
+                    if let Err(primary) = resize_terminal(driver, size, signals) {
+                        return primary;
+                    }
+                    redraw = true;
+                }
+                Ok(Outcome::Quit) => return Primary::Normal,
+                Err(error) => return Primary::Error(error),
+            }
+        } else if let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) {
             let started = recorder.begin_operation();
             let result = app.update(action);
             recorder.finish_operation(RuntimeOperation::Action, started);
@@ -527,8 +619,11 @@ struct CrosstermDriver {
 
 impl CrosstermDriver {
     fn new() -> io::Result<Self> {
+        let options = TerminalOptions {
+            viewport: Viewport::Fixed(Rect::default()),
+        };
         Ok(Self {
-            terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
+            terminal: Terminal::with_options(CrosstermBackend::new(io::stdout()), options)?,
         })
     }
 }
@@ -537,6 +632,10 @@ impl TerminalDriver for CrosstermDriver {
     fn size(&mut self) -> io::Result<(u16, u16)> {
         let size = self.terminal.size()?;
         Ok((size.width, size.height))
+    }
+
+    fn resize(&mut self, size: TerminalSize) -> io::Result<()> {
+        self.terminal.resize(size.area())
     }
 
     fn enable_raw_mode(&mut self) -> io::Result<()> {
@@ -571,11 +670,6 @@ impl TerminalDriver for CrosstermDriver {
 
     fn read(&mut self) -> io::Result<Event> {
         event::read()
-    }
-
-    fn force_redraw(&mut self) -> io::Result<()> {
-        let size = self.terminal.size()?;
-        self.terminal.resize(size.into())
     }
 
     fn suspend(&mut self) -> io::Result<()> {
@@ -625,6 +719,7 @@ mod tests {
     use std::{collections::VecDeque, fs, path::Path};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::backend::TestBackend;
     use signal_hook::consts::signal::{SIGHUP, SIGTERM};
     use tempfile::tempdir;
 
@@ -634,6 +729,8 @@ mod tests {
     struct FakeDriver {
         calls: Vec<&'static str>,
         failures: Vec<&'static str>,
+        sizes: VecDeque<(u16, u16)>,
+        resizes: Vec<TerminalSize>,
         events: VecDeque<Event>,
         inject_on: Option<&'static str>,
         inject_suspend_on: Option<&'static str>,
@@ -647,6 +744,8 @@ mod tests {
             Self {
                 calls: Vec::new(),
                 failures: Vec::new(),
+                sizes: VecDeque::new(),
+                resizes: Vec::new(),
                 events: VecDeque::new(),
                 inject_on: None,
                 inject_suspend_on: None,
@@ -680,7 +779,13 @@ mod tests {
     impl TerminalDriver for FakeDriver {
         fn size(&mut self) -> io::Result<(u16, u16)> {
             self.call("size")?;
-            Ok((20, 4))
+            Ok(self.sizes.pop_front().unwrap_or((20, 4)))
+        }
+
+        fn resize(&mut self, size: TerminalSize) -> io::Result<()> {
+            self.call("resize")?;
+            self.resizes.push(size);
+            Ok(())
         }
 
         fn enable_raw_mode(&mut self) -> io::Result<()> {
@@ -713,10 +818,6 @@ mod tests {
             self.events
                 .pop_front()
                 .ok_or_else(|| io::Error::other("empty event queue"))
-        }
-
-        fn force_redraw(&mut self) -> io::Result<()> {
-            self.call("force_redraw")
         }
 
         fn suspend(&mut self) -> io::Result<()> {
@@ -785,6 +886,90 @@ mod tests {
     }
 
     #[test]
+    fn terminal_size_limits_bound_cells_and_double_buffers() {
+        let boundary = TerminalSize::new(4096, 128).unwrap();
+        assert_eq!(terminal_cell_limit(), MAX_TERMINAL_CELLS);
+        assert_eq!(
+            boundary.buffer_bytes(),
+            MAX_TERMINAL_CELLS * 2 * u64::try_from(size_of::<Cell>()).unwrap()
+        );
+        assert!(boundary.buffer_bytes() <= MAX_TERMINAL_BUFFER_BYTES);
+        assert!(TerminalSize::new(1000, 300).is_ok());
+        assert!(TerminalSize::new(0, u16::MAX).is_ok());
+        assert!(matches!(
+            TerminalSize::new(4096, 129),
+            Err(TutError::TerminalTooLarge {
+                columns: 4096,
+                rows: 129,
+                cell_limit: MAX_TERMINAL_CELLS,
+            })
+        ));
+        assert!(matches!(
+            TerminalSize::new(u16::MAX, u16::MAX),
+            Err(TutError::TerminalTooLarge {
+                columns: u16::MAX,
+                rows: u16::MAX,
+                cell_limit: MAX_TERMINAL_CELLS,
+            })
+        ));
+    }
+
+    #[test]
+    fn fixed_terminals_do_not_autoresize_during_draw() {
+        let fixed = Rect::new(0, 0, 10, 5);
+        let options = TerminalOptions {
+            viewport: Viewport::Fixed(fixed),
+        };
+        let mut terminal = Terminal::with_options(TestBackend::new(10, 5), options).unwrap();
+        terminal.backend_mut().resize(20, 10);
+        let mut rendered = Rect::default();
+
+        terminal
+            .draw(|frame| {
+                rendered = frame.area();
+            })
+            .unwrap();
+
+        assert_eq!(rendered, fixed);
+        assert_eq!(terminal.get_frame().area(), fixed);
+        assert_eq!(terminal.size().unwrap(), (20, 10).into());
+    }
+
+    #[test]
+    fn oversized_startup_geometry_precedes_terminal_mutation() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((u16::MAX, u16::MAX));
+        let mut application = app();
+
+        let error = run_with_driver(&mut application, &mut driver, &signals).unwrap_err();
+
+        assert!(matches!(error, TutError::TerminalTooLarge { .. }));
+        assert_eq!(
+            error.message(),
+            "terminal size 65535x65535 exceeds the 524288-cell limit"
+        );
+        assert_eq!(driver.calls, ["size"]);
+        assert!(driver.resizes.is_empty());
+        assert!(application.terminal_too_small());
+    }
+
+    #[test]
+    fn signals_preempt_oversized_startup_geometry() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((u16::MAX, u16::MAX));
+        driver.inject_on = Some("size");
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Signal(ExternalSignal::Terminate)
+        );
+        assert_eq!(driver.calls, ["size"]);
+        assert!(driver.resizes.is_empty());
+    }
+
+    #[test]
     fn partial_initialization_restores_every_marked_step_once() {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
@@ -825,6 +1010,18 @@ mod tests {
             run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
             RunOutcome::Normal
         );
+        assert_eq!(
+            &driver.calls[..6],
+            [
+                "size",
+                "enable_raw",
+                "enter_alt",
+                "hide_cursor",
+                "resize",
+                "draw"
+            ]
+        );
+        assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
         assert!(
             driver
                 .calls
@@ -906,7 +1103,7 @@ mod tests {
             "enable_raw",
             "enter_alt",
             "hide_cursor",
-            "force_redraw",
+            "resize",
             "draw",
         ];
         assert!(
@@ -953,7 +1150,7 @@ mod tests {
             RunOutcome::Normal
         );
         assert!(!driver.calls.contains(&"suspend"));
-        assert!(driver.calls.contains(&"force_redraw"));
+        assert_eq!(driver.resizes.len(), 2);
     }
 
     #[test]
@@ -982,6 +1179,97 @@ mod tests {
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
         assert!(driver.calls.is_empty());
+    }
+
+    #[test]
+    fn oversized_active_resize_restores_without_resizing_again() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.push_back(Event::Resize(u16::MAX, u16::MAX));
+
+        let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
+
+        assert!(matches!(error, TutError::TerminalTooLarge { .. }));
+        assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
+        assert_eq!(
+            driver.calls.iter().filter(|call| **call == "draw").count(),
+            1
+        );
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn accepted_active_resize_updates_driver_before_redrawing() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.extend([Event::Resize(40, 10), quit_event()]);
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(
+            driver.resizes,
+            [
+                TerminalSize::new(20, 4).unwrap(),
+                TerminalSize::new(40, 10).unwrap()
+            ]
+        );
+        assert!(
+            driver
+                .calls
+                .windows(3)
+                .any(|calls| calls == ["read", "resize", "draw"])
+        );
+    }
+
+    #[test]
+    fn same_size_resize_resets_the_fixed_viewport_and_redraws() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.extend([Event::Resize(20, 4), quit_event()]);
+
+        assert_eq!(
+            run_with_driver(&mut app(), &mut driver, &signals).unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(
+            driver.resizes,
+            [
+                TerminalSize::new(20, 4).unwrap(),
+                TerminalSize::new(20, 4).unwrap()
+            ]
+        );
+        assert_eq!(
+            driver.calls.iter().filter(|call| **call == "draw").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn oversized_geometry_after_suspend_precedes_reinitialization() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.extend([(20, 4), (u16::MAX, u16::MAX)]);
+        driver.inject_suspend_on = Some("poll");
+
+        let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
+
+        assert!(matches!(error, TutError::TerminalTooLarge { .. }));
+        assert_eq!(driver.resizes, [TerminalSize::new(20, 4).unwrap()]);
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "enable_raw")
+                .count(),
+            1
+        );
+        assert_eq!(driver.calls.last(), Some(&"size"));
     }
 
     #[test]
