@@ -561,6 +561,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn viewport(&mut self) -> Result<Option<Viewport>, TutError> {
         let Some(layout) = self.layout.as_ref() else {
             return Ok(None);
@@ -1078,13 +1079,9 @@ impl App {
             return Ok(true);
         }
 
-        let first_visible = self
-            .viewport()?
-            .map_or(self.document.source_start(), |viewport| {
-                viewport.first_visible_start
-            });
-        let reader = self.document.reader(&mut self.search_cache);
-        self.search = SearchSession::new(&reader, draft, first_visible)?;
+        let mut reader = self.document.reader(&mut self.search_cache);
+        reader.validate()?;
+        self.search = SearchSession::new(&reader, draft, self.anchor)?;
         self.follow_end = false;
         self.search_turn = true;
         Ok(true)
@@ -2118,6 +2115,50 @@ mod tests {
         assert_eq!(app.update(Action::SearchCancel).unwrap(), Outcome::Changed);
         assert_eq!(app.search_status(), SearchStatus::None);
         assert!(!app.has_background_work());
+    }
+
+    #[test]
+    fn search_commit_reuses_the_visible_anchor_without_scanning_document_rows() {
+        let mut app = reader(&"x".repeat(SOURCE_WINDOW_BYTES * 2), 16, 7);
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        let anchor = app.anchor;
+        assert!(anchor > app.document.source_start());
+
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchInsert('x')).unwrap();
+        app.document_cache.reset_metrics();
+        app.search_cache.reset_metrics();
+
+        assert_eq!(app.update(Action::SearchCommit).unwrap(), Outcome::Changed);
+        for metrics in [app.document_cache.metrics(), app.search_cache.metrics()] {
+            assert_eq!(metrics.window_calls(), 0);
+            assert_eq!(metrics.grapheme_window_calls(), 0);
+            assert_eq!(metrics.grapheme_emissions(), 0);
+            assert_eq!(metrics.segmentation_runs(), 0);
+        }
+
+        settle(&mut app);
+        assert_eq!(app.current_match().unwrap().start(), anchor);
+    }
+
+    #[test]
+    fn search_commit_rejects_changed_files_before_starting_the_session() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-search.txt");
+        fs::write(&path, "cat").unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchInsert('c')).unwrap();
+
+        fs::write(path, "changed").unwrap();
+
+        assert!(matches!(
+            app.update(Action::SearchCommit),
+            Err(TutError::Load(_))
+        ));
+        assert!(app.search.is_none());
     }
 
     #[test]
