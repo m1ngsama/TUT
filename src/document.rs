@@ -8,7 +8,7 @@ use std::{
 };
 
 use rustix::fs::{Mode, OFlags};
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 use crate::{
     error::{LoadError, sanitize_os},
@@ -182,6 +182,7 @@ pub(super) struct DocumentCache {
 pub(super) struct DocumentMetrics {
     grapheme_emissions: usize,
     segmentation_runs: usize,
+    segmentation_advanced_bytes: usize,
     grapheme_window_calls: usize,
     grapheme_window_returned_bytes: usize,
 }
@@ -194,6 +195,10 @@ impl DocumentMetrics {
 
     pub(super) const fn segmentation_runs(self) -> usize {
         self.segmentation_runs
+    }
+
+    pub(super) const fn segmentation_advanced_bytes(self) -> usize {
+        self.segmentation_advanced_bytes
     }
 
     pub(super) const fn grapheme_window_calls(self) -> usize {
@@ -577,28 +582,50 @@ impl DocumentGraphemes<'_, '_> {
         if self.next_start == self.reader.source_end() {
             return Ok(None);
         }
+        let remaining = usize::try_from(self.reader.source_end().get() - self.next_start.get())
+            .map_err(|_| {
+                self.reader
+                    .protocol_error("grapheme length exceeds the address space")
+            })?;
+        let mut segmenter = GraphemeCursor::new(0, remaining, true);
+        #[cfg(test)]
+        let mut advanced = 0;
         loop {
             self.ensure_data()?;
+            let (candidate_len, boundary) = {
+                let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
+                    .expect("document caches contain validated UTF-8");
+                let candidate = &buffer[self.cursor..];
+                #[cfg(test)]
+                {
+                    self.reader.cache.metrics.segmentation_runs += 1;
+                }
+                (candidate.len(), segmenter.next_boundary(candidate, 0))
+            };
             #[cfg(test)]
             {
-                self.reader.cache.metrics.segmentation_runs += 1;
+                let cursor = segmenter.cur_cursor();
+                self.reader.cache.metrics.segmentation_advanced_bytes += cursor - advanced;
+                advanced = cursor;
             }
-            let buffer = std::str::from_utf8(&self.reader.cache.grapheme)
-                .expect("document caches contain validated UTF-8");
-            let candidate = &buffer[self.cursor..];
-            let grapheme_bytes = candidate
-                .graphemes(true)
-                .next()
-                .expect("a nonempty source has a grapheme")
-                .len();
-            let complete =
-                grapheme_bytes < candidate.len() || self.loaded_end == self.reader.source_end();
-
-            if complete {
-                return self.emit(grapheme_bytes, grapheme_bytes <= MAX_GRAPHEME_BYTES);
-            }
-            if candidate.len() >= MAX_GRAPHEME_BYTES {
-                return self.emit(candidate.len(), false);
+            match boundary {
+                Ok(Some(grapheme_bytes)) => {
+                    return self.emit(grapheme_bytes, grapheme_bytes <= MAX_GRAPHEME_BYTES);
+                }
+                Err(GraphemeIncomplete::NextChunk) if candidate_len >= MAX_GRAPHEME_BYTES => {
+                    return self.emit(candidate_len, false);
+                }
+                Err(GraphemeIncomplete::NextChunk) => {}
+                Ok(None)
+                | Err(
+                    GraphemeIncomplete::PreContext(_)
+                    | GraphemeIncomplete::PrevChunk
+                    | GraphemeIncomplete::InvalidOffset,
+                ) => {
+                    return Err(self
+                        .reader
+                        .protocol_error("invalid incremental grapheme state"));
+                }
             }
             self.compact();
             self.append_window()?;
@@ -1927,6 +1954,28 @@ mod tests {
 
         assert_ne!(first_id, second_id);
         assert_eq!(cache.metrics().grapheme_window_calls(), 1);
+    }
+
+    #[test]
+    fn incremental_grapheme_segmentation_advances_linearly() {
+        let combining_count = (256 * 1024 - 1) / '\u{301}'.len_utf8();
+        let mut cluster = String::with_capacity(1 + combining_count * '\u{301}'.len_utf8());
+        cluster.push('a');
+        cluster.extend(std::iter::repeat_n('\u{301}', combining_count));
+        let cluster_len = cluster.len();
+        cluster.push('z');
+
+        let document = Document::from_text(Path::new("linear-grapheme.txt"), cluster);
+        let mut cache = DocumentCache::with_window_bytes(257);
+        {
+            let mut reader = document.reader(&mut cache);
+            let mut graphemes = reader.graphemes(SourceOffset::ZERO).unwrap();
+            let first = graphemes.next_grapheme().unwrap().unwrap();
+            assert_eq!(first.end(), SourceOffset::from_usize(cluster_len));
+            assert!(first.text().is_some());
+        }
+
+        assert_eq!(cache.metrics().segmentation_advanced_bytes(), cluster_len);
     }
 
     #[test]
