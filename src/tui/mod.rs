@@ -22,6 +22,7 @@ use signal_hook::{SigId, low_level};
 use crate::{
     app::{Action, App, Geometry, Outcome},
     error::{ExternalSignal, RunOutcome, TutError},
+    observer::Observer,
 };
 
 const MAX_POLL: Duration = Duration::from_millis(100);
@@ -342,6 +343,7 @@ fn run_session<T: TerminalDriver>(
     session: &mut TerminalSession<'_, T>,
     signals: &SignalState,
     force_redraw: bool,
+    observer: &mut Observer,
 ) -> Primary {
     if let Err(primary) = refresh_geometry(app, session.driver, signals) {
         return primary;
@@ -349,6 +351,7 @@ fn run_session<T: TerminalDriver>(
     if let Err(primary) = session.initialize(signals) {
         return primary;
     }
+    observer.terminal_session();
     if force_redraw {
         let result = session.driver.force_redraw();
         if let Err(primary) = check_control(signals) {
@@ -364,15 +367,16 @@ fn run_session<T: TerminalDriver>(
     event_loop(app, session.driver, signals)
 }
 
-fn run_with_driver<T: TerminalDriver>(
+fn run_with_observer<T: TerminalDriver>(
     app: &mut App,
     driver: &mut T,
     signals: &SignalState,
+    observer: &mut Observer,
 ) -> Result<RunOutcome, TutError> {
     let mut session = TerminalSession::new(driver);
     let mut resumed = false;
     loop {
-        let primary = run_session(app, &mut session, signals, resumed);
+        let primary = run_session(app, &mut session, signals, resumed, observer);
         let restoration = session.restore();
         let primary = promote_termination(primary, signals);
         if !matches!(primary, Primary::Suspend) {
@@ -396,8 +400,19 @@ fn run_with_driver<T: TerminalDriver>(
             operation: "suspend process",
             source,
         })?;
+        observer.suspension();
         resumed = true;
     }
+}
+
+#[cfg(test)]
+fn run_with_driver<T: TerminalDriver>(
+    app: &mut App,
+    driver: &mut T,
+    signals: &SignalState,
+) -> Result<RunOutcome, TutError> {
+    let mut observer = Observer::new(None);
+    run_with_observer(app, driver, signals, &mut observer)
 }
 
 fn event_loop<T: TerminalDriver>(app: &mut App, driver: &mut T, signals: &SignalState) -> Primary {
@@ -562,7 +577,11 @@ impl TerminalDriver for CrosstermDriver {
     }
 }
 
-pub(super) fn run(app: &mut App, signals: &SignalState) -> Result<RunOutcome, TutError> {
+pub(super) fn run(
+    app: &mut App,
+    signals: &SignalState,
+    observer: &mut Observer,
+) -> Result<RunOutcome, TutError> {
     let mut driver = match CrosstermDriver::new() {
         Ok(driver) => driver,
         Err(source) => {
@@ -575,7 +594,7 @@ pub(super) fn run(app: &mut App, signals: &SignalState) -> Result<RunOutcome, Tu
             });
         }
     };
-    run_with_driver(app, &mut driver, signals)
+    run_with_observer(app, &mut driver, signals, observer)
 }
 
 #[cfg(test)]

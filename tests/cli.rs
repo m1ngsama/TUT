@@ -6,7 +6,9 @@ use std::{
 use tempfile::{NamedTempFile, tempdir};
 
 fn tut() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tut"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tut"));
+    command.env_remove("TUT_LOG_FILE");
+    command
 }
 
 #[test]
@@ -25,6 +27,16 @@ fn help_and_version_bypass_terminal_checks() {
         assert_eq!(output.stdout, expected.as_bytes());
         assert!(output.stderr.is_empty());
     }
+
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("help.log");
+    let output = tut()
+        .env("TUT_LOG_FILE", &log)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!log.exists());
 }
 
 #[test]
@@ -33,6 +45,10 @@ fn invalid_invocations_use_gnu_diagnostics_and_exit_two() {
         (Vec::<&str>::new(), "missing file operand"),
         (vec!["a", "b"], "extra operand 'b'"),
         (vec!["--unknown"], "unrecognized option '--unknown'"),
+        (
+            vec!["--log-file"],
+            "option '--log-file' requires an argument",
+        ),
     ] {
         let output = tut().args(arguments).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
@@ -87,13 +103,22 @@ fn terminal_validation_precedes_file_access() {
 
 #[test]
 fn standard_input_requires_terminal_output() {
-    let output = tut().arg("-").stdin(Stdio::piped()).output().unwrap();
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("session.log");
+    let output = tut()
+        .arg("-")
+        .arg("--log-file")
+        .arg(&log)
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert_eq!(
         output.stderr,
         b"tut: interactive reading requires terminal input and output\n"
     );
+    assert!(!log.exists());
 }
 
 #[cfg(unix)]
@@ -162,22 +187,38 @@ mod pty {
 
     impl PtyChild {
         fn spawn(path: &Path) -> io::Result<Self> {
-            Self::spawn_inner(TestInput::Path(path))
+            Self::spawn_inner(TestInput::Path(path), None, None)
+        }
+
+        fn spawn_logged(
+            path: &Path,
+            cli_log: Option<&Path>,
+            environment_log: Option<&Path>,
+        ) -> io::Result<Self> {
+            Self::spawn_inner(TestInput::Path(path), cli_log, environment_log)
         }
 
         fn spawn_standard_input(bytes: &[u8]) -> io::Result<Self> {
-            Self::spawn_inner(TestInput::StandardInput(bytes))
+            Self::spawn_inner(TestInput::StandardInput(bytes), None, None)
+        }
+
+        fn spawn_standard_input_logged(bytes: &[u8], log: &Path) -> io::Result<Self> {
+            Self::spawn_inner(TestInput::StandardInput(bytes), None, Some(log))
         }
 
         fn spawn_open_standard_input() -> io::Result<Self> {
-            Self::spawn_inner(TestInput::OpenStandardInput)
+            Self::spawn_inner(TestInput::OpenStandardInput, None, None)
         }
 
         fn spawn_unreadable_standard_input() -> io::Result<Self> {
-            Self::spawn_inner(TestInput::UnreadableStandardInput)
+            Self::spawn_inner(TestInput::UnreadableStandardInput, None, None)
         }
 
-        fn spawn_inner(input: TestInput<'_>) -> io::Result<Self> {
+        fn spawn_inner(
+            input: TestInput<'_>,
+            cli_log: Option<&Path>,
+            environment_log: Option<&Path>,
+        ) -> io::Result<Self> {
             let master_fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
             grantpt(&master_fd)?;
             unlockpt(&master_fd)?;
@@ -207,6 +248,9 @@ mod pty {
             let controlling_name = slave_name;
 
             let mut command = tut();
+            if let Some(path) = environment_log {
+                command.env("TUT_LOG_FILE", path);
+            }
             match input {
                 TestInput::Path(path) => {
                     command.arg(path).stdin(Stdio::from(terminal_input));
@@ -218,6 +262,9 @@ mod pty {
                     let unreadable = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
                     command.arg("-").stdin(Stdio::from(unreadable));
                 }
+            }
+            if let Some(path) = cli_log {
+                command.arg("--log-file").arg(path);
             }
             command.stdout(Stdio::from(stdout)).stderr(Stdio::piped());
             // The child setup uses only async-signal-safe descriptor and session operations.
@@ -481,7 +528,57 @@ mod pty {
     }
 
     #[test]
+    fn session_logs_are_private_typed_and_cli_configuration_wins() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("private-title.txt");
+        let cli_log = directory.path().join("cli.log");
+        let environment_log = directory.path().join("environment.log");
+        std::fs::write(&input, "PRIVATE_CONTENT_SENTINEL\n").unwrap();
+
+        let mut pty =
+            PtyChild::spawn_logged(&input, Some(&cli_log), Some(&environment_log)).unwrap();
+        pty.wait_for(b"PRIVATE_CONTENT_SENTINEL").unwrap();
+        pty.master.write_all(b"q").unwrap();
+        let status = pty.wait().unwrap();
+
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+        assert!(!environment_log.exists());
+        let log = std::fs::read_to_string(cli_log).unwrap();
+        assert!(log.is_ascii());
+        assert!(log.starts_with("schema version=1\nsession_start input=path source_bytes=25\n"));
+        assert!(log.contains("session_summary outcome=normal elapsed_us="));
+        assert!(log.ends_with(" terminal_sessions=1 suspensions=0\n"));
+        assert!(!log.contains("private-title"));
+        assert!(!log.contains("PRIVATE_CONTENT_SENTINEL"));
+    }
+
+    #[test]
+    fn session_logs_cannot_modify_the_input_document() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "unchanged").unwrap();
+        let mut pty = PtyChild::spawn_logged(file.path(), Some(file.path()), None).unwrap();
+        let status = pty.wait().unwrap();
+
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "unchanged");
+        assert!(
+            String::from_utf8_lossy(&pty.stderr_output)
+                .starts_with("tut: session log is the input document:")
+        );
+        assert!(
+            !pty.output
+                .windows(ENTER_ALT.len())
+                .any(|window| window == ENTER_ALT)
+        );
+        pty.assert_restored();
+    }
+
+    #[test]
     fn piped_standard_input_uses_the_controlling_terminal_for_commands() {
+        let directory = tempdir().unwrap();
+        let log = directory.path().join("session.log");
         let mut text = String::new();
         for line in 0..60 {
             match line {
@@ -490,8 +587,9 @@ mod pty {
                 _ => text.push_str("ordinary piped line\n"),
             }
         }
+        let source_bytes = text.len();
 
-        let mut pty = PtyChild::spawn_standard_input(text.as_bytes()).unwrap();
+        let mut pty = PtyChild::spawn_standard_input_logged(text.as_bytes(), &log).unwrap();
         pty.wait_for(b"PIPE_START_SENTINEL").unwrap();
         pty.master.write_all(b"G").unwrap();
         pty.wait_for(b"PIPE_END_SENTINEL").unwrap();
@@ -501,6 +599,11 @@ mod pty {
         assert_eq!(status.code(), Some(0));
         assert!(pty.stderr_output.is_empty());
         pty.assert_restored();
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.contains(&format!(
+            "session_start input=stdin source_bytes={source_bytes}\n"
+        )));
+        assert!(log.ends_with(" terminal_sessions=1 suspensions=0\n"));
     }
 
     #[test]
@@ -562,22 +665,36 @@ mod pty {
     #[test]
     fn external_signals_restore_before_reporting_the_signal() {
         let file = NamedTempFile::new().unwrap();
+        let directory = tempdir().unwrap();
         std::fs::write(file.path(), "text").unwrap();
-        for (signal, code, diagnostic) in [
-            (Signal::HUP, 129, b"tut: interrupted by SIGHUP\n".as_slice()),
-            (Signal::INT, 130, b"tut: interrupted by SIGINT\n".as_slice()),
+        for (signal, code, name, diagnostic) in [
+            (
+                Signal::HUP,
+                129,
+                "SIGHUP",
+                b"tut: interrupted by SIGHUP\n".as_slice(),
+            ),
+            (
+                Signal::INT,
+                130,
+                "SIGINT",
+                b"tut: interrupted by SIGINT\n".as_slice(),
+            ),
             (
                 Signal::QUIT,
                 131,
+                "SIGQUIT",
                 b"tut: interrupted by SIGQUIT\n".as_slice(),
             ),
             (
                 Signal::TERM,
                 143,
+                "SIGTERM",
                 b"tut: interrupted by SIGTERM\n".as_slice(),
             ),
         ] {
-            let mut pty = PtyChild::spawn(file.path()).unwrap();
+            let log = directory.path().join(format!("{name}.log"));
+            let mut pty = PtyChild::spawn_logged(file.path(), None, Some(&log)).unwrap();
             pty.wait_for(HIDE_CURSOR).unwrap();
             pty.signal(signal).unwrap();
             let status = pty.wait().unwrap();
@@ -594,14 +711,19 @@ mod pty {
                     .any(|window| window == LEAVE_ALT)
             );
             pty.assert_restored();
+            let log = std::fs::read_to_string(log).unwrap();
+            assert!(log.contains(&format!("session_summary outcome=signal signal={name} ")));
+            assert!(log.ends_with(" terminal_sessions=1 suspensions=0\n"));
         }
     }
 
     #[test]
     fn suspension_restores_and_continuation_reenters_the_terminal() {
-        let file = NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), "SUSPEND_SENTINEL\n").unwrap();
-        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        let log = directory.path().join("session.log");
+        std::fs::write(&input, "SUSPEND_SENTINEL\n").unwrap();
+        let mut pty = PtyChild::spawn_logged(&input, None, Some(&log)).unwrap();
         pty.wait_for(b"SUSPEND_SENTINEL").unwrap();
 
         let suspension_start = pty.output.len();
@@ -623,6 +745,8 @@ mod pty {
         assert_eq!(status.code(), Some(0));
         assert!(pty.stderr_output.is_empty());
         pty.assert_restored();
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.ends_with(" terminal_sessions=2 suspensions=1\n"));
     }
 
     #[test]
