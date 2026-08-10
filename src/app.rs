@@ -310,12 +310,16 @@ pub(super) struct RenderRows {
     text: String,
     spans: Vec<RenderSpan>,
     rows: Vec<RenderRowRange>,
+    #[cfg(test)]
+    reserve_attempts: RenderReserveAttempts,
 }
 
 static EMPTY_RENDER_ROWS: RenderRows = RenderRows {
     text: String::new(),
     spans: Vec::new(),
     rows: Vec::new(),
+    #[cfg(test)]
+    reserve_attempts: RenderReserveAttempts::ZERO,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -349,6 +353,25 @@ impl RenderRows {
 
     pub(super) const fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    fn storage(&self) -> RenderStorage {
+        RenderStorage {
+            text: self.text.capacity(),
+            spans: self.spans.capacity(),
+            rows: self.rows.capacity(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.spans.clear();
+        self.rows.clear();
+    }
+
+    #[cfg(test)]
+    const fn reserve_attempts(&self) -> RenderReserveAttempts {
+        self.reserve_attempts
     }
 
     #[cfg(test)]
@@ -1199,13 +1222,25 @@ impl App {
             self.document.validate()?;
             return Ok(Some(cached.viewport));
         }
-        self.render_cache = None;
-        let layout = self.layout.as_ref().expect("viewport has a layout");
-        let mut rows = RenderRowsBuilder::new(usize::from(row_capacity))?;
-        let mut reader = self.document.reader(&mut self.document_cache);
-        let (visible_rows, visible_end) =
-            layout.project_visible_rows(&mut reader, self.anchor, &mut rows)?;
-        let rows = rows.finish();
+        let reusable_rows = self
+            .render_cache
+            .take()
+            .filter(|cached| cached.geometry == self.geometry)
+            .map(|cached| cached.rows);
+        let row_capacity = usize::from(row_capacity);
+        let rendered = project_render_rows(
+            &self.document,
+            &mut self.document_cache,
+            self.layout.as_ref().expect("viewport has a layout"),
+            self.anchor,
+            row_capacity,
+            reusable_rows,
+        )?;
+        let RenderedViewportRows {
+            rows,
+            visible_rows,
+            visible_end,
+        } = rendered;
         debug_assert_eq!(rows.len(), visible_rows);
         let viewport = Viewport {
             visible_rows,
@@ -1233,6 +1268,23 @@ struct RenderStorage {
     text: usize,
     spans: usize,
     rows: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RenderReserveAttempts {
+    text: usize,
+    spans: usize,
+    rows: usize,
+}
+
+#[cfg(test)]
+impl RenderReserveAttempts {
+    const ZERO: Self = Self {
+        text: 0,
+        spans: 0,
+        rows: 0,
+    };
 }
 
 impl RenderStorage {
@@ -1267,11 +1319,133 @@ struct RenderRowsBuilder {
     rows: Vec<RenderRowRange>,
     row_start: RenderRowsCheckpoint,
     limit: usize,
+    #[cfg(test)]
+    reserve_attempts: RenderReserveAttempts,
+}
+
+struct RenderedViewportRows {
+    rows: RenderRows,
+    visible_rows: usize,
+    visible_end: SourceOffset,
+}
+
+fn project_render_rows(
+    document: &Document,
+    cache: &mut DocumentCache,
+    layout: &ViewportLayout,
+    anchor: SourceOffset,
+    row_capacity: usize,
+    reusable: Option<RenderRows>,
+) -> Result<RenderedViewportRows, TutError> {
+    project_render_rows_with_limit(
+        document,
+        cache,
+        layout,
+        anchor,
+        row_capacity,
+        reusable,
+        MAX_VISIBLE_RENDER_BYTES,
+    )
+}
+
+fn project_render_rows_with_limit(
+    document: &Document,
+    cache: &mut DocumentCache,
+    layout: &ViewportLayout,
+    anchor: SourceOffset,
+    row_capacity: usize,
+    reusable: Option<RenderRows>,
+    limit: usize,
+) -> Result<RenderedViewportRows, TutError> {
+    let Some(reusable) = reusable else {
+        let rows = RenderRowsBuilder::with_limit(row_capacity, limit)?;
+        return project_render_rows_once(document, cache, layout, anchor, rows);
+    };
+
+    let reused = RenderRowsBuilder::reuse_with_limit(reusable, row_capacity, limit)
+        .and_then(|rows| project_render_rows_once(document, cache, layout, anchor, rows));
+    match reused {
+        Ok(rendered) => Ok(rendered),
+        Err(error) => retry_reused_render(error, || {
+            let rows = RenderRowsBuilder::with_limit(row_capacity, limit)?;
+            project_render_rows_once(document, cache, layout, anchor, rows)
+        }),
+    }
+}
+
+fn project_render_rows_once(
+    document: &Document,
+    cache: &mut DocumentCache,
+    layout: &ViewportLayout,
+    anchor: SourceOffset,
+    mut rows: RenderRowsBuilder,
+) -> Result<RenderedViewportRows, TutError> {
+    let mut reader = document.reader(cache);
+    let (visible_rows, visible_end) =
+        layout.project_visible_rows(&mut reader, anchor, &mut rows)?;
+    Ok(RenderedViewportRows {
+        rows: rows.finish(),
+        visible_rows,
+        visible_end,
+    })
+}
+
+fn retry_reused_render<T>(
+    error: TutError,
+    fresh: impl FnOnce() -> Result<T, TutError>,
+) -> Result<T, TutError> {
+    if retryable_reused_render_error(&error) {
+        fresh()
+    } else {
+        Err(error)
+    }
+}
+
+fn retryable_reused_render_error(error: &TutError) -> bool {
+    match error {
+        TutError::VisibleRenderTooLarge { .. } => true,
+        TutError::Allocation(context) => matches!(
+            *context,
+            "visible row text" | "visible row spans" | "visible rows"
+        ),
+        _ => false,
+    }
 }
 
 impl RenderRowsBuilder {
-    fn new(row_capacity: usize) -> Result<Self, TutError> {
-        Self::with_limit(row_capacity, MAX_VISIBLE_RENDER_BYTES)
+    fn reuse_with_limit(
+        mut rows: RenderRows,
+        row_capacity: usize,
+        limit: usize,
+    ) -> Result<Self, TutError> {
+        rows.storage().require(limit)?;
+        rows.clear();
+        let mut builder = Self {
+            text: rows.text,
+            spans: rows.spans,
+            rows: rows.rows,
+            row_start: RenderRowsCheckpoint { text: 0, spans: 0 },
+            limit,
+            #[cfg(test)]
+            reserve_attempts: RenderReserveAttempts::ZERO,
+        };
+        if builder.rows.capacity() < row_capacity {
+            RenderStorage {
+                rows: row_capacity,
+                ..builder.storage()
+            }
+            .require(builder.limit)?;
+            #[cfg(test)]
+            {
+                builder.reserve_attempts.rows += 1;
+            }
+            builder
+                .rows
+                .try_reserve_exact(row_capacity)
+                .map_err(|_| TutError::Allocation("visible rows"))?;
+            builder.storage().require(builder.limit)?;
+        }
+        Ok(builder)
     }
 
     fn with_limit(row_capacity: usize, limit: usize) -> Result<Self, TutError> {
@@ -1290,6 +1464,12 @@ impl RenderRowsBuilder {
             rows,
             row_start: RenderRowsCheckpoint { text: 0, spans: 0 },
             limit,
+            #[cfg(test)]
+            reserve_attempts: RenderReserveAttempts {
+                text: 0,
+                spans: 0,
+                rows: 1,
+            },
         };
         builder.storage().require(limit)?;
         Ok(builder)
@@ -1303,6 +1483,8 @@ impl RenderRowsBuilder {
             text: self.text,
             spans: self.spans,
             rows: self.rows,
+            #[cfg(test)]
+            reserve_attempts: self.reserve_attempts,
         }
     }
 
@@ -1341,6 +1523,10 @@ impl RenderRowsBuilder {
                 .text
                 .checked_sub(self.text.len())
                 .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+            #[cfg(test)]
+            {
+                self.reserve_attempts.text += 1;
+            }
             self.text
                 .try_reserve_exact(additional)
                 .map_err(|_| TutError::Allocation("visible row text"))?;
@@ -1354,6 +1540,10 @@ impl RenderRowsBuilder {
                 .spans
                 .checked_sub(self.spans.len())
                 .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+            #[cfg(test)]
+            {
+                self.reserve_attempts.spans += 1;
+            }
             self.spans
                 .try_reserve_exact(additional)
                 .map_err(|_| TutError::Allocation("visible row spans"))?;
@@ -1368,6 +1558,10 @@ impl RenderRowsBuilder {
                 .rows
                 .checked_sub(self.rows.len())
                 .ok_or(TutError::VisibleRenderTooLarge { limit: self.limit })?;
+            #[cfg(test)]
+            {
+                self.reserve_attempts.rows += 1;
+            }
             self.rows
                 .try_reserve_exact(additional)
                 .map_err(|_| TutError::Allocation("visible rows"))?;
@@ -2521,6 +2715,96 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_reused_capacity_retries_with_fresh_storage() {
+        let mut app = reader(&"x".repeat(16), 16, 4);
+        let row_capacity = usize::from(app.geometry.body_height().unwrap().get());
+        let layout = app.layout.as_ref().unwrap();
+        let fresh = project_render_rows_with_limit(
+            &app.document,
+            &mut app.document_cache,
+            layout,
+            app.anchor,
+            row_capacity,
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        let fresh_storage = fresh.rows.storage();
+
+        let mut retained_text = String::new();
+        retained_text.try_reserve_exact(1024).unwrap();
+        let mut retained_rows = Vec::new();
+        retained_rows.try_reserve_exact(row_capacity).unwrap();
+        let reusable = RenderRows {
+            text: retained_text,
+            spans: Vec::new(),
+            rows: retained_rows,
+            reserve_attempts: RenderReserveAttempts::ZERO,
+        };
+        let reused_storage = reusable.storage();
+        let limit = reused_storage
+            .bytes()
+            .unwrap()
+            .max(fresh_storage.bytes().unwrap());
+        reused_storage.require(limit).unwrap();
+        fresh_storage.require(limit).unwrap();
+        assert!(matches!(
+            RenderStorage {
+                text: reused_storage.text,
+                spans: fresh_storage.spans,
+                rows: fresh_storage.rows,
+            }
+            .require(limit),
+            Err(TutError::VisibleRenderTooLarge { limit: actual }) if actual == limit
+        ));
+
+        let actual = project_render_rows_with_limit(
+            &app.document,
+            &mut app.document_cache,
+            layout,
+            app.anchor,
+            row_capacity,
+            Some(reusable),
+            limit,
+        )
+        .unwrap();
+
+        assert_eq!(actual.rows, fresh.rows);
+        assert_eq!(actual.visible_rows, fresh.visible_rows);
+        assert_eq!(actual.visible_end, fresh.visible_end);
+    }
+
+    #[test]
+    fn fresh_render_failures_are_returned_without_another_retry() {
+        let mut fresh_attempts = 0;
+        let error: Result<(), TutError> =
+            retry_reused_render(TutError::VisibleRenderTooLarge { limit: 7 }, || {
+                fresh_attempts += 1;
+                Err(TutError::VisibleRenderTooLarge { limit: 11 })
+            });
+
+        assert_eq!(fresh_attempts, 1);
+        assert!(matches!(
+            error,
+            Err(TutError::VisibleRenderTooLarge { limit: 11 })
+        ));
+        for context in ["visible row text", "visible row spans", "visible rows"] {
+            assert!(retryable_reused_render_error(&TutError::Allocation(
+                context
+            )));
+        }
+        assert!(!retryable_reused_render_error(&TutError::Load(
+            crate::error::LoadError::Allocation("file window")
+        )));
+        assert!(!retryable_reused_render_error(&TutError::Search(
+            crate::error::SearchError::Allocation
+        )));
+        assert!(!retryable_reused_render_error(&TutError::Allocation(
+            "search query"
+        )));
+    }
+
+    #[test]
     fn discarded_provisional_tail_releases_length_but_not_capacity() {
         let mut builder = RenderRowsBuilder::with_limit(1, usize::MAX).unwrap();
         builder.push(projected_atom("a")).unwrap();
@@ -2713,6 +2997,66 @@ mod tests {
     }
 
     #[test]
+    fn moved_viewports_reuse_render_storage_without_reserving() {
+        let mut app = reader(&"x".repeat(1024), 16, 7);
+        app.render_state().unwrap();
+        let first = app.render_cache.as_ref().unwrap();
+        let (_, first_text, first_spans, first_rows) = first.rows.storage_identity();
+        let first_storage = first.rows.storage();
+        let first_anchor = app.anchor;
+        assert!(first.rows.reserve_attempts().text > 0);
+        assert!(first.rows.reserve_attempts().spans > 0);
+        assert_eq!(first.rows.reserve_attempts().rows, 1);
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        assert_ne!(app.anchor, first_anchor);
+        app.render_state().unwrap();
+
+        let second = app.render_cache.as_ref().unwrap();
+        let (_, second_text, second_spans, second_rows) = second.rows.storage_identity();
+        assert_eq!(
+            (second_text, second_spans, second_rows),
+            (first_text, first_spans, first_rows)
+        );
+        assert_eq!(second.rows.storage(), first_storage);
+        assert_eq!(second.rows.reserve_attempts(), RenderReserveAttempts::ZERO);
+    }
+
+    #[test]
+    fn reused_render_storage_grows_within_its_budget() {
+        let cluster = "\u{301}".repeat(512);
+        let mut app = reader(&format!("a\n{cluster}\n"), 16, 4);
+        app.render_state().unwrap();
+        let first_storage = app.render_cache.as_ref().unwrap().rows.storage();
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        app.render_state().unwrap();
+
+        let rows = &app.render_cache.as_ref().unwrap().rows;
+        assert!(rows.storage().text > first_storage.text);
+        assert!(rows.reserve_attempts().text > 0);
+        assert!(rows.storage().bytes().unwrap() <= MAX_VISIBLE_RENDER_BYTES);
+    }
+
+    #[test]
+    fn geometry_changes_discard_render_storage() {
+        let mut app = reader(&"x".repeat(4096), 127, 7);
+        app.render_state().unwrap();
+        let first_storage = app.render_cache.as_ref().unwrap().rows.storage();
+
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        settle(&mut app);
+        app.render_state().unwrap();
+
+        let rows = &app.render_cache.as_ref().unwrap().rows;
+        assert_eq!(rows.reserve_attempts().rows, 1);
+        assert!(rows.storage().bytes().unwrap() < first_storage.bytes().unwrap());
+        assert!(rows.storage().bytes().unwrap() <= MAX_VISIBLE_RENDER_BYTES);
+    }
+
+    #[test]
     fn search_input_redraws_reuse_the_cached_body_and_line_position() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("search-redraw.txt");
@@ -2852,6 +3196,23 @@ mod tests {
         fs::write(&path, "other").unwrap();
 
         assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+    }
+
+    #[test]
+    fn recycled_file_rendering_still_rejects_in_place_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing-recycled.txt");
+        fs::write(&path, "x".repeat(128)).unwrap();
+        let mut app = App::new(crate::document::load(path.clone()).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        app.render_state().unwrap();
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        fs::write(path, "y".repeat(128)).unwrap();
+
+        assert!(matches!(app.render_state(), Err(TutError::Load(_))));
+        assert!(app.render_cache.is_none());
     }
 
     #[test]
