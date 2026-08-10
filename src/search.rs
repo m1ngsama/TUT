@@ -105,7 +105,7 @@ struct SearchNavigation {
     source_end: SourceOffset,
     current: SearchRange,
     previous: Option<SearchRange>,
-    block: Option<MatchBlock>,
+    block: MatchBlockCache,
     direction: NavigationDirection,
     wrap: Option<SearchRange>,
     #[cfg(test)]
@@ -120,12 +120,32 @@ enum NavigationDirection {
 
 #[derive(Debug)]
 struct MatchBlock {
+    document_id: DocumentId,
     query_len: usize,
     start: SourceOffset,
     next: SourceOffset,
     previous: Option<SearchRange>,
-    starts: Vec<u32>,
+    storage: MatchBlockStorage,
     selected: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct MatchBlockStorage {
+    starts: Vec<u32>,
+    #[cfg(test)]
+    reserve_attempts: usize,
+}
+
+#[derive(Debug)]
+enum MatchBlockCache {
+    Ready(MatchBlock),
+    Spare(MatchBlockStorage),
+}
+
+impl Default for MatchBlockCache {
+    fn default() -> Self {
+        Self::Spare(MatchBlockStorage::default())
+    }
 }
 
 impl SearchAdvance {
@@ -180,7 +200,7 @@ pub(super) struct SearchSession {
     index: SearchIndex,
     current_match: Option<SearchRange>,
     navigation: Option<SearchNavigation>,
-    match_block: Option<MatchBlock>,
+    match_block: MatchBlockCache,
     pending_navigation: i64,
     highlights: SearchHighlightState,
     jump_pending: bool,
@@ -207,7 +227,7 @@ impl SearchSession {
             index,
             current_match: None,
             navigation: None,
-            match_block: None,
+            match_block: MatchBlockCache::default(),
             pending_navigation: 0,
             highlights: SearchHighlightState::default(),
             jump_pending,
@@ -284,10 +304,8 @@ impl SearchSession {
     pub(super) fn cancel_motion(&mut self) -> bool {
         let changed =
             self.navigation.is_some() || self.pending_navigation != 0 || self.jump_pending;
-        if let Some(mut navigation) = self.navigation.take()
-            && let Some(block) = navigation.take_block()
-        {
-            self.match_block = Some(block);
+        if let Some(mut navigation) = self.navigation.take() {
+            self.match_block = navigation.take_block();
         }
         self.pending_navigation = 0;
         self.jump_pending = false;
@@ -355,9 +373,11 @@ impl SearchSession {
                 };
                 let forward = self.pending_navigation > 0;
                 self.pending_navigation -= if forward { 1 } else { -1 };
-                self.navigation =
-                    self.index
-                        .navigation_with_block(current, forward, self.match_block.take());
+                self.navigation = self.index.navigation_with_block(
+                    current,
+                    forward,
+                    std::mem::take(&mut self.match_block),
+                );
             }
             let Some(navigation) = self.navigation.as_mut() else {
                 let changed = self.pending_navigation != 0;
@@ -378,7 +398,7 @@ impl SearchSession {
             self.match_block = self
                 .navigation
                 .as_mut()
-                .and_then(SearchNavigation::take_block);
+                .map_or_else(MatchBlockCache::default, SearchNavigation::take_block);
             self.navigation = None;
         }
         let jump = if let Some(selected) = advance.selected() {
@@ -403,7 +423,7 @@ impl SearchSession {
 
     #[cfg(test)]
     pub(super) const fn has_cached_block(&self) -> bool {
-        self.match_block.is_some()
+        self.match_block.is_ready()
     }
 
     #[cfg(test)]
@@ -548,14 +568,14 @@ impl SearchIndex {
 
     #[cfg(test)]
     fn navigation(&self, current: SearchRange, forward: bool) -> Option<SearchNavigation> {
-        self.navigation_with_block(current, forward, None)
+        self.navigation_with_block(current, forward, MatchBlockCache::default())
     }
 
     fn navigation_with_block(
         &self,
         current: SearchRange,
         forward: bool,
-        block: Option<MatchBlock>,
+        mut block: MatchBlockCache,
     ) -> Option<SearchNavigation> {
         if !self.complete {
             return None;
@@ -566,17 +586,18 @@ impl SearchIndex {
             NavigationDirection::Backward
         };
         let checkpoint = (!forward).then(|| self.checkpoint_at_or_before(current.start()));
-        let mut block = block;
-        if block.as_mut().is_some_and(|block| {
-            let contains = block.locate(current).is_some();
-            !(contains || forward && block.previous == Some(current))
+        if block.ready_mut().is_some_and(|block| {
+            let compatible =
+                block.document_id == self.document_id && block.query_len == self.query_len;
+            let contains = compatible && block.locate(current).is_some();
+            !(contains || compatible && forward && block.previous == Some(current))
         }) {
-            block = None;
+            block.make_spare();
         }
         let cursor = if forward {
-            block.as_ref().map_or(current.end(), |block| block.start)
+            block.ready().map_or(current.end(), |block| block.start)
         } else {
-            block.as_ref().map_or_else(
+            block.ready().map_or_else(
                 || {
                     checkpoint
                         .expect("backward navigation starts from a checkpoint")
@@ -588,7 +609,7 @@ impl SearchIndex {
         let previous = if forward {
             Some(current)
         } else {
-            block.as_ref().map_or_else(
+            block.ready().map_or_else(
                 || {
                     checkpoint
                         .expect("backward navigation starts from a checkpoint")
@@ -789,34 +810,84 @@ fn initial_checkpoint_reservation(
         .min(limits.max_checkpoints)
 }
 
-impl MatchBlock {
+impl MatchBlockCache {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn ready(&self) -> Option<&MatchBlock> {
+        match self {
+            Self::Ready(block) => Some(block),
+            Self::Spare(_) => None,
+        }
+    }
+
+    const fn ready_mut(&mut self) -> Option<&mut MatchBlock> {
+        match self {
+            Self::Ready(block) => Some(block),
+            Self::Spare(_) => None,
+        }
+    }
+
+    fn make_spare(&mut self) {
+        let storage = match std::mem::take(self) {
+            Self::Ready(block) => block.storage,
+            Self::Spare(storage) => storage,
+        };
+        *self = Self::Spare(storage);
+    }
+
     fn scan(
+        &mut self,
         reader: &mut DocumentReader<'_>,
         needle: &str,
         document_id: DocumentId,
         source_end: SourceOffset,
         start: SourceOffset,
         previous: Option<SearchRange>,
-    ) -> Result<Self, TutError> {
+    ) -> Result<(), TutError> {
         if reader.document_id() != document_id {
             return Err(SearchError::SourceMismatch.into());
         }
-        let mut block = Self {
+        self.make_spare();
+        let Self::Spare(mut storage) = std::mem::take(self) else {
+            unreachable!("match block caches become spare before scanning");
+        };
+        storage.starts.clear();
+        let mut block = MatchBlock {
+            document_id,
             query_len: needle.len(),
             start,
             next: start,
             previous,
-            starts: Vec::new(),
+            storage,
             selected: None,
         };
-        block.next = scan_window(reader, needle, start, source_end, |range| {
+        match scan_window(reader, needle, start, source_end, |range| {
             block.push(range.start())
-        })?;
-        Ok(block)
+        }) {
+            Ok(next) => {
+                block.next = next;
+                *self = Self::Ready(block);
+                Ok(())
+            }
+            Err(error) => {
+                block.storage.starts.clear();
+                *self = Self::Spare(block.storage);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl MatchBlock {
+    fn starts(&self) -> &[u32] {
+        &self.storage.starts
     }
 
     fn push(&mut self, start: SourceOffset) -> Result<(), TutError> {
-        if self.starts.len() >= MATCH_BLOCK_START_LIMIT {
+        let starts = &mut self.storage.starts;
+        if starts.len() >= MATCH_BLOCK_START_LIMIT {
             return Err(SearchError::Allocation.into());
         }
         let relative = start
@@ -824,19 +895,23 @@ impl MatchBlock {
             .checked_sub(self.start.get())
             .and_then(|relative| u32::try_from(relative).ok())
             .ok_or(SearchError::CoordinateOverflow)?;
-        if self.starts.len() == self.starts.capacity() {
-            let remaining = MATCH_BLOCK_START_LIMIT - self.starts.len();
-            let additional = self.starts.capacity().max(256).min(remaining);
-            self.starts
+        if starts.len() == starts.capacity() {
+            let remaining = MATCH_BLOCK_START_LIMIT - starts.len();
+            let additional = starts.capacity().max(256).min(remaining);
+            #[cfg(test)]
+            {
+                self.storage.reserve_attempts = self.storage.reserve_attempts.saturating_add(1);
+            }
+            starts
                 .try_reserve_exact(additional)
                 .map_err(|_| SearchError::Allocation)?;
         }
-        self.starts.push(relative);
+        starts.push(relative);
         Ok(())
     }
 
     fn range(&self, index: usize) -> SearchRange {
-        let relative = usize::try_from(self.starts[index])
+        let relative = usize::try_from(self.starts()[index])
             .expect("u32 match offsets fit the process address space");
         let start = self
             .start
@@ -855,10 +930,10 @@ impl MatchBlock {
         let lower = earliest.saturating_sub(self.start.get());
         let upper = visible.end.get().saturating_sub(self.start.get());
         let first = self
-            .starts
+            .starts()
             .partition_point(|start| u64::from(*start) < lower);
         let last = self
-            .starts
+            .starts()
             .partition_point(|start| u64::from(*start) < upper);
 
         (first..last).map(|index| self.range(index))
@@ -872,7 +947,7 @@ impl MatchBlock {
         }
         let relative = range.start().get().checked_sub(self.start.get())?;
         let relative = u32::try_from(relative).ok()?;
-        let index = self.starts.binary_search(&relative).ok()?;
+        let index = self.starts().binary_search(&relative).ok()?;
         if self.range(index) != range {
             return None;
         }
@@ -886,11 +961,11 @@ impl MatchBlock {
     }
 
     fn first(&mut self) -> Option<SearchRange> {
-        (!self.starts.is_empty()).then(|| self.select(0))
+        (!self.starts().is_empty()).then(|| self.select(0))
     }
 
     fn last_or_previous(&self) -> Option<SearchRange> {
-        self.starts
+        self.starts()
             .len()
             .checked_sub(1)
             .map(|index| self.range(index))
@@ -902,7 +977,7 @@ impl MatchBlock {
             return self.first();
         }
         let index = self.locate(current)?.checked_add(1)?;
-        (index < self.starts.len()).then(|| self.select(index))
+        (index < self.starts().len()).then(|| self.select(index))
     }
 
     fn predecessor(&mut self, current: SearchRange) -> Option<SearchRange> {
@@ -913,7 +988,7 @@ impl MatchBlock {
     fn last_before(&mut self, before: SourceOffset) -> Option<SearchRange> {
         let relative = before.get().saturating_sub(self.start.get());
         let index = self
-            .starts
+            .starts()
             .partition_point(|start| u64::from(*start) < relative)
             .checked_sub(1)?;
         Some(self.select(index))
@@ -939,8 +1014,8 @@ impl SearchNavigation {
         }
     }
 
-    fn take_block(&mut self) -> Option<MatchBlock> {
-        self.block.take()
+    fn take_block(&mut self) -> MatchBlockCache {
+        std::mem::take(&mut self.block)
     }
 
     #[cfg(test)]
@@ -953,13 +1028,12 @@ impl SearchNavigation {
         reader: &mut DocumentReader<'_>,
         needle: &str,
     ) -> Result<SearchAdvance, TutError> {
-        let reused_block = self.block.is_some();
+        let reused_block = self.block.is_ready();
         if reused_block {
             reader.validate()?;
         }
-        if let Some(mut block) = self.take_block() {
+        if let Some(block) = self.block.ready_mut() {
             if let Some(selected) = block.successor(self.current) {
-                self.block = Some(block);
                 return Ok(SearchAdvance {
                     selected: Some(selected),
                     completed: true,
@@ -969,7 +1043,6 @@ impl SearchNavigation {
             self.previous = block.last_or_previous();
             if self.cursor >= self.source_end {
                 block.clear_selection();
-                self.block = Some(block);
                 return Ok(SearchAdvance {
                     selected: self.wrap,
                     completed: true,
@@ -986,7 +1059,7 @@ impl SearchNavigation {
             });
         }
 
-        let mut block = MatchBlock::scan(
+        self.block.scan(
             reader,
             needle,
             self.document_id,
@@ -998,6 +1071,10 @@ impl SearchNavigation {
         {
             self.window_scans += 1;
         }
+        let block = self
+            .block
+            .ready_mut()
+            .expect("successful scans publish a ready match block");
         self.cursor = block.next;
         self.previous = block.last_or_previous();
         let selected = block.first();
@@ -1005,7 +1082,6 @@ impl SearchNavigation {
         if completed && selected.is_none() {
             block.clear_selection();
         }
-        self.block = Some(block);
         Ok(SearchAdvance {
             selected: if completed {
                 selected.or(self.wrap)
@@ -1021,17 +1097,16 @@ impl SearchNavigation {
         reader: &mut DocumentReader<'_>,
         needle: &str,
     ) -> Result<SearchAdvance, TutError> {
-        let reused_block = self.block.is_some();
+        let reused_block = self.block.is_ready();
         if reused_block {
             reader.validate()?;
         }
-        if let Some(mut block) = self.take_block() {
+        if let Some(block) = self.block.ready_mut() {
             if block.locate(self.current).is_some() {
                 let selected = block.predecessor(self.current).or(block.previous);
                 if selected.is_none() || selected == block.previous {
                     block.clear_selection();
                 }
-                self.block = Some(block);
                 return Ok(SearchAdvance {
                     selected: selected.or(self.wrap),
                     completed: true,
@@ -1050,7 +1125,7 @@ impl SearchNavigation {
             });
         }
 
-        let mut block = MatchBlock::scan(
+        self.block.scan(
             reader,
             needle,
             self.document_id,
@@ -1062,10 +1137,13 @@ impl SearchNavigation {
         {
             self.window_scans += 1;
         }
+        let block = self
+            .block
+            .ready_mut()
+            .expect("successful scans publish a ready match block");
         self.cursor = block.next;
         self.previous = block.last_or_previous();
         if self.cursor < self.current.start() {
-            self.block = Some(block);
             return Ok(SearchAdvance {
                 selected: None,
                 completed: false,
@@ -1076,7 +1154,6 @@ impl SearchNavigation {
         if selected.is_none() || selected == block.previous {
             block.clear_selection();
         }
-        self.block = Some(block);
         Ok(SearchAdvance {
             selected: selected.or(self.wrap),
             completed: true,
@@ -1197,7 +1274,7 @@ impl SearchHighlights {
         &mut self,
         reader: &mut DocumentReader<'_>,
         needle: &str,
-        cached: &mut Option<MatchBlock>,
+        cached: &mut MatchBlockCache,
     ) -> Result<bool, TutError> {
         if reader.document_id() != self.document_id {
             return Err(SearchError::SourceMismatch.into());
@@ -1211,27 +1288,27 @@ impl SearchHighlights {
             return Ok(true);
         }
 
-        let block = cached.take().filter(|block| {
-            block.query_len == needle.len()
+        let reusable = cached.ready().is_some_and(|block| {
+            block.document_id == self.document_id
+                && block.query_len == needle.len()
                 && block.start <= self.needed_from
                 && self.needed_from < block.next
         });
-        let block = if let Some(block) = block {
-            if let Err(error) = reader.validate() {
-                *cached = Some(block);
-                return Err(error.into());
-            }
-            block
+        if reusable {
+            reader.validate()?;
         } else {
-            MatchBlock::scan(
+            cached.scan(
                 reader,
                 needle,
                 self.document_id,
                 self.source_end,
                 self.cursor,
                 self.previous,
-            )?
-        };
+            )?;
+        }
+        let block = cached
+            .ready()
+            .expect("reused and successfully scanned match blocks are ready");
         let push_result = block
             .overlapping(&self.visible)
             .try_for_each(|range| self.push(range));
@@ -1240,7 +1317,6 @@ impl SearchHighlights {
             self.needed_from = block.next;
             self.previous = block.last_or_previous();
         }
-        *cached = Some(block);
         push_result?;
         if self.cursor >= self.source_end || self.cursor >= self.visible.end {
             self.finish();
@@ -1426,7 +1502,7 @@ mod tests {
         let mut highlights = index.highlights(visible).unwrap();
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
         while !highlights.is_complete() {
             highlights.advance(&mut reader, needle, &mut block).unwrap();
         }
@@ -1473,8 +1549,8 @@ mod tests {
         needle: &str,
         current: SearchRange,
         forward: bool,
-        block: Option<MatchBlock>,
-    ) -> (Option<SearchRange>, Option<MatchBlock>, usize) {
+        block: MatchBlockCache,
+    ) -> (Option<SearchRange>, MatchBlockCache, usize) {
         let mut navigation = index
             .navigation_with_block(current, forward, block)
             .unwrap();
@@ -1669,7 +1745,7 @@ mod tests {
         let text = "a ".repeat(SOURCE_WINDOW_BYTES / 2);
         let (document, index) = complete(&text, "a");
         let mut current = index.first_match.unwrap();
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
         let mut forward_scans = 0;
 
         for match_index in 1..=1024 {
@@ -1699,7 +1775,7 @@ mod tests {
         let text = "a".repeat(4096);
         let (document, index) = complete(&text, "aa");
         let mut current = index.first_match.unwrap();
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
         let mut scans = 0;
 
         for match_index in 1..=512 {
@@ -1726,8 +1802,14 @@ mod tests {
         let (document, index) = complete(&text, needle);
         let first = index.first_match.unwrap();
 
-        let (second, block, first_scans) =
-            navigate_with_block(&document, &index, needle, first, true, None);
+        let (second, block, first_scans) = navigate_with_block(
+            &document,
+            &index,
+            needle,
+            first,
+            true,
+            MatchBlockCache::default(),
+        );
         let second = second.unwrap();
         assert_eq!(second.start(), SourceOffset::from_usize(crossing));
         assert_eq!(first_scans, 1);
@@ -1736,6 +1818,98 @@ mod tests {
             navigate_with_block(&document, &index, needle, second, true, block);
         assert_eq!(third.unwrap().start(), SourceOffset::from_usize(following));
         assert_eq!(second_scans, 1);
+    }
+
+    #[test]
+    fn consecutive_dense_blocks_reuse_one_starts_allocation() {
+        let document = Document::from_text(
+            Path::new("dense-blocks.txt"),
+            "a".repeat(SOURCE_WINDOW_BYTES * 2),
+        );
+        let mut document_cache = DocumentCache::default();
+        let mut reader = document.reader(&mut document_cache);
+        let document_id = reader.document_id();
+        let source_end = reader.source_end();
+        let mut cache = MatchBlockCache::default();
+
+        cache
+            .scan(
+                &mut reader,
+                "a",
+                document_id,
+                source_end,
+                SourceOffset::ZERO,
+                None,
+            )
+            .unwrap();
+        let first = cache.ready().unwrap();
+        assert_eq!(first.storage.starts.len(), SOURCE_WINDOW_BYTES);
+        let allocation = first.storage.starts.as_ptr();
+        let capacity = first.storage.starts.capacity();
+        let reserve_attempts = first.storage.reserve_attempts;
+        let second_start = first.next;
+        let previous = first.last_or_previous();
+        assert!(reserve_attempts > 0);
+
+        cache
+            .scan(
+                &mut reader,
+                "a",
+                document_id,
+                source_end,
+                second_start,
+                previous,
+            )
+            .unwrap();
+        let second = cache.ready().unwrap();
+        assert_eq!(second.storage.starts.len(), SOURCE_WINDOW_BYTES);
+        assert_eq!(second.storage.starts.as_ptr(), allocation);
+        assert_eq!(second.storage.starts.capacity(), capacity);
+        assert_eq!(second.storage.reserve_attempts, reserve_attempts);
+    }
+
+    #[test]
+    fn match_block_scan_failures_leave_only_cleared_spare_storage() {
+        let document = Document::from_text(Path::new("failed-block.txt"), "aaaa".to_owned());
+        let mut document_cache = DocumentCache::default();
+        let mut reader = document.reader(&mut document_cache);
+        let document_id = reader.document_id();
+        let source_end = reader.source_end();
+        let mut cache = MatchBlockCache::default();
+
+        cache
+            .scan(
+                &mut reader,
+                "a",
+                document_id,
+                source_end,
+                SourceOffset::ZERO,
+                None,
+            )
+            .unwrap();
+        let ready = cache.ready().unwrap();
+        let allocation = ready.storage.starts.as_ptr();
+        let capacity = ready.storage.starts.capacity();
+        let reserve_attempts = ready.storage.reserve_attempts;
+
+        assert!(matches!(
+            cache.scan(
+                &mut reader,
+                "a",
+                document_id,
+                SourceOffset::new(1),
+                SourceOffset::ZERO,
+                None,
+            ),
+            Err(TutError::Search(SearchError::NonIncreasingCursor { at: 0 }))
+        ));
+        let MatchBlockCache::Spare(storage) = &cache else {
+            panic!("failed scans must not publish partial match blocks");
+        };
+        assert!(storage.starts.is_empty());
+        assert_eq!(storage.starts.as_ptr(), allocation);
+        assert_eq!(storage.starts.capacity(), capacity);
+        assert_eq!(storage.reserve_attempts, reserve_attempts);
     }
 
     #[test]
@@ -1873,7 +2047,7 @@ mod tests {
     fn cached_highlights_preserve_global_greedy_matches() {
         let (document, index) = complete("aaaaaa", "aa");
         let mut cache = DocumentCache::default();
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
 
         let mut first = index
             .highlights(SourceOffset::new(1)..SourceOffset::new(3))
@@ -1974,7 +2148,7 @@ mod tests {
         let end = start.checked_add(needle.len()).unwrap();
         let expected = SearchRange::new(start, end).unwrap();
         let mut cache = DocumentCache::default();
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
 
         let mut suffix = index.highlights(after_first_character..end).unwrap();
         {
@@ -1982,7 +2156,7 @@ mod tests {
             assert!(suffix.advance(&mut reader, needle, &mut block).unwrap());
         }
         assert_eq!(suffix.ranges(), &[expected]);
-        block.as_mut().unwrap().selected = Some(0);
+        block.ready_mut().unwrap().selected = Some(0);
         cache.reset_metrics();
 
         let mut prefix = index.highlights(start..after_first_character).unwrap();
@@ -1991,7 +2165,7 @@ mod tests {
             assert!(prefix.advance(&mut reader, needle, &mut block).unwrap());
         }
         assert_eq!(prefix.ranges(), &[expected]);
-        assert_eq!(block.as_ref().unwrap().selected, Some(0));
+        assert_eq!(block.ready().unwrap().selected, Some(0));
         assert_eq!(cache.metrics().window_calls(), 0);
     }
 
@@ -2014,13 +2188,15 @@ mod tests {
         };
 
         let visible = document.source_start()..document.source_end();
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
         let mut first = index.highlights(visible.clone()).unwrap();
         {
             let mut reader = document.reader(&mut cache);
             assert!(first.advance(&mut reader, "cat", &mut block).unwrap());
         }
-        assert!(block.is_some());
+        let ready = block.ready().unwrap();
+        let allocation = ready.storage.starts.as_ptr();
+        let capacity = ready.storage.starts.capacity();
         fs::write(path, "changed contents").unwrap();
         cache.reset_metrics();
 
@@ -2030,7 +2206,9 @@ mod tests {
             stale.advance(&mut reader, "cat", &mut block)
         };
         assert!(matches!(result, Err(TutError::Load(_))));
-        assert!(block.is_some());
+        let ready = block.ready().unwrap();
+        assert_eq!(ready.storage.starts.as_ptr(), allocation);
+        assert_eq!(ready.storage.starts.capacity(), capacity);
         assert!(stale.ranges().is_empty());
         assert_eq!(cache.metrics().window_calls(), 0);
     }
@@ -2051,7 +2229,7 @@ mod tests {
         let whole_target = SearchRange::new(whole.start, whole.end).unwrap();
         session.prepare_highlights(whole, [whole_target]).unwrap();
         settle_session(&document, &mut cache, &mut session);
-        let allocation = session.match_block.as_ref().unwrap().starts.as_ptr();
+        let allocation = session.match_block.ready().unwrap().storage.starts.as_ptr();
         cache.reset_metrics();
 
         assert!(request_session_navigation(
@@ -2066,7 +2244,7 @@ mod tests {
             SourceOffset::new(4)
         );
         assert_eq!(
-            session.match_block.as_ref().unwrap().starts.as_ptr(),
+            session.match_block.ready().unwrap().storage.starts.as_ptr(),
             allocation
         );
 
@@ -2078,7 +2256,7 @@ mod tests {
         settle_session(&document, &mut cache, &mut session);
         assert_eq!(session.highlight_ranges(&second), &[second_target]);
         assert_eq!(
-            session.match_block.as_ref().unwrap().starts.as_ptr(),
+            session.match_block.ready().unwrap().storage.starts.as_ptr(),
             allocation
         );
 
@@ -2091,10 +2269,216 @@ mod tests {
         settle_session(&document, &mut cache, &mut session);
         assert_eq!(session.current_match().unwrap().start(), SourceOffset::ZERO);
         assert_eq!(
-            session.match_block.as_ref().unwrap().starts.as_ptr(),
+            session.match_block.ready().unwrap().storage.starts.as_ptr(),
             allocation
         );
         assert_eq!(cache.metrics().window_calls(), 0);
+    }
+
+    #[test]
+    fn highlights_and_cross_window_navigation_move_one_starts_allocation() {
+        let first_start = SOURCE_WINDOW_BYTES - 3;
+        let second_start = SOURCE_WINDOW_BYTES + 5;
+        let mut text = "x".repeat(first_start);
+        text.push_str("cat");
+        text.push_str(&"x".repeat(second_start - text.len()));
+        text.push_str("cat");
+        let document = Document::from_text(Path::new("cross-window.txt"), text);
+        let mut document_cache = DocumentCache::default();
+        let mut session = {
+            let reader = document.reader(&mut document_cache);
+            SearchSession::new(
+                &reader,
+                "cat".to_owned(),
+                SourceOffset::from_usize(first_start),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        settle_session(&document, &mut document_cache, &mut session);
+        assert_eq!(
+            session.current_match().unwrap().start(),
+            SourceOffset::from_usize(first_start)
+        );
+
+        let first_visible = SourceOffset::from_usize(first_start)
+            ..SourceOffset::from_usize(first_start + "cat".len());
+        let first_target = SearchRange::new(first_visible.start, first_visible.end).unwrap();
+        session
+            .prepare_highlights(first_visible.clone(), [first_target])
+            .unwrap();
+        settle_session(&document, &mut document_cache, &mut session);
+        assert_eq!(session.highlight_ranges(&first_visible), &[first_target]);
+        let first = session.match_block.ready().unwrap();
+        let allocation = first.storage.starts.as_ptr();
+        let capacity = first.storage.starts.capacity();
+        let reserve_attempts = first.storage.reserve_attempts;
+
+        document_cache.reset_metrics();
+        assert!(request_session_navigation(
+            &document,
+            &mut document_cache,
+            &mut session,
+            true
+        ));
+        settle_session(&document, &mut document_cache, &mut session);
+        assert_eq!(
+            session.current_match().unwrap().start(),
+            SourceOffset::from_usize(second_start)
+        );
+        let navigated = session.match_block.ready().unwrap();
+        assert_eq!(navigated.storage.starts.as_ptr(), allocation);
+        assert_eq!(navigated.storage.starts.capacity(), capacity);
+        assert_eq!(navigated.storage.reserve_attempts, reserve_attempts);
+        assert_eq!(navigated.selected, Some(0));
+        assert_eq!(document_cache.metrics().window_calls(), 1);
+
+        let second_visible = SourceOffset::from_usize(second_start)
+            ..SourceOffset::from_usize(second_start + "cat".len());
+        let second_target = SearchRange::new(second_visible.start, second_visible.end).unwrap();
+        document_cache.reset_metrics();
+        session
+            .prepare_highlights(second_visible.clone(), [second_target])
+            .unwrap();
+        settle_session(&document, &mut document_cache, &mut session);
+        assert_eq!(session.highlight_ranges(&second_visible), &[second_target]);
+        let highlighted = session.match_block.ready().unwrap();
+        assert_eq!(highlighted.storage.starts.as_ptr(), allocation);
+        assert_eq!(highlighted.storage.starts.capacity(), capacity);
+        assert_eq!(highlighted.storage.reserve_attempts, reserve_attempts);
+        assert_eq!(highlighted.selected, Some(0));
+        assert_eq!(document_cache.metrics().window_calls(), 0);
+    }
+
+    #[test]
+    fn cancel_motion_returns_cross_window_match_block_storage() {
+        let second_start = SOURCE_WINDOW_BYTES * 2 + 7;
+        let mut text = "cat".to_owned();
+        text.push_str(&"x".repeat(second_start - text.len()));
+        text.push_str("cat");
+        let document = Document::from_text(Path::new("cancel-cross-window.txt"), text);
+        let mut document_cache = DocumentCache::default();
+        let mut session = {
+            let reader = document.reader(&mut document_cache);
+            SearchSession::new(&reader, "cat".to_owned(), SourceOffset::ZERO)
+                .unwrap()
+                .unwrap()
+        };
+        settle_session(&document, &mut document_cache, &mut session);
+
+        let first_visible = SourceOffset::ZERO..SourceOffset::new(3);
+        let first_target = SearchRange::new(first_visible.start, first_visible.end).unwrap();
+        session
+            .prepare_highlights(first_visible, [first_target])
+            .unwrap();
+        settle_session(&document, &mut document_cache, &mut session);
+        let first = session.match_block.ready().unwrap();
+        let allocation = first.storage.starts.as_ptr();
+        let capacity = first.storage.starts.capacity();
+        let reserve_attempts = first.storage.reserve_attempts;
+        assert_ne!(capacity, 0);
+
+        document_cache.reset_metrics();
+        assert!(request_session_navigation(
+            &document,
+            &mut document_cache,
+            &mut session,
+            true
+        ));
+        {
+            let mut reader = document.reader(&mut document_cache);
+            let step = session.advance(&mut reader).unwrap();
+            assert!(!step.changed());
+        }
+        let active = session.navigation.as_ref().unwrap().block.ready().unwrap();
+        assert_eq!(active.start, SourceOffset::from_usize(SOURCE_WINDOW_BYTES));
+        assert_eq!(
+            active.next,
+            SourceOffset::from_usize(SOURCE_WINDOW_BYTES * 2)
+        );
+        assert!(active.storage.starts.is_empty());
+        assert_eq!(active.storage.starts.as_ptr(), allocation);
+        assert_eq!(active.storage.starts.capacity(), capacity);
+        assert_eq!(active.storage.reserve_attempts, reserve_attempts);
+        assert_eq!(document_cache.metrics().window_calls(), 1);
+
+        assert!(session.cancel_motion());
+        assert!(session.navigation.is_none());
+        let returned = session.match_block.ready().unwrap();
+        assert_eq!(returned.storage.starts.as_ptr(), allocation);
+        assert_eq!(returned.storage.starts.capacity(), capacity);
+        assert_eq!(returned.storage.reserve_attempts, reserve_attempts);
+
+        document_cache.reset_metrics();
+        assert!(request_session_navigation(
+            &document,
+            &mut document_cache,
+            &mut session,
+            true
+        ));
+        settle_session(&document, &mut document_cache, &mut session);
+        assert_eq!(
+            session.current_match().unwrap().start(),
+            SourceOffset::from_usize(second_start)
+        );
+        let resumed = session.match_block.ready().unwrap();
+        assert_eq!(resumed.storage.starts.as_ptr(), allocation);
+        assert_eq!(resumed.storage.starts.capacity(), capacity);
+        assert_eq!(resumed.storage.reserve_attempts, reserve_attempts);
+        assert_eq!(document_cache.metrics().window_calls(), 1);
+    }
+
+    #[test]
+    fn incompatible_blocks_become_spare_without_skipping_freshness() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("incompatible-block.txt");
+        fs::write(&path, "cat").unwrap();
+        let document = crate::document::load(path.clone()).unwrap();
+        let mut document_cache = DocumentCache::default();
+        let index = {
+            let mut reader = document.reader(&mut document_cache);
+            let mut index = SearchIndex::new(&reader, "cat", SourceOffset::ZERO)
+                .unwrap()
+                .unwrap();
+            while !index.is_complete() {
+                index.advance(&mut reader, "cat").unwrap();
+            }
+            index
+        };
+        let current = index.first_match.unwrap();
+        let mut block = MatchBlockCache::default();
+        {
+            let mut reader = document.reader(&mut document_cache);
+            block
+                .scan(
+                    &mut reader,
+                    "c",
+                    index.document_id,
+                    index.source_end,
+                    index.source_start,
+                    None,
+                )
+                .unwrap();
+        }
+        let allocation = block.ready().unwrap().storage.starts.as_ptr();
+        let mut navigation = index.navigation_with_block(current, true, block).unwrap();
+        let MatchBlockCache::Spare(storage) = &navigation.block else {
+            panic!("query-incompatible match data must become spare storage");
+        };
+        assert_eq!(storage.starts.as_ptr(), allocation);
+
+        fs::write(path, "changed contents").unwrap();
+        document_cache.reset_metrics();
+        let result = {
+            let mut reader = document.reader(&mut document_cache);
+            navigation.advance(&mut reader, "cat")
+        };
+        assert!(matches!(result, Err(TutError::Load(_))));
+        let MatchBlockCache::Spare(storage) = &navigation.block else {
+            panic!("failed freshness checks must not publish match data");
+        };
+        assert_eq!(storage.starts.as_ptr(), allocation);
+        assert_eq!(document_cache.metrics().window_calls(), 0);
     }
 
     #[test]
@@ -2105,7 +2489,7 @@ mod tests {
         let mut highlights = index.highlights(SourceOffset::ZERO..source_end).unwrap();
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
 
         assert!(
             !highlights
@@ -2152,7 +2536,7 @@ mod tests {
         };
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
-        let mut block = None;
+        let mut block = MatchBlockCache::default();
 
         while !highlights.is_complete() {
             highlights.advance(&mut reader, "a", &mut block).unwrap();
