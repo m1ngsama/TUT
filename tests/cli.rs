@@ -285,6 +285,30 @@ mod pty {
             )
         }
 
+        fn spawn_logged_with_separate_terminal_input(path: &Path, log: &Path) -> io::Result<Self> {
+            let (master, stdout, controlling_name, _controlling_initial) = open_test_pty()?;
+            let (command_master, terminal_input, _input_name, input_initial) = open_test_pty()?;
+            let probe = terminal_input.try_clone()?;
+
+            let mut command = tut();
+            command
+                .arg(path)
+                .arg("--log-file")
+                .arg(log)
+                .stdin(Stdio::from(terminal_input))
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::piped());
+            configure_child_session(&mut command, Some(controlling_name));
+            Self::finish_spawn(
+                command.spawn()?,
+                TestInput::Path(path),
+                master,
+                probe,
+                input_initial,
+                Some(command_master),
+            )
+        }
+
         fn spawn_unreadable_standard_input() -> io::Result<Self> {
             Self::spawn_inner(TestInput::UnreadableStandardInput, None, None)
         }
@@ -435,6 +459,15 @@ mod pty {
             Ok(())
         }
 
+        fn disconnect_terminal_input(&mut self) -> io::Result<()> {
+            let master = self
+                .command_master
+                .take()
+                .ok_or_else(|| io::Error::other("separate terminal input is not configured"))?;
+            drop(master);
+            Ok(())
+        }
+
         fn pump(&mut self) -> io::Result<()> {
             let mut buffer = [0_u8; 8192];
             loop {
@@ -565,6 +598,19 @@ mod pty {
             assert_terminal_configuration(&after, &self.initial);
         }
 
+        fn assert_restored_after_input_disconnect(&self) {
+            match termios::tcgetattr(&self.probe) {
+                Ok(after) => assert_terminal_configuration(&after, &self.initial),
+                #[cfg(target_os = "linux")]
+                Err(error) if error.raw_os_error() == libc::EIO => {
+                    // Linux stops exposing a PTY slave's termios after its last
+                    // master closes. The cleanup escape sequences remain
+                    // observable on the separate controlling/output terminal.
+                }
+                Err(error) => panic!("failed to inspect restored terminal input: {error}"),
+            }
+        }
+
         fn terminate_and_reap(&mut self) {
             if self.reaped {
                 return;
@@ -638,7 +684,7 @@ mod pty {
         assert_eq!(actual.line_discipline, expected.line_discipline);
     }
 
-    fn assert_session_terminal_restored(pty: &PtyChild) {
+    fn assert_session_cleanup_sequences(pty: &PtyChild) {
         for sequence in [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT] {
             assert!(
                 pty.output
@@ -646,11 +692,17 @@ mod pty {
                     .any(|window| window == sequence)
             );
         }
+    }
+
+    fn assert_session_terminal_restored(pty: &PtyChild) {
+        assert_session_cleanup_sequences(pty);
         pty.assert_restored();
     }
 
     fn open_test_pty() -> io::Result<(File, File, CString, Termios)> {
         let master_fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+        let fd_flags = rustix::io::fcntl_getfd(&master_fd)?;
+        rustix::io::fcntl_setfd(&master_fd, fd_flags | rustix::io::FdFlags::CLOEXEC)?;
         grantpt(&master_fd)?;
         unlockpt(&master_fd)?;
         let slave_name = ptsname(&master_fd, Vec::new())?;
@@ -857,6 +909,38 @@ mod pty {
             b"tut: failed to poll terminal events: terminal input sequence did not finish within 2 seconds\n"
         );
         assert_session_terminal_restored(&pty);
+    }
+
+    #[test]
+    fn terminal_input_close_exits_and_restores_the_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "closed input\n").unwrap();
+        let directory = tempdir().unwrap();
+        let log = directory.path().join("session.log");
+        let mut pty =
+            PtyChild::spawn_logged_with_separate_terminal_input(file.path(), &log).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+
+        let started = Instant::now();
+        pty.disconnect_terminal_input().unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "terminal close did not terminate promptly"
+        );
+        assert_eq!(
+            pty.stderr_output,
+            b"tut: failed to poll terminal events: terminal input closed\n"
+        );
+        assert_session_cleanup_sequences(&pty);
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.starts_with("schema version=1\nsession_start "));
+        assert!(log.contains("\nruntime_summary "));
+        assert!(log.contains("\nsession_summary outcome=error elapsed_us="));
+        assert!(log.ends_with(" terminal_sessions=1 suspensions=0\n"));
+        assert_eq!(log.lines().count(), 4);
+        pty.assert_restored_after_input_disconnect();
     }
 
     #[test]
