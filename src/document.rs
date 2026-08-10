@@ -219,6 +219,7 @@ pub(super) struct DocumentCache {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct DocumentMetrics {
     window_calls: usize,
+    byte_window_calls: usize,
     grapheme_emissions: usize,
     segmentation_runs: usize,
     segmentation_advanced_bytes: usize,
@@ -231,6 +232,10 @@ pub(super) struct DocumentMetrics {
 impl DocumentMetrics {
     pub(super) const fn window_calls(self) -> usize {
         self.window_calls
+    }
+
+    pub(super) const fn byte_window_calls(self) -> usize {
+        self.byte_window_calls
     }
 
     pub(super) const fn grapheme_emissions(self) -> usize {
@@ -479,6 +484,10 @@ impl<'document> DocumentReader<'document> {
             return Ok(offset);
         }
         let cr_joins_lf = if offset < self.source_end() {
+            #[cfg(test)]
+            {
+                self.cache.metrics.byte_window_calls += 1;
+            }
             self.document
                 .store
                 .copy_bytes(offset, 1, &mut self.cache.chunk)?;
@@ -525,6 +534,10 @@ impl<'document> DocumentReader<'document> {
         }
         if offset == self.source_end() {
             return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.cache.metrics.byte_window_calls += 1;
         }
         self.document
             .store
