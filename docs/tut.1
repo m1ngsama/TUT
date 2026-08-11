@@ -181,8 +181,9 @@ The complete reader requires a terminal of at least 16 columns by 4 rows.
 Smaller terminals display resize and quit guidance.
 .IP \(bu 2
 Terminal geometry is limited to 524,288 cells.
-The two fixed cell vectors are also subject to a 64 MiB accounting budget;
-this is not a limit on total process memory or on heap-backed cell symbols.
+The two fixed cell vectors and the heap-backed cell symbols in both frames
+share a conservative 64 MiB accounting budget.
+This is not a limit on total process memory.
 .IP \(bu 2
 Visible rendered content is limited to 32 MiB.
 .IP \(bu 2

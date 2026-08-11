@@ -161,6 +161,7 @@ from search input closes only with Esc or `F1`.
 | Oversized graphemes | A grapheme over 1024 UTF-8 bytes is replaced safely |
 | Opened file mutation | Fingerprint changes are reported as an error |
 | Minimum terminal | 16 columns by 4 rows for the reader view |
+| Terminal frames | Two cell buffers and heap symbols share a 64 MiB budget |
 | Tested systems | Linux and macOS |
 
 Windows is not supported. Other Unix systems may work, but are not currently

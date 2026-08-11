@@ -116,6 +116,9 @@ pub enum TutError {
     VisibleRenderTooLarge {
         limit: usize,
     },
+    TerminalFrameSymbolBudgetExceeded {
+        limit: u64,
+    },
     Layout(LayoutError),
     Search(SearchError),
     Log(LogError),
@@ -200,6 +203,9 @@ impl TutError {
             } => format!("terminal size {columns}x{rows} exceeds the {cell_limit}-cell limit"),
             Self::VisibleRenderTooLarge { limit } => {
                 format!("visible rendered content exceeds the {limit}-byte limit")
+            }
+            Self::TerminalFrameSymbolBudgetExceeded { limit } => {
+                format!("terminal frame symbols exceed the {limit}-byte limit")
             }
             Self::Layout(LayoutError::DocumentMismatch) => {
                 "layout state belongs to another document".to_owned()

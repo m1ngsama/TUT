@@ -18,13 +18,16 @@ use crossterm::{
     },
 };
 use ratatui::{
-    Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, buffer::Cell, layout::Rect,
+    Terminal, TerminalOptions, Viewport,
+    backend::{Backend, CrosstermBackend},
+    buffer::Cell,
+    layout::Rect,
 };
 use signals::SuspendOutcome;
 pub(super) use signals::{ProcessSessionLease, SignalHandlers, SignalState};
 
 use crate::{
-    app::{Action, App, BackgroundWork, Geometry, Outcome},
+    app::{Action, App, BackgroundWork, Geometry, Outcome, ViewState},
     error::{ExternalSignal, RunOutcome, TutError},
     observer::{DisabledRecorder, Observer, RuntimeOperation, RuntimeRecorder},
 };
@@ -33,6 +36,48 @@ const MAX_POLL: Duration = Duration::from_millis(100);
 const BACKGROUND_POLL: Duration = Duration::ZERO;
 const MAX_TERMINAL_CELLS: u64 = 512 * 1024;
 const MAX_TERMINAL_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+const COMPACT_STRING_INLINE_BYTES: usize = 24;
+const COMPACT_STRING_MIN_HEAP_BYTES: usize = size_of::<String>() + size_of::<usize>();
+
+const _: () = {
+    assert!(size_of::<String>() == COMPACT_STRING_INLINE_BYTES);
+    assert!(COMPACT_STRING_MIN_HEAP_BYTES == 32);
+};
+
+#[derive(Debug)]
+pub(super) struct FrameSymbolMeter {
+    used: u64,
+    limit: u64,
+}
+
+impl FrameSymbolMeter {
+    const fn new(limit: u64) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn charge(&mut self, symbol: &str) -> Result<(), TutError> {
+        let requested = if symbol.len() <= COMPACT_STRING_INLINE_BYTES {
+            0
+        } else {
+            symbol.len().max(COMPACT_STRING_MIN_HEAP_BYTES)
+        };
+        let requested = u64::try_from(requested)
+            .map_err(|_| TutError::TerminalFrameSymbolBudgetExceeded { limit: self.limit })?;
+        let Some(next) = self.used.checked_add(requested) else {
+            return Err(TutError::TerminalFrameSymbolBudgetExceeded { limit: self.limit });
+        };
+        if next > self.limit {
+            return Err(TutError::TerminalFrameSymbolBudgetExceeded { limit: self.limit });
+        }
+        self.used = next;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    const fn used(&self) -> u64 {
+        self.used
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TerminalSize {
@@ -65,13 +110,16 @@ impl TerminalSize {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    #[cfg(test)]
     fn buffer_bytes(self) -> u64 {
         u64::from(self.width)
             * u64::from(self.height)
             * 2
             * u64::try_from(size_of::<Cell>())
                 .expect("terminal cell sizes fit unsigned 64-bit integers")
+    }
+
+    fn symbol_budget(self) -> u64 {
+        (MAX_TERMINAL_BUFFER_BYTES - self.buffer_bytes()) / 2
     }
 }
 
@@ -594,6 +642,41 @@ struct CrosstermDriver {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+fn try_draw_fallible<B, F>(terminal: &mut Terminal<B>, render: F) -> Result<(), TutError>
+where
+    B: Backend<Error = io::Error>,
+    F: FnOnce(&mut ratatui::Frame<'_>) -> Result<(), TutError>,
+{
+    let mut render_error = None;
+    let result = terminal.try_draw(|frame| match render(frame) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            render_error = Some(error);
+            Err(io::Error::other("terminal frame rendering rejected"))
+        }
+    });
+
+    if let Some(error) = render_error {
+        terminal.current_buffer_mut().reset();
+        return Err(error);
+    }
+
+    result.map(|_| ()).map_err(|source| TutError::Io {
+        operation: "draw terminal frame",
+        source,
+    })
+}
+
+fn render_budgeted_frame(
+    frame: &mut ratatui::Frame<'_>,
+    state: &ViewState<'_>,
+) -> Result<(), TutError> {
+    let area = frame.area();
+    let size = TerminalSize::new(area.width, area.height)?;
+    let mut symbols = FrameSymbolMeter::new(size.symbol_budget());
+    view::render(frame, state, &mut symbols)
+}
+
 impl CrosstermDriver {
     fn new() -> io::Result<Self> {
         let options = TerminalOptions {
@@ -633,16 +716,9 @@ impl TerminalDriver for CrosstermDriver {
 
     fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
         let state = app.view_state()?;
-        let mut view_result = Ok(());
-        self.terminal
-            .draw(|frame| {
-                view_result = view::render(frame, &state);
-            })
-            .map_err(|source| TutError::Io {
-                operation: "draw terminal frame",
-                source,
-            })?;
-        view_result
+        try_draw_fallible(&mut self.terminal, |frame| {
+            render_budgeted_frame(frame, &state)
+        })
     }
 
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
@@ -706,15 +782,99 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell as StateCell, collections::VecDeque, fs, path::Path, rc::Rc};
+    use std::{
+        cell::Cell as StateCell, collections::VecDeque, convert::Infallible, fs, path::Path, rc::Rc,
+    };
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use libc::{SIGHUP, SIGTERM};
-    use ratatui::backend::TestBackend;
+    use ratatui::{
+        backend::{ClearType, TestBackend, WindowSize},
+        layout::{Position, Size},
+    };
     use tempfile::tempdir;
 
     use super::*;
-    use crate::app::{ViewState, app_from_text};
+    use crate::app::{
+        RenderRows, RenderRowsView, RenderState, SearchStatus, ViewState, app_from_text,
+    };
+
+    fn infallible<T>(result: Result<T, Infallible>) -> io::Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match error {},
+        }
+    }
+
+    struct IoTestBackend {
+        inner: TestBackend,
+        draw_calls: usize,
+        flush_calls: usize,
+        fail_draw: bool,
+    }
+
+    impl IoTestBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                draw_calls: 0,
+                flush_calls: 0,
+                fail_draw: false,
+            }
+        }
+    }
+
+    impl Backend for IoTestBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.draw_calls += 1;
+            if self.fail_draw {
+                return Err(io::Error::other("injected backend draw failure"));
+            }
+            infallible(self.inner.draw(content))
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            infallible(self.inner.hide_cursor())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            infallible(self.inner.show_cursor())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            infallible(self.inner.get_cursor_position())
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            infallible(self.inner.set_cursor_position(position))
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            infallible(self.inner.clear())
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            infallible(self.inner.clear_region(clear_type))
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            infallible(self.inner.size())
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            infallible(self.inner.window_size())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_calls += 1;
+            infallible(self.inner.flush())
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DrawKind {
@@ -1082,6 +1242,7 @@ mod tests {
             MAX_TERMINAL_CELLS * 2 * u64::try_from(size_of::<Cell>()).unwrap()
         );
         assert!(boundary.buffer_bytes() <= MAX_TERMINAL_BUFFER_BYTES);
+        assert_eq!(boundary.symbol_budget(), 8 * 1024 * 1024);
         assert!(TerminalSize::new(1000, 300).is_ok());
         assert!(TerminalSize::new(0, u16::MAX).is_ok());
         assert!(matches!(
@@ -1100,6 +1261,139 @@ mod tests {
                 cell_limit: MAX_TERMINAL_CELLS,
             })
         ));
+    }
+
+    #[test]
+    fn frame_symbol_meter_uses_locked_compact_string_capacity_boundaries() {
+        for (length, expected) in [(24, 0), (25, 32), (31, 32), (32, 32), (33, 33)] {
+            let mut meter = FrameSymbolMeter::new(u64::MAX);
+            meter.charge(&"x".repeat(length)).unwrap();
+            assert_eq!(meter.used(), expected);
+        }
+
+        let mut exact = FrameSymbolMeter::new(32);
+        exact.charge(&"x".repeat(25)).unwrap();
+        assert_eq!(exact.used(), 32);
+        let error = exact.charge(&"s".repeat(25)).unwrap_err();
+        assert!(matches!(
+            error,
+            TutError::TerminalFrameSymbolBudgetExceeded { limit: 32 }
+        ));
+        assert_eq!(exact.used(), 32);
+        assert!(!error.message().contains(&"s".repeat(25)));
+
+        let mut next_byte = FrameSymbolMeter::new(32);
+        let error = next_byte.charge(&"x".repeat(33)).unwrap_err();
+        assert!(matches!(
+            error,
+            TutError::TerminalFrameSymbolBudgetExceeded { limit: 32 }
+        ));
+        assert_eq!(next_byte.used(), 0);
+    }
+
+    #[test]
+    fn maximum_geometry_rejects_large_body_symbols_without_publishing_a_frame() {
+        const COLUMNS: u16 = 4096;
+        const ROWS: u16 = 128;
+        const BODY_RUNS: usize = 8;
+        const GRAPHEMES_PER_RUN: usize = 4096;
+
+        let grapheme = format!("a{}", "\u{0301}".repeat(495));
+        assert_eq!(grapheme.len(), 991);
+        let run = grapheme.repeat(GRAPHEMES_PER_RUN);
+        assert_eq!(run.len(), 4_059_136);
+        assert_eq!(run.len() * BODY_RUNS, 32_473_088);
+        let rows = RenderRows::from_prebuilt_runs(&run, BODY_RUNS, COLUMNS).unwrap();
+        let actual_storage_bytes = rows.storage_bytes();
+        assert!(
+            actual_storage_bytes <= 32 * 1024 * 1024,
+            "prebuilt RenderRows storage uses {actual_storage_bytes} bytes, exceeding the 32 MiB limit"
+        );
+        let state = ViewState::Reader(RenderState {
+            filename: "fixture",
+            path: "fixture",
+            rows: RenderRowsView::from_rows(&rows),
+            progress: 100,
+            current_line: Some(1),
+            total_lines: Some(8),
+            status: SearchStatus::None,
+            activity: None,
+            boundary: None,
+            repeat: None,
+        });
+        let options = TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, COLUMNS, ROWS)),
+        };
+        let backend = IoTestBackend::new(COLUMNS, ROWS);
+        let mut terminal = Terminal::with_options(backend, options).unwrap();
+        let frame_count = terminal.get_frame().count();
+        let current_buffer = std::ptr::from_mut(terminal.current_buffer_mut());
+
+        let error = try_draw_fallible(&mut terminal, |frame| render_budgeted_frame(frame, &state))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TutError::TerminalFrameSymbolBudgetExceeded { limit: 8_388_608 }
+        ));
+        assert_eq!(
+            error.message(),
+            "terminal frame symbols exceed the 8388608-byte limit"
+        );
+        assert_eq!(terminal.backend().draw_calls, 0);
+        assert_eq!(terminal.backend().flush_calls, 0);
+        assert_eq!(terminal.get_frame().count(), frame_count);
+        assert_eq!(
+            std::ptr::from_mut(terminal.current_buffer_mut()),
+            current_buffer
+        );
+        assert!(
+            terminal
+                .current_buffer_mut()
+                .content()
+                .iter()
+                .all(|cell| cell == &Cell::default())
+        );
+        assert!(
+            terminal
+                .backend()
+                .inner
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell == &Cell::default())
+        );
+
+        let retry = ViewState::Help { q_closes: true };
+        try_draw_fallible(&mut terminal, |frame| render_budgeted_frame(frame, &retry)).unwrap();
+        assert_eq!(terminal.backend().draw_calls, 1);
+        assert_eq!(terminal.backend().flush_calls, 1);
+        assert_eq!(terminal.get_frame().count(), frame_count + 1);
+    }
+
+    #[test]
+    fn backend_draw_failures_are_not_mislabeled_as_budget_rejections() {
+        let options = TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, 16, 4)),
+        };
+        let mut backend = IoTestBackend::new(16, 4);
+        backend.fail_draw = true;
+        let mut terminal = Terminal::with_options(backend, options).unwrap();
+        let state = ViewState::Help { q_closes: true };
+
+        let error = try_draw_fallible(&mut terminal, |frame| render_budgeted_frame(frame, &state))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TutError::Io {
+                operation: "draw terminal frame",
+                ..
+            }
+        ));
+        assert!(error.message().contains("injected backend draw failure"));
+        assert_eq!(terminal.backend().draw_calls, 1);
+        assert_eq!(terminal.backend().flush_calls, 0);
     }
 
     #[test]

@@ -8,6 +8,11 @@ tag does not describe the present program or its compatibility.
 
 ## Unreleased
 
+### Fixed
+
+- Heap-backed terminal cell symbols now share the 64 MiB terminal-buffer
+  accounting budget and over-budget frames are rejected before publication.
+
 ## 0.0.5 - 2026-08-11
 
 ### Added
