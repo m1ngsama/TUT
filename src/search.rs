@@ -16,6 +16,26 @@ pub(super) const MAX_SEARCH_QUERY_BYTES: usize = 4096;
 const MATCH_BLOCK_START_LIMIT: usize = SOURCE_WINDOW_BYTES + MAX_SEARCH_QUERY_BYTES;
 const DISPLAY_HIGHLIGHT_MERGE_BUDGET: usize = 1024;
 
+#[cfg(test)]
+pub(super) const fn search_index_memory_budget_bytes() -> usize {
+    SEARCH_INDEX_MEMORY_BUDGET_BYTES
+}
+
+#[cfg(test)]
+pub(super) const fn search_highlight_memory_budget_bytes() -> usize {
+    SEARCH_HIGHLIGHT_MEMORY_BUDGET_BYTES
+}
+
+#[cfg(test)]
+pub(super) const fn match_block_start_limit() -> usize {
+    MATCH_BLOCK_START_LIMIT
+}
+
+#[cfg(test)]
+pub(super) const fn display_highlight_merge_budget() -> usize {
+    DISPLAY_HIGHLIGHT_MERGE_BUDGET
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SearchHighlightKey {
     columns: u16,
@@ -240,6 +260,14 @@ pub(super) struct SearchSession {
     pending_navigation: i64,
     highlights: SearchHighlightState,
     jump_pending: bool,
+    #[cfg(test)]
+    highlight_comparisons: usize,
+    #[cfg(test)]
+    highlight_outputs: usize,
+    #[cfg(test)]
+    max_highlight_operations: usize,
+    #[cfg(test)]
+    max_highlight_reserves: usize,
 }
 
 impl SearchSession {
@@ -267,6 +295,14 @@ impl SearchSession {
             pending_navigation: 0,
             highlights: SearchHighlightState::default(),
             jump_pending,
+            #[cfg(test)]
+            highlight_comparisons: 0,
+            #[cfg(test)]
+            highlight_outputs: 0,
+            #[cfg(test)]
+            max_highlight_operations: 0,
+            #[cfg(test)]
+            max_highlight_reserves: 0,
         }))
     }
 
@@ -348,12 +384,38 @@ impl SearchSession {
             self.highlights = SearchHighlightState::Absent(storage);
             return Ok(false);
         }
-        match job.advance(
+        #[cfg(test)]
+        let reserves_before = job.storage.reserve_attempts;
+        let result = job.advance(
             reader,
             self.query.as_str(),
             &mut self.match_block,
             &mut target_at,
-        ) {
+        );
+        #[cfg(test)]
+        {
+            let comparisons = job.last_step.comparisons;
+            let outputs = job.last_step.output_attempts;
+            let operations = comparisons
+                .checked_add(outputs)
+                .expect("bounded highlight operation counts fit usize");
+            let reserves = job
+                .storage
+                .reserve_attempts
+                .checked_sub(reserves_before)
+                .expect("highlight reserve attempts are monotonic");
+            self.highlight_comparisons = self
+                .highlight_comparisons
+                .checked_add(comparisons)
+                .expect("bounded highlight comparison totals fit usize");
+            self.highlight_outputs = self
+                .highlight_outputs
+                .checked_add(outputs)
+                .expect("bounded highlight output totals fit usize");
+            self.max_highlight_operations = self.max_highlight_operations.max(operations);
+            self.max_highlight_reserves = self.max_highlight_reserves.max(reserves);
+        }
+        match result {
             Ok(false) => {
                 self.highlights = SearchHighlightState::Pending(job);
                 Ok(false)
@@ -514,6 +576,47 @@ impl SearchSession {
             SearchHighlightState::Pending(job) => job.storage.reserve_attempts,
             SearchHighlightState::Ready(highlights) => highlights.storage.reserve_attempts,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_highlight_metrics(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.highlight_reserve_attempts(),
+            self.highlight_comparisons,
+            self.highlight_outputs,
+            self.max_highlight_operations,
+            self.max_highlight_reserves,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_highlight_bytes(&self) -> Option<usize> {
+        let capacity = match &self.highlights {
+            SearchHighlightState::Absent(storage)
+            | SearchHighlightState::Disabled { storage, .. } => storage.ranges.capacity(),
+            SearchHighlightState::Pending(job) => job.storage.ranges.capacity(),
+            SearchHighlightState::Ready(highlights) => highlights.storage.ranges.capacity(),
+        };
+        capacity.checked_mul(size_of::<SearchRange>())
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_storage_bytes(&self) -> Option<usize> {
+        let query = self.query.0.capacity();
+        let index = self
+            .index
+            .checkpoints
+            .capacity()
+            .checked_mul(size_of::<SearchCheckpoint>())?;
+        let block = self.match_block.bounded_storage_bytes()?;
+        let navigation = self.navigation.as_ref().map_or(Some(0), |navigation| {
+            navigation.block.bounded_storage_bytes()
+        })?;
+        query
+            .checked_add(index)?
+            .checked_add(block)?
+            .checked_add(navigation)?
+            .checked_add(self.bounded_highlight_bytes()?)
     }
 
     #[cfg(test)]
@@ -949,6 +1052,15 @@ fn initial_checkpoint_reservation(
 }
 
 impl MatchBlockCache {
+    #[cfg(test)]
+    fn bounded_storage_bytes(&self) -> Option<usize> {
+        let capacity = match self {
+            Self::Ready(block) => block.storage.starts.capacity(),
+            Self::Spare(storage) => storage.starts.capacity(),
+        };
+        capacity.checked_mul(size_of::<u32>())
+    }
+
     const fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }

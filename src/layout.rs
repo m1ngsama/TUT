@@ -19,6 +19,29 @@ const TAB_STOP: u32 = 4;
 const PROJECTED_SCAN_ATOM_BUDGET: usize = 1024;
 const PROJECTED_SCAN_BYTE_BUDGET: u64 = SOURCE_WINDOW_BYTES as u64;
 
+#[cfg(test)]
+pub(super) const fn projected_scan_atom_budget() -> usize {
+    PROJECTED_SCAN_ATOM_BUDGET
+}
+
+#[cfg(test)]
+pub(super) const fn projected_scan_byte_budget() -> u64 {
+    PROJECTED_SCAN_BYTE_BUDGET
+}
+
+#[cfg(test)]
+pub(super) fn projected_scan_step_byte_bound() -> u64 {
+    PROJECTED_SCAN_BYTE_BUDGET
+        .checked_sub(1)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::try_from(crate::document::max_grapheme_bytes())
+                    .expect("maximum grapheme bytes fit u64"),
+            )
+        })
+        .expect("projected scan step bounds fit u64")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub(super) struct DisplayColumn(u32);

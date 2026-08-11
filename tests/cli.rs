@@ -139,7 +139,7 @@ fn diagnostics_escape_control_bytes_in_arguments() {
 mod pty {
     use std::{
         ffi::CString,
-        fs::File,
+        fs::{File, OpenOptions},
         io::{self, Read, Write},
         os::unix::process::{CommandExt, ExitStatusExt},
         path::Path,
@@ -823,6 +823,104 @@ mod pty {
             }
             pty.assert_restored();
             assert!(std::fs::read_to_string(log).unwrap().contains(summary));
+        }
+    }
+
+    #[test]
+    #[ignore = "run only through make bounded-results"]
+    fn bounded_results_pty() {
+        const SCHEMA_RECORD: &str = "{\"schema\":\"tut-bounds/v1\",\"kind\":\"schema\",\"records\":16,\"core_records\":12,\"record_bytes\":1024,\"stream_bytes\":16384}\n";
+        const RECORD_LIMIT: usize = 1_024;
+        const STREAM_LIMIT: usize = 16 * 1_024;
+
+        let output = std::env::var_os("TUT_BOUNDED_RESULTS_FILE")
+            .expect("TUT_BOUNDED_RESULTS_FILE is set by make bounded-results");
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("private-input.txt");
+        let log = directory.path().join("session.log");
+        std::fs::write(&input, "BOUNDED_PRIVATE_TEXT\nx BOUNDED_PRIVATE_QUERY\n").unwrap();
+
+        let mut pty = PtyChild::spawn_logged(&input, Some(&log), None).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+        pty.master.write_all(b"/BOUNDED_PRIVATE_QUERY\rq").unwrap();
+        let status = pty.wait().unwrap();
+        let exit_code = status.code().expect("bounded PTY child exits normally");
+        assert_eq!(exit_code, 0);
+        assert!(pty.stderr_output.is_empty());
+        let cleanup_sequences = [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT]
+            .into_iter()
+            .filter(|sequence| {
+                pty.output
+                    .windows(sequence.len())
+                    .any(|window| window == *sequence)
+            })
+            .count();
+        assert_eq!(cleanup_sequences, 4);
+        pty.assert_restored();
+        let termios_restored = 1_usize;
+
+        let log_bytes = std::fs::read(&log).unwrap();
+        let log_ascii = usize::from(log_bytes.is_ascii());
+        assert_eq!(log_ascii, 1);
+        assert!(log_bytes.ends_with(b"\n"));
+        let log_records = log_bytes.split(|byte| *byte == b'\n').count() - 1;
+        assert_eq!(log_records, 4);
+        let log_text = String::from_utf8(log_bytes).unwrap();
+        let forbidden = [
+            input.to_string_lossy().into_owned(),
+            input.file_name().unwrap().to_string_lossy().into_owned(),
+            "BOUNDED_PRIVATE_TEXT".to_owned(),
+            "BOUNDED_PRIVATE_QUERY".to_owned(),
+        ];
+        let forbidden_values = forbidden
+            .iter()
+            .filter(|value| log_text.contains(value.as_str()))
+            .count();
+        assert_eq!(forbidden_values, 0);
+
+        let record = format!(
+            "{{\"schema\":\"tut-bounds/v1\",\"kind\":\"pty\",\"case\":\"cleanup_log\",\"exit_code\":{},\"cleanup_sequences\":{},\"termios_restored\":{},\"log_records\":{},\"log_ascii\":{},\"forbidden_values\":{}}}\n",
+            u64::try_from(exit_code).unwrap(),
+            u64::try_from(cleanup_sequences).unwrap(),
+            u64::try_from(termios_restored).unwrap(),
+            u64::try_from(log_records).unwrap(),
+            u64::try_from(log_ascii).unwrap(),
+            u64::try_from(forbidden_values).unwrap(),
+        );
+        assert!(record.is_ascii());
+        assert!(record.ends_with('\n'));
+        assert!(record.len() <= RECORD_LIMIT);
+        let mut file = OpenOptions::new().append(true).open(&output).unwrap();
+        file.write_all(record.as_bytes()).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let stream = std::fs::read(&output).unwrap();
+        assert!(stream.is_ascii());
+        assert!(stream.len() <= STREAM_LIMIT);
+        assert!(stream.ends_with(b"\n"));
+        let records = stream
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 16);
+        assert_eq!(records[0], SCHEMA_RECORD.as_bytes());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| {
+                    record
+                        .windows(b"\"kind\":\"core\"".len())
+                        .any(|window| window == b"\"kind\":\"core\"")
+                })
+                .count(),
+            12
+        );
+        for record in records {
+            assert!(record.len() <= RECORD_LIMIT);
+            assert!(record.starts_with(b"{\"schema\":\"tut-bounds/v1\",\"kind\":"));
+            assert!(record.ends_with(b"}\n"));
+            assert_eq!(record.iter().filter(|byte| **byte == b'\n').count(), 1);
+            assert!(!record.contains(&b'\r'));
         }
     }
 

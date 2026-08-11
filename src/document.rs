@@ -79,6 +79,16 @@ impl Document {
         self.source_start
     }
 
+    #[cfg(test)]
+    pub(super) const fn line_index_scanned_to(&self) -> SourceOffset {
+        self.line_index.scanned_to()
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_storage_bytes(&self) -> Option<usize> {
+        self.line_index.bounded_storage_bytes()
+    }
+
     pub(super) const fn source_end(&self) -> SourceOffset {
         self.source_end
     }
@@ -275,6 +285,23 @@ impl DocumentMetrics {
     }
 }
 
+#[cfg(test)]
+pub(super) const fn max_grapheme_bytes() -> usize {
+    MAX_GRAPHEME_BYTES
+}
+
+#[cfg(test)]
+pub(super) const fn source_window_slop_bytes() -> usize {
+    UTF8_BOUNDARY_SLOP_BYTES
+}
+
+#[cfg(test)]
+pub(super) fn source_window_max_bytes() -> usize {
+    SOURCE_WINDOW_BYTES
+        .checked_add(UTF8_BOUNDARY_SLOP_BYTES)
+        .expect("source window bounds fit usize")
+}
+
 impl Default for DocumentCache {
     fn default() -> Self {
         Self {
@@ -308,6 +335,11 @@ impl DocumentCache {
     #[cfg(test)]
     pub(super) const fn metrics(&self) -> DocumentMetrics {
         self.metrics
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_storage_bytes(&self) -> Option<usize> {
+        self.chunk.capacity().checked_add(self.grapheme.capacity())
     }
 }
 
