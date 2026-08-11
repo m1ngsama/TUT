@@ -24,7 +24,7 @@ MANPAGE = docs/tut.1
 PACKAGE_VERSION = $(shell $(CARGO) pkgid --locked 2>/dev/null | sed 's/.*[@:]//')
 DIST_ARCHIVE = $(CARGO_TARGET_DIR)/package/tut-$(PACKAGE_VERSION).crate
 
-.PHONY: all check release-check installdirs install install-strip installcheck uninstall dist distcheck mostlyclean clean distclean maintainer-clean
+.PHONY: all check release-check bounded-results installdirs install install-strip installcheck uninstall dist distcheck mostlyclean clean distclean maintainer-clean
 
 all:
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) build --release --locked $(CARGO_TARGET_OPTION)
@@ -34,6 +34,15 @@ check:
 
 release-check:
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) test --release --all-targets --locked $(CARGO_TARGET_OPTION)
+
+bounded-results:
+	@set -eu; \
+	mkdir -p "$(CARGO_TARGET_DIR)"; \
+	results=$$(mktemp "$(abspath $(CARGO_TARGET_DIR))/tut-bounds-v1.XXXXXX"); \
+	trap 'rm -f "$$results"' EXIT HUP INT TERM; \
+	TUT_BOUNDED_RESULTS_FILE="$$results" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) test --release --locked --lib tui::tests::bounded_results::bounded_results_core $(CARGO_TARGET_OPTION) -- --ignored --exact --test-threads=1 1>&2; \
+	TUT_BOUNDED_RESULTS_FILE="$$results" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) test --release --locked --test cli pty::bounded_results_pty $(CARGO_TARGET_OPTION) -- --ignored --exact --test-threads=1 1>&2; \
+	cat "$$results"
 
 installdirs:
 	$(MKDIR_P) "$(DESTDIR)$(bindir)"

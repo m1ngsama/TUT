@@ -750,6 +750,48 @@ pub(super) struct App {
     repeat: Option<RepeatStatus>,
     #[cfg(test)]
     fail_search_recall_reserve: bool,
+    #[cfg(test)]
+    bounded_counters: BoundedAppCounters,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+struct BoundedAppCounters {
+    max_search_windows: usize,
+    max_projected_emissions: usize,
+    max_projected_bytes: usize,
+    max_grapheme_window_bytes: usize,
+    render_reserves: usize,
+    peak_render_bytes: usize,
+    max_line_step_bytes: usize,
+    line_step_violation: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BoundedCoreMetrics {
+    pub(super) window_calls: usize,
+    pub(super) byte_window_calls: usize,
+    pub(super) grapheme_window_calls: usize,
+    pub(super) grapheme_window_bytes: usize,
+    pub(super) utf8_bytes: usize,
+    pub(super) segmentation_runs: usize,
+    pub(super) segmentation_bytes: usize,
+    pub(super) grapheme_emissions: usize,
+    pub(super) max_search_windows: usize,
+    pub(super) max_projected_emissions: usize,
+    pub(super) max_projected_bytes: usize,
+    pub(super) max_grapheme_window_bytes: usize,
+    pub(super) render_reserves: usize,
+    pub(super) highlight_reserves: usize,
+    pub(super) highlight_comparisons: usize,
+    pub(super) highlight_outputs: usize,
+    pub(super) max_highlight_operations: usize,
+    pub(super) max_highlight_reserves: usize,
+    pub(super) peak_render_bytes: usize,
+    pub(super) peak_highlight_bytes: usize,
+    pub(super) max_line_step_bytes: usize,
+    pub(super) line_step_violation: bool,
 }
 
 #[cfg(test)]
@@ -783,7 +825,82 @@ impl App {
             repeat: None,
             #[cfg(test)]
             fail_search_recall_reserve: false,
+            #[cfg(test)]
+            bounded_counters: BoundedAppCounters::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_core_metrics(&self) -> BoundedCoreMetrics {
+        let document = self.document_cache.metrics();
+        let search = self.search_cache.metrics();
+        let sum = |left: usize, right: usize| {
+            left.checked_add(right)
+                .expect("bounded metric totals fit usize")
+        };
+        let (highlight_reserves, highlight_comparisons, highlight_outputs, max_ops, max_reserves) =
+            self.search
+                .as_ref()
+                .map_or((0, 0, 0, 0, 0), |search| search.bounded_highlight_metrics());
+        let peak_highlight_bytes = self
+            .search
+            .as_ref()
+            .and_then(SearchSession::bounded_highlight_bytes)
+            .unwrap_or(0);
+        BoundedCoreMetrics {
+            window_calls: sum(document.window_calls(), search.window_calls()),
+            byte_window_calls: sum(document.byte_window_calls(), search.byte_window_calls()),
+            grapheme_window_calls: sum(
+                document.grapheme_window_calls(),
+                search.grapheme_window_calls(),
+            ),
+            grapheme_window_bytes: sum(
+                document.grapheme_window_returned_bytes(),
+                search.grapheme_window_returned_bytes(),
+            ),
+            utf8_bytes: sum(
+                document.grapheme_utf8_validated_bytes(),
+                search.grapheme_utf8_validated_bytes(),
+            ),
+            segmentation_runs: sum(document.segmentation_runs(), search.segmentation_runs()),
+            segmentation_bytes: sum(
+                document.segmentation_advanced_bytes(),
+                search.segmentation_advanced_bytes(),
+            ),
+            grapheme_emissions: sum(document.grapheme_emissions(), search.grapheme_emissions()),
+            max_search_windows: self.bounded_counters.max_search_windows,
+            max_projected_emissions: self.bounded_counters.max_projected_emissions,
+            max_projected_bytes: self.bounded_counters.max_projected_bytes,
+            max_grapheme_window_bytes: self.bounded_counters.max_grapheme_window_bytes,
+            render_reserves: self.bounded_counters.render_reserves,
+            highlight_reserves,
+            highlight_comparisons,
+            highlight_outputs,
+            max_highlight_operations: max_ops,
+            max_highlight_reserves: max_reserves,
+            peak_render_bytes: self.bounded_counters.peak_render_bytes,
+            peak_highlight_bytes,
+            max_line_step_bytes: self.bounded_counters.max_line_step_bytes,
+            line_step_violation: self.bounded_counters.line_step_violation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn bounded_capacity_bytes(&self) -> Option<usize> {
+        let render = self
+            .current_render_cache()
+            .map_or(Some(0), |cache| cache.rows.storage().bytes())?;
+        let search = self
+            .search
+            .as_ref()
+            .map_or(Some(0), SearchSession::bounded_storage_bytes)?;
+        self.document
+            .bounded_storage_bytes()?
+            .checked_add(self.document_cache.bounded_storage_bytes()?)?
+            .checked_add(self.search_cache.bounded_storage_bytes()?)?
+            .checked_add(self.row_neighborhood.bounded_storage_bytes()?)?
+            .checked_add(render)?
+            .checked_add(search)
     }
 
     pub(super) const fn terminal_too_small(&self) -> bool {
@@ -1152,14 +1269,79 @@ impl App {
         let Some(schedule) = self.background_schedule() else {
             return Ok(false);
         };
+        #[cfg(test)]
+        let document_before = self.document_cache.metrics();
+        #[cfg(test)]
+        let search_before = self.search_cache.metrics();
+        #[cfg(test)]
+        let line_before = self.document.line_index_scanned_to();
         if let Some(search_turn) = schedule.next_search_turn {
             self.search_turn = search_turn;
         }
-        match schedule.work {
+        let result = match schedule.work {
             BackgroundWork::LineIndex => self.advance_line_index(),
             BackgroundWork::Viewport => self.advance_viewport_locator(),
             BackgroundWork::Render => self.advance_render(),
             BackgroundWork::Search => self.advance_search(),
+        };
+        #[cfg(test)]
+        self.record_bounded_step(schedule.work, document_before, search_before, line_before);
+        result
+    }
+
+    #[cfg(test)]
+    fn record_bounded_step(
+        &mut self,
+        work: BackgroundWork,
+        document_before: crate::document::DocumentMetrics,
+        search_before: crate::document::DocumentMetrics,
+        line_before: SourceOffset,
+    ) {
+        let document_after = self.document_cache.metrics();
+        let search_after = self.search_cache.metrics();
+        let delta = |after: usize, before: usize| {
+            after
+                .checked_sub(before)
+                .expect("bounded document metrics are monotonic")
+        };
+        if matches!(work, BackgroundWork::Viewport | BackgroundWork::Render) {
+            let emissions = delta(
+                document_after.grapheme_emissions(),
+                document_before.grapheme_emissions(),
+            );
+            let bytes = delta(
+                document_after.segmentation_advanced_bytes(),
+                document_before.segmentation_advanced_bytes(),
+            );
+            let window_bytes = delta(
+                document_after.grapheme_window_returned_bytes(),
+                document_before.grapheme_window_returned_bytes(),
+            );
+            self.bounded_counters.max_projected_emissions =
+                self.bounded_counters.max_projected_emissions.max(emissions);
+            self.bounded_counters.max_projected_bytes =
+                self.bounded_counters.max_projected_bytes.max(bytes);
+            self.bounded_counters.max_grapheme_window_bytes = self
+                .bounded_counters
+                .max_grapheme_window_bytes
+                .max(window_bytes);
+        }
+        if work == BackgroundWork::Search {
+            let windows = delta(search_after.window_calls(), search_before.window_calls());
+            self.bounded_counters.max_search_windows =
+                self.bounded_counters.max_search_windows.max(windows);
+        }
+        if work == BackgroundWork::LineIndex {
+            let line_after = self.document.line_index_scanned_to();
+            let advanced = line_after.get().checked_sub(line_before.get());
+            let maximum = u64::try_from(crate::document::source_window_max_bytes())
+                .expect("source window bounds fit u64");
+            let valid = advanced.is_some_and(|bytes| bytes > 0 && bytes <= maximum);
+            if let Some(bytes) = advanced.and_then(|bytes| usize::try_from(bytes).ok()) {
+                self.bounded_counters.max_line_step_bytes =
+                    self.bounded_counters.max_line_step_bytes.max(bytes);
+            }
+            self.bounded_counters.line_step_violation |= !valid;
         }
     }
 
@@ -1790,6 +1972,21 @@ impl App {
                 self.document.validate()?;
                 let rows = sink.finish();
                 debug_assert_eq!(rows.len(), result.rows);
+                #[cfg(test)]
+                {
+                    let reserves = rows.reserve_attempts().total();
+                    let bytes = rows
+                        .storage()
+                        .bytes()
+                        .expect("bounded render storage fits usize");
+                    self.bounded_counters.render_reserves = self
+                        .bounded_counters
+                        .render_reserves
+                        .checked_add(reserves)
+                        .expect("bounded render reserve totals fit usize");
+                    self.bounded_counters.peak_render_bytes =
+                        self.bounded_counters.peak_render_bytes.max(bytes);
+                }
                 let at_end = result.next.is_none();
                 let viewport = Viewport {
                     visible_rows: result.rows,
@@ -1889,6 +2086,49 @@ impl RenderReserveAttempts {
         spans: 0,
         rows: 0,
     };
+
+    fn total(self) -> usize {
+        self.text
+            .checked_add(self.spans)
+            .and_then(|total| total.checked_add(self.rows))
+            .expect("bounded render reserve totals fit usize")
+    }
+}
+
+#[cfg(test)]
+pub(super) const fn visible_render_memory_budget_bytes() -> usize {
+    MAX_VISIBLE_RENDER_BYTES
+}
+
+#[cfg(test)]
+pub(super) fn visible_render_refusal_is_typed_and_atomic() -> bool {
+    let mut builder = RenderRowsBuilder::with_limit(1, usize::MAX)
+        .expect("one render row fits an unbounded test builder");
+    let atom = crate::layout::DisplayAtoms::new("x")
+        .next()
+        .expect("the refusal probe contains one grapheme")
+        .project(
+            DisplayColumn::ZERO,
+            ContentWidth::new(1).expect("one column is nonzero"),
+        )
+        .expect("the refusal probe grapheme is visible");
+    builder.push(atom).expect("the seed atom fits");
+    let limit = builder
+        .storage()
+        .bytes()
+        .expect("seed render storage fits usize");
+    builder.limit = limit;
+    let text_len = builder.text.len();
+    let spans_len = builder.spans.len();
+    let rows_len = builder.rows.len();
+    let storage = builder.storage();
+    matches!(
+        builder.push(atom),
+        Err(TutError::VisibleRenderTooLarge { limit: actual }) if actual == limit
+    ) && builder.text.len() == text_len
+        && builder.spans.len() == spans_len
+        && builder.rows.len() == rows_len
+        && builder.storage() == storage
 }
 
 impl RenderStorage {

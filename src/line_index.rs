@@ -7,6 +7,11 @@ const INITIAL_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024;
 const INITIAL_CHECKPOINT_INTERVAL_LINES: u64 = 1;
 const INITIAL_CHECKPOINT_RESERVATION: usize = 1024;
 
+#[cfg(test)]
+pub(super) const fn memory_budget_bytes() -> usize {
+    LINE_INDEX_MEMORY_BUDGET_BYTES
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 struct PhysicalLine(u64);
@@ -171,6 +176,12 @@ pub(super) struct LineIndex {
 }
 
 impl LineIndex {
+    #[cfg(test)]
+    pub(super) fn bounded_storage_bytes(&self) -> Option<usize> {
+        self.checkpoints
+            .capacity()
+            .checked_mul(size_of::<LineCheckpoint>())
+    }
     pub(super) fn new(
         source_start: SourceOffset,
         source_end: SourceOffset,

@@ -875,12 +875,17 @@ mod tests {
             infallible(self.inner.flush())
         }
     }
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DrawKind {
         Pending,
         Reader,
         Help,
+    }
+
+    #[derive(Debug, Default)]
+    struct BoundedScript {
+        stage: u8,
+        turns_in_stage: usize,
     }
 
     struct FakeDriver {
@@ -898,6 +903,8 @@ mod tests {
         signal_handlers_active: Option<Rc<StateCell<bool>>>,
         draws: Vec<DrawKind>,
         quit_after_reader_draw: bool,
+        bounded_script: Option<BoundedScript>,
+        turn: Option<Rc<StateCell<u64>>>,
     }
 
     impl FakeDriver {
@@ -917,6 +924,71 @@ mod tests {
                 signal_handlers_active: None,
                 draws: Vec::new(),
                 quit_after_reader_draw: false,
+                bounded_script: None,
+                turn: None,
+            }
+        }
+
+        fn bounded(signals: &SignalState, turn: Rc<StateCell<u64>>) -> Self {
+            let mut driver = Self::new(signals);
+            driver.sizes.push_back((80, 24));
+            driver.bounded_script = Some(BoundedScript::default());
+            driver.turn = Some(turn);
+            driver
+        }
+
+        fn advance_bounded_script(&mut self, app: &mut App, kind: DrawKind) {
+            if kind != DrawKind::Reader {
+                return;
+            }
+            let Some(script) = &mut self.bounded_script else {
+                return;
+            };
+            let event = match script.stage {
+                0 => Some(document_end_event()),
+                1 if app.background_work().is_none() => Some(character_event('/')),
+                2 if matches!(app.search_status(), SearchStatus::Draft { draft: "", .. }) => {
+                    Some(character_event('x'))
+                }
+                3 if matches!(app.search_status(), SearchStatus::Draft { draft: "x", .. }) => {
+                    Some(Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        modifiers: KeyModifiers::NONE,
+                        kind: KeyEventKind::Press,
+                        state: KeyEventState::NONE,
+                    }))
+                }
+                4 if app.background_work().is_none()
+                    && matches!(
+                        app.search_status(),
+                        SearchStatus::Committed {
+                            searching: false,
+                            ..
+                        }
+                    ) =>
+                {
+                    Some(character_event('n'))
+                }
+                5 if app.background_work().is_none()
+                    && matches!(
+                        app.search_status(),
+                        SearchStatus::Committed {
+                            searching: false,
+                            ..
+                        }
+                    ) =>
+                {
+                    Some(quit_event())
+                }
+                _ => None,
+            };
+            if let Some(event) = event {
+                self.events.push_back(event);
+                script.stage = script
+                    .stage
+                    .checked_add(1)
+                    .expect("bounded script stages fit u8");
+                script.turns_in_stage = 0;
             }
         }
 
@@ -1043,12 +1115,30 @@ mod tests {
                 self.quit_after_reader_draw = false;
                 self.events.push_back(quit_event());
             }
+            self.advance_bounded_script(app, kind);
             Ok(())
         }
 
         fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
             self.poll_timeouts.push(timeout);
             self.call("poll")?;
+            if let Some(turn) = &self.turn {
+                turn.set(
+                    turn.get()
+                        .checked_add(1)
+                        .expect("bounded event-loop turns fit u64"),
+                );
+            }
+            if let Some(script) = &mut self.bounded_script {
+                script.turns_in_stage = script
+                    .turns_in_stage
+                    .checked_add(1)
+                    .expect("bounded phase turns fit usize");
+                assert!(
+                    script.turns_in_stage <= 100_000,
+                    "bounded workload phase exceeded 100000 event-loop turns"
+                );
+            }
             Ok(!self.events.is_empty())
         }
 
@@ -1086,6 +1176,8 @@ mod tests {
         suspend_after_render: Option<SignalState>,
         terminate_after_render: Option<SignalState>,
         terminate_after_search: Option<SignalState>,
+        turn: Option<Rc<StateCell<u64>>>,
+        background_turns: Vec<u64>,
     }
 
     impl RuntimeRecorder for TraceRecorder {
@@ -1099,6 +1191,11 @@ mod tests {
 
         fn finish_operation(&mut self, operation: RuntimeOperation, started: Self::Stamp) {
             self.operations.push((operation, started));
+            if matches!(operation, RuntimeOperation::Background(_))
+                && let Some(turn) = &self.turn
+            {
+                self.background_turns.push(turn.get());
+            }
             if matches!(
                 operation,
                 RuntimeOperation::Background(BackgroundWork::Render)
@@ -2569,5 +2666,615 @@ mod tests {
         let error = run_with_driver(&mut app(), &mut driver, &signals).unwrap_err();
         assert!(matches!(error, TutError::SignalAndRestoration { .. }));
         assert_eq!(error.exit_code(), 1);
+    }
+
+    mod bounded_results {
+        use std::{
+            env,
+            fs::{self, File, OpenOptions},
+            io::Write,
+            path::Path,
+            rc::Rc,
+        };
+
+        use super::*;
+        use crate::{
+            app::{
+                BoundedCoreMetrics, visible_render_memory_budget_bytes,
+                visible_render_refusal_is_typed_and_atomic,
+            },
+            document::{
+                MAX_FILE_BYTES, SOURCE_WINDOW_BYTES, max_grapheme_bytes, source_window_max_bytes,
+                source_window_slop_bytes,
+            },
+            error::LoadError,
+            layout::{
+                MAX_RENDER_GRAPHEME_BYTES, projected_scan_atom_budget, projected_scan_byte_budget,
+                projected_scan_step_byte_bound,
+            },
+            line_index::memory_budget_bytes as line_index_memory_budget_bytes,
+            locator::row_neighborhood_capacity,
+            search::{
+                MAX_SEARCH_QUERY_BYTES, display_highlight_merge_budget, match_block_start_limit,
+                search_highlight_memory_budget_bytes, search_index_memory_budget_bytes,
+            },
+        };
+
+        const SCHEMA: &str = "tut-bounds/v1";
+        const RECORD_LIMIT: usize = 1_024;
+        const STREAM_LIMIT: usize = 16 * 1_024;
+        const GENERATION_CHUNK_BYTES: usize = 64 * 1_024;
+        const MIB: usize = 1024 * 1024;
+
+        #[derive(Debug, Clone, Copy)]
+        enum WorkloadPattern {
+            Repeated(&'static str),
+            Line64k { newline: bool },
+            Egc1m,
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        struct Workload {
+            case: &'static str,
+            source_bytes: usize,
+            pattern: WorkloadPattern,
+        }
+
+        const MIXED_UNICODE: &str = "x界\r\nx👩‍💻e\u{301}\nalpha x\nx\n";
+        const WORKLOADS: [Workload; 12] = [
+            Workload {
+                case: "1m_ascii_lf",
+                source_bytes: MIB,
+                pattern: WorkloadPattern::Repeated("alpha x\n"),
+            },
+            Workload {
+                case: "1m_cjk_lf",
+                source_bytes: MIB,
+                pattern: WorkloadPattern::Repeated("界x界\n"),
+            },
+            Workload {
+                case: "1m_emoji_zwj_combining",
+                source_bytes: MIB,
+                pattern: WorkloadPattern::Repeated("x👩‍💻e\u{301}\n"),
+            },
+            Workload {
+                case: "1m_dense_nul",
+                source_bytes: MIB,
+                pattern: WorkloadPattern::Repeated("x\0"),
+            },
+            Workload {
+                case: "8m_ascii_crlf",
+                source_bytes: 8 * MIB,
+                pattern: WorkloadPattern::Repeated("xxxxxx\r\n"),
+            },
+            Workload {
+                case: "8m_mixed_unicode",
+                source_bytes: 8 * MIB,
+                pattern: WorkloadPattern::Repeated(MIXED_UNICODE),
+            },
+            Workload {
+                case: "8m_line_64k",
+                source_bytes: 8 * MIB,
+                pattern: WorkloadPattern::Line64k { newline: true },
+            },
+            Workload {
+                case: "8m_no_newline",
+                source_bytes: 8 * MIB,
+                pattern: WorkloadPattern::Line64k { newline: false },
+            },
+            Workload {
+                case: "32m_ascii_lf",
+                source_bytes: 32 * MIB,
+                pattern: WorkloadPattern::Repeated("alpha x\n"),
+            },
+            Workload {
+                case: "32m_dense_nul",
+                source_bytes: 32 * MIB,
+                pattern: WorkloadPattern::Repeated("x\0"),
+            },
+            Workload {
+                case: "32m_no_newline",
+                source_bytes: 32 * MIB,
+                pattern: WorkloadPattern::Line64k { newline: false },
+            },
+            Workload {
+                case: "32m_egc_1m_x32",
+                source_bytes: 32 * MIB,
+                pattern: WorkloadPattern::Egc1m,
+            },
+        ];
+
+        #[derive(Debug, Default)]
+        struct RecorderTotals {
+            cases: usize,
+            events: u64,
+            operations: usize,
+            max_background_per_turn: usize,
+        }
+
+        struct ResultWriter {
+            file: File,
+            records: usize,
+            bytes: usize,
+        }
+
+        impl ResultWriter {
+            fn new(path: &Path) -> Self {
+                Self {
+                    file: OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(path)
+                        .expect("create bounded result stream"),
+                    records: 0,
+                    bytes: 0,
+                }
+            }
+
+            fn record(&mut self, record: String) {
+                assert!(record.is_ascii(), "bounded records are ASCII");
+                assert!(record.ends_with('\n'), "bounded records end with LF");
+                assert!(!record[..record.len() - 1].contains(['\n', '\r']));
+                assert!(
+                    record.len() <= RECORD_LIMIT,
+                    "bounded record exceeds 1024 bytes"
+                );
+                self.bytes = self
+                    .bytes
+                    .checked_add(record.len())
+                    .expect("bounded stream byte count fits usize");
+                assert!(self.bytes <= STREAM_LIMIT, "bounded stream exceeds 16 KiB");
+                self.records = self
+                    .records
+                    .checked_add(1)
+                    .expect("bounded record count fits usize");
+                self.file
+                    .write_all(record.as_bytes())
+                    .expect("write bounded result record");
+            }
+
+            fn finish(mut self) {
+                assert_eq!(self.records, 15);
+                self.file.flush().expect("flush bounded result stream");
+            }
+        }
+
+        fn checked_u64(value: usize) -> u64 {
+            u64::try_from(value).expect("bounded counter fits unsigned 64-bit output")
+        }
+
+        fn write_workload(path: &Path, workload: Workload) {
+            assert_eq!(MIXED_UNICODE.len(), 32);
+            assert_eq!(workload.source_bytes % GENERATION_CHUNK_BYTES, 0);
+            let mut file = File::create(path).expect("create bounded workload file");
+            let mut buffer = [0_u8; GENERATION_CHUNK_BYTES];
+            match workload.pattern {
+                WorkloadPattern::Repeated(pattern) => {
+                    let pattern = pattern.as_bytes();
+                    assert_eq!(GENERATION_CHUNK_BYTES % pattern.len(), 0);
+                    for chunk in buffer.chunks_exact_mut(pattern.len()) {
+                        chunk.copy_from_slice(pattern);
+                    }
+                    for _ in 0..workload.source_bytes / GENERATION_CHUNK_BYTES {
+                        file.write_all(&buffer)
+                            .expect("write bounded workload chunk");
+                    }
+                }
+                WorkloadPattern::Line64k { newline } => {
+                    buffer.fill(b'a');
+                    buffer[0] = b'x';
+                    if newline {
+                        buffer[GENERATION_CHUNK_BYTES - 1] = b'\n';
+                    }
+                    for _ in 0..workload.source_bytes / GENERATION_CHUNK_BYTES {
+                        file.write_all(&buffer)
+                            .expect("write bounded workload chunk");
+                    }
+                }
+                WorkloadPattern::Egc1m => {
+                    let prefix = "x\u{20dd}".as_bytes();
+                    let combining = "\u{301}".as_bytes();
+                    assert_eq!(prefix.len(), 4);
+                    assert_eq!(combining.len(), 2);
+                    assert_eq!(MIB % GENERATION_CHUNK_BYTES, 0);
+                    for _ in 0..workload.source_bytes / MIB {
+                        buffer[..prefix.len()].copy_from_slice(prefix);
+                        for chunk in buffer[prefix.len()..].chunks_exact_mut(combining.len()) {
+                            chunk.copy_from_slice(combining);
+                        }
+                        file.write_all(&buffer).expect("write first EGC chunk");
+                        for chunk in buffer.chunks_exact_mut(combining.len()) {
+                            chunk.copy_from_slice(combining);
+                        }
+                        for _ in 1..MIB / GENERATION_CHUNK_BYTES {
+                            file.write_all(&buffer).expect("write remaining EGC chunk");
+                        }
+                    }
+                }
+            }
+            file.flush().expect("flush bounded workload file");
+            assert_eq!(
+                file.metadata().expect("inspect bounded workload").len(),
+                checked_u64(workload.source_bytes)
+            );
+        }
+
+        fn max_background_per_turn(turns: &[u64]) -> usize {
+            let mut maximum = 0;
+            let mut previous = None;
+            let mut current = 0_usize;
+            for &turn in turns {
+                if previous == Some(turn) {
+                    current = current
+                        .checked_add(1)
+                        .expect("bounded per-turn operation count fits usize");
+                } else {
+                    previous = Some(turn);
+                    current = 1;
+                }
+                maximum = maximum.max(current);
+            }
+            maximum
+        }
+
+        fn count_operation(recorder: &TraceRecorder, expected: RuntimeOperation) -> usize {
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| *operation == expected)
+                .count()
+        }
+
+        fn run_workload(path: &Path, workload: Workload, totals: &mut RecorderTotals) -> String {
+            write_workload(path, workload);
+            let document =
+                crate::document::load(path.to_path_buf()).expect("load bounded workload");
+            let mut app = App::new(document);
+            let signals = SignalState::empty();
+            let turn = Rc::new(StateCell::new(0_u64));
+            let mut driver = FakeDriver::bounded(&signals, Rc::clone(&turn));
+            let mut recorder = TraceRecorder {
+                turn: Some(turn),
+                ..TraceRecorder::default()
+            };
+
+            assert_eq!(
+                run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder)
+                    .expect("run bounded workload"),
+                RunOutcome::Normal
+            );
+            assert_eq!(
+                driver
+                    .bounded_script
+                    .as_ref()
+                    .expect("bounded workload retains its script")
+                    .stage,
+                6
+            );
+
+            let metrics = app.bounded_core_metrics();
+            assert_core_gates(metrics);
+            let background_per_turn = max_background_per_turn(&recorder.background_turns);
+            assert_eq!(background_per_turn, 1);
+
+            totals.cases = totals
+                .cases
+                .checked_add(1)
+                .expect("bounded case count fits usize");
+            totals.events = totals
+                .events
+                .checked_add(recorder.events)
+                .expect("bounded event total fits u64");
+            totals.operations = totals
+                .operations
+                .checked_add(recorder.operations.len())
+                .expect("bounded operation total fits usize");
+            totals.max_background_per_turn =
+                totals.max_background_per_turn.max(background_per_turn);
+
+            let draws = count_operation(&recorder, RuntimeOperation::Draw);
+            let line_steps = count_operation(
+                &recorder,
+                RuntimeOperation::Background(BackgroundWork::LineIndex),
+            );
+            let viewport_steps = count_operation(
+                &recorder,
+                RuntimeOperation::Background(BackgroundWork::Viewport),
+            );
+            let render_steps = count_operation(
+                &recorder,
+                RuntimeOperation::Background(BackgroundWork::Render),
+            );
+            let search_steps = count_operation(
+                &recorder,
+                RuntimeOperation::Background(BackgroundWork::Search),
+            );
+            let record = format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"core\",\"case\":\"{}\",\"source_bytes\":{},\"draws\":{},\"line_steps\":{},\"viewport_steps\":{},\"render_steps\":{},\"search_steps\":{},\"window_calls\":{},\"byte_window_calls\":{},\"grapheme_window_calls\":{},\"grapheme_window_bytes\":{},\"utf8_bytes\":{},\"segmentation_runs\":{},\"segmentation_bytes\":{},\"grapheme_emissions\":{},\"max_search_windows\":{},\"max_projected_emissions\":{},\"max_projected_bytes\":{},\"render_reserves\":{},\"highlight_reserves\":{},\"highlight_comparisons\":{},\"highlight_outputs\":{},\"peak_render_bytes\":{},\"peak_highlight_bytes\":{}}}\n",
+                workload.case,
+                checked_u64(workload.source_bytes),
+                checked_u64(draws),
+                checked_u64(line_steps),
+                checked_u64(viewport_steps),
+                checked_u64(render_steps),
+                checked_u64(search_steps),
+                checked_u64(metrics.window_calls),
+                checked_u64(metrics.byte_window_calls),
+                checked_u64(metrics.grapheme_window_calls),
+                checked_u64(metrics.grapheme_window_bytes),
+                checked_u64(metrics.utf8_bytes),
+                checked_u64(metrics.segmentation_runs),
+                checked_u64(metrics.segmentation_bytes),
+                checked_u64(metrics.grapheme_emissions),
+                checked_u64(metrics.max_search_windows),
+                checked_u64(metrics.max_projected_emissions),
+                checked_u64(metrics.max_projected_bytes),
+                checked_u64(metrics.render_reserves),
+                checked_u64(metrics.highlight_reserves),
+                checked_u64(metrics.highlight_comparisons),
+                checked_u64(metrics.highlight_outputs),
+                checked_u64(metrics.peak_render_bytes),
+                checked_u64(metrics.peak_highlight_bytes),
+            );
+            drop(app);
+            fs::remove_file(path).expect("remove bounded workload after case");
+            record
+        }
+
+        fn assert_core_gates(metrics: BoundedCoreMetrics) {
+            assert!(!metrics.line_step_violation);
+            assert!(metrics.max_line_step_bytes > 0);
+            assert!(metrics.max_line_step_bytes <= source_window_max_bytes());
+            assert!(metrics.max_search_windows <= 1);
+            assert!(metrics.max_projected_emissions <= projected_scan_atom_budget());
+            assert!(checked_u64(metrics.max_projected_bytes) <= projected_scan_step_byte_bound());
+            let grapheme_read_limit = max_grapheme_bytes()
+                .checked_add(SOURCE_WINDOW_BYTES)
+                .and_then(|bytes| bytes.checked_add(4))
+                .expect("grapheme read gate fits usize");
+            assert!(metrics.max_grapheme_window_bytes <= grapheme_read_limit);
+            assert!(metrics.max_highlight_operations <= display_highlight_merge_budget());
+            assert!(metrics.max_highlight_reserves <= 1);
+            assert!(metrics.peak_render_bytes <= visible_render_memory_budget_bytes());
+            assert!(metrics.peak_highlight_bytes <= search_highlight_memory_budget_bytes());
+        }
+
+        fn refusal_counts() -> (usize, usize) {
+            let directory = tempdir().expect("create refusal probe directory");
+            let path = directory.path().join("source-limit");
+            File::create(&path)
+                .expect("create source refusal probe")
+                .set_len(MAX_FILE_BYTES + 1)
+                .expect("size source refusal probe");
+            let source_typed = matches!(
+                crate::document::load(path.clone()),
+                Err(LoadError::TooLarge {
+                    limit: MAX_FILE_BYTES,
+                    ..
+                })
+            );
+            let source_atomic =
+                fs::metadata(&path).expect("inspect refused source").len() == MAX_FILE_BYTES + 1;
+            let terminal_typed = matches!(
+                TerminalSize::new(4096, 129),
+                Err(TutError::TerminalTooLarge { .. })
+            );
+            let terminal_atomic = TerminalSize::new(4096, 128).is_ok();
+            let render_typed_and_atomic = visible_render_refusal_is_typed_and_atomic();
+            let typed = [source_typed, terminal_typed, render_typed_and_atomic]
+                .into_iter()
+                .filter(|passed| *passed)
+                .count();
+            let atomic = [source_atomic, terminal_atomic, render_typed_and_atomic]
+                .into_iter()
+                .filter(|passed| *passed)
+                .count();
+            assert_eq!((typed, atomic), (3, 3));
+            (typed, atomic)
+        }
+
+        fn limits_record() -> String {
+            let (typed_refusals, atomic_refusals) = refusal_counts();
+            format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"limits\",\"case\":\"hard_limits\",\"source_bytes\":{},\"source_window_target_bytes\":{},\"source_window_slop_bytes\":{},\"source_window_bytes\":{},\"grapheme_chunk_bytes\":{},\"render_grapheme_bytes\":{},\"projected_atoms\":{},\"projected_target_bytes\":{},\"projected_step_bytes\":{},\"terminal_cells\":{},\"terminal_buffer_bytes\":{},\"visible_render_bytes\":{},\"line_index_bytes\":{},\"search_index_bytes\":{},\"highlight_bytes\":{},\"query_bytes\":{},\"match_block_starts\":{},\"row_edges\":{},\"highlight_operations\":{},\"typed_refusals\":{},\"atomic_refusals\":{}}}\n",
+                MAX_FILE_BYTES,
+                checked_u64(SOURCE_WINDOW_BYTES),
+                checked_u64(source_window_slop_bytes()),
+                checked_u64(source_window_max_bytes()),
+                checked_u64(max_grapheme_bytes()),
+                checked_u64(MAX_RENDER_GRAPHEME_BYTES),
+                checked_u64(projected_scan_atom_budget()),
+                projected_scan_byte_budget(),
+                projected_scan_step_byte_bound(),
+                MAX_TERMINAL_CELLS,
+                MAX_TERMINAL_BUFFER_BYTES,
+                checked_u64(visible_render_memory_budget_bytes()),
+                checked_u64(line_index_memory_budget_bytes()),
+                checked_u64(search_index_memory_budget_bytes()),
+                checked_u64(search_highlight_memory_budget_bytes()),
+                checked_u64(MAX_SEARCH_QUERY_BYTES),
+                checked_u64(match_block_start_limit()),
+                checked_u64(row_neighborhood_capacity()),
+                checked_u64(display_highlight_merge_budget()),
+                checked_u64(typed_refusals),
+                checked_u64(atomic_refusals),
+            )
+        }
+
+        fn input_preemption_count() -> usize {
+            let signals = SignalState::empty();
+            let mut driver = FakeDriver::new(&signals);
+            driver.events.push_back(quit_event());
+            let mut recorder = TraceRecorder::default();
+            let mut app = app();
+            let outcome = run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder)
+                .expect("run input-preemption probe");
+            usize::from(
+                outcome == RunOutcome::Normal
+                    && app.has_background_work()
+                    && recorder.operations.iter().all(|(operation, _)| {
+                        !matches!(operation, RuntimeOperation::Background(_))
+                    }),
+            )
+        }
+
+        fn signal_preemption_count() -> usize {
+            let signals = SignalState::empty();
+            let mut driver = FakeDriver::new(&signals);
+            driver.inject_on = Some("poll");
+            let mut recorder = TraceRecorder::default();
+            let mut app = app();
+            let outcome = run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder)
+                .expect("run signal-preemption probe");
+            usize::from(
+                outcome == RunOutcome::Signal(ExternalSignal::Terminate)
+                    && app.has_background_work()
+                    && recorder.operations.is_empty(),
+            )
+        }
+
+        fn run_warm_cycle(app: &mut App) {
+            let signals = SignalState::empty();
+            let turn = Rc::new(StateCell::new(0_u64));
+            let mut driver = FakeDriver::bounded(&signals, Rc::clone(&turn));
+            let mut recorder = TraceRecorder {
+                turn: Some(turn),
+                ..TraceRecorder::default()
+            };
+            assert_eq!(
+                run_with_test_recorder(app, &mut driver, &signals, &mut recorder)
+                    .expect("run warm bounded cycle"),
+                RunOutcome::Normal
+            );
+            assert_eq!(max_background_per_turn(&recorder.background_turns), 1);
+        }
+
+        fn warm_capacities() -> (usize, usize) {
+            let mut app = app_from_text(Path::new("/bounded/warm"), "alpha x\n".repeat(16 * 1024));
+            run_warm_cycle(&mut app);
+            let warm = app
+                .bounded_capacity_bytes()
+                .expect("warm bounded capacities fit usize");
+            run_warm_cycle(&mut app);
+            let after = app
+                .bounded_capacity_bytes()
+                .expect("post-warm bounded capacities fit usize");
+            let growth = after.saturating_sub(warm);
+            assert!(after <= warm);
+            assert_eq!(growth, 0);
+            (warm, growth)
+        }
+
+        fn partial_publication_counts() -> (usize, usize) {
+            let signals = SignalState::empty();
+            let mut frame_driver = FakeDriver::new(&signals);
+            frame_driver.sizes.push_back((4096, 4));
+            let mut frame_recorder = TraceRecorder {
+                terminate_after_render: Some(signals.clone()),
+                ..TraceRecorder::default()
+            };
+            let mut frame_app =
+                app_from_text(Path::new("/bounded/partial-frame"), "x".repeat(4096));
+            assert_eq!(
+                run_with_test_recorder(
+                    &mut frame_app,
+                    &mut frame_driver,
+                    &signals,
+                    &mut frame_recorder,
+                )
+                .expect("run partial-frame probe"),
+                RunOutcome::Signal(ExternalSignal::Terminate)
+            );
+            assert_eq!(
+                count_operation(
+                    &frame_recorder,
+                    RuntimeOperation::Background(BackgroundWork::Render),
+                ),
+                1
+            );
+            let frame_ready = frame_app.frame_ready();
+            let partial_frames = usize::from(frame_ready);
+            assert!(!frame_ready);
+            assert_eq!(frame_app.background_work(), Some(BackgroundWork::Render));
+
+            let highlight_signals = SignalState::empty();
+            let mut highlight_driver = FakeDriver::new(&highlight_signals);
+            let mut highlight_recorder = TraceRecorder {
+                terminate_after_search: Some(highlight_signals.clone()),
+                ..TraceRecorder::default()
+            };
+            let mut highlight_app = merge_pending_app();
+            let highlight_before = highlight_app
+                .pending_highlight_cursors()
+                .expect("highlight probe starts with pending cursors");
+            assert!(matches!(
+                event_loop(
+                    &mut highlight_app,
+                    &mut highlight_driver,
+                    &highlight_signals,
+                    &mut highlight_recorder,
+                ),
+                Primary::Signal(ExternalSignal::Terminate)
+            ));
+            assert_eq!(
+                count_operation(
+                    &highlight_recorder,
+                    RuntimeOperation::Background(BackgroundWork::Search),
+                ),
+                1
+            );
+            let highlight_after = highlight_app
+                .pending_highlight_cursors()
+                .expect("one highlight phase remains pending");
+            assert_ne!(highlight_after, highlight_before);
+            let partial_highlights = usize::from(highlight_app.published_highlight_count() != 0);
+            (partial_frames, partial_highlights)
+        }
+
+        fn recorder_record(totals: RecorderTotals) -> String {
+            let input_preemptions = input_preemption_count();
+            let signal_preemptions = signal_preemption_count();
+            assert_eq!((input_preemptions, signal_preemptions), (1, 1));
+            let (warm_capacity_bytes, post_warm_growth_bytes) = warm_capacities();
+            let (partial_frames, partial_highlights) = partial_publication_counts();
+            assert_eq!(totals.cases, WORKLOADS.len());
+            assert_eq!(totals.max_background_per_turn, 1);
+            assert_eq!((partial_frames, partial_highlights), (0, 0));
+            format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"recorder\",\"case\":\"fake_loop\",\"cases\":{},\"recorded_events\":{},\"recorded_operations\":{},\"max_background_per_turn\":{},\"input_preemptions\":{},\"signal_preemptions\":{},\"warm_capacity_bytes\":{},\"post_warm_growth_bytes\":{},\"partial_frames\":{},\"partial_highlights\":{}}}\n",
+                checked_u64(totals.cases),
+                totals.events,
+                checked_u64(totals.operations),
+                checked_u64(totals.max_background_per_turn),
+                checked_u64(input_preemptions),
+                checked_u64(signal_preemptions),
+                checked_u64(warm_capacity_bytes),
+                checked_u64(post_warm_growth_bytes),
+                checked_u64(partial_frames),
+                checked_u64(partial_highlights),
+            )
+        }
+
+        #[test]
+        #[ignore = "run only through make bounded-results"]
+        fn bounded_results_core() {
+            let output = env::var_os("TUT_BOUNDED_RESULTS_FILE")
+                .expect("TUT_BOUNDED_RESULTS_FILE is set by make bounded-results");
+            let output = Path::new(&output);
+            let directory = tempdir().expect("create bounded workload directory");
+            let workload_path = directory.path().join("workload");
+            let mut writer = ResultWriter::new(output);
+            writer.record(format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"schema\",\"records\":16,\"core_records\":12,\"record_bytes\":1024,\"stream_bytes\":16384}}\n"
+            ));
+            let mut totals = RecorderTotals::default();
+            for workload in WORKLOADS {
+                writer.record(run_workload(&workload_path, workload, &mut totals));
+            }
+            writer.record(limits_record());
+            writer.record(recorder_record(totals));
+            writer.finish();
+        }
     }
 }

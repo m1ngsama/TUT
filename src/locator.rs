@@ -13,6 +13,11 @@ use crate::{
 const INITIAL_ROW_NEIGHBORHOOD_CAPACITY: usize = 64;
 const ROW_NEIGHBORHOOD_CAPACITY: usize = 4096;
 
+#[cfg(test)]
+pub(super) const fn row_neighborhood_capacity() -> usize {
+    ROW_NEIGHBORHOOD_CAPACITY
+}
+
 pub(super) fn source_row_bound(
     source_start: SourceOffset,
     source_end: SourceOffset,
@@ -50,6 +55,12 @@ pub(super) struct RowNeighborhood {
 }
 
 impl RowNeighborhood {
+    #[cfg(test)]
+    pub(super) fn bounded_storage_bytes(&self) -> Option<usize> {
+        self.edges
+            .capacity()
+            .checked_mul(std::mem::size_of::<RowEdge>())
+    }
     pub(super) fn clear(&mut self) {
         self.key = None;
         self.edges.clear();
