@@ -67,11 +67,11 @@ const COMMITTED_SEARCH_FOOTER: &[CopyTier] = &[
 const SEARCH_INPUT_FOOTER: &[CopyTier] = &[
     CopyTier {
         min_columns: 80,
-        text: "Esc cancel  Enter apply  Backspace delete  F1 help  Ctrl-C interrupt",
+        text: "Esc cancel Enter Backspace Up recall Ctrl-U clear F1 help Ctrl-C interrupt",
     },
     CopyTier {
         min_columns: 40,
-        text: "Esc cancel  Enter  Backspace  F1 help",
+        text: "Esc cancel Enter Up recall Ctrl-U clear",
     },
     CopyTier {
         min_columns: 20,
@@ -146,7 +146,8 @@ const TINY_COPY: &[CopyTier] = &[
 ];
 const COMPACT_HELP: &[&str] = &[
     "1-9 + j/k/page/n/N    repeat relative",
-    "/ search   n/N next/previous match",
+    "/ search  Up recall  Ctrl-U clear",
+    "n/N                   next/previous match",
     "j/k or Up/Down        move by line",
     "Space/b or PgDn/PgUp  move by page",
     "g/G or Home/End       document ends",
@@ -167,6 +168,8 @@ const FULL_HELP: &[&str] = &[
     "  G / End              document end",
     "Search",
     "  /                    enter search",
+    "  Up                   recall current query",
+    "  Ctrl-U               clear search draft",
     "  Enter                apply search",
     "  Esc                  cancel or clear search",
     "  n / N                next / previous match",
@@ -847,7 +850,11 @@ mod tests {
         assert_eq!(footer_for(draft, 20), "Esc cancel  Enter F1");
         assert_eq!(
             footer_for(draft, 40),
-            "Esc cancel  Enter  Backspace  F1 help"
+            "Esc cancel Enter Up recall Ctrl-U clear"
+        );
+        assert_eq!(
+            footer_for(draft, 80),
+            "Esc cancel Enter Backspace Up recall Ctrl-U clear F1 help Ctrl-C interrupt"
         );
         assert_eq!(pick_copy(16, READER_HELP_FOOTER), "Esc/q/F1 close");
         assert_eq!(pick_copy(16, SEARCH_HELP_FOOTER), "Esc/F1 close");
@@ -935,12 +942,47 @@ mod tests {
         let buffer = draw(&mut app, 48, 4);
         assert_eq!(
             row_text(&buffer, 3),
-            "Esc cancel  Enter  Backspace  F1 help"
+            "Esc cancel Enter Up recall Ctrl-U clear"
         );
 
         app.update(Action::ShowHelp).unwrap();
         let buffer = draw(&mut app, 48, 4);
         assert_eq!(row_text(&buffer, 3), "Esc/F1 close help  Ctrl-C interrupt");
+    }
+
+    #[test]
+    fn recalled_search_status_and_clear_remove_stale_query_cells() {
+        let backend = TestBackend::new(40, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "needle".to_owned());
+        app.update(Action::Resize(Geometry::new(40, 4))).unwrap();
+        app.update(Action::BeginSearch).unwrap();
+        for character in "needle".chars() {
+            app.update(Action::SearchInsert(character)).unwrap();
+        }
+        app.update(Action::SearchCommit).unwrap();
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchRecall).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(
+            row_text(terminal.backend().buffer(), 2),
+            "ALL  1/1  /needle"
+        );
+
+        app.update(Action::SearchClearDraft).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "ALL  1/1  /");
+        for column in 11..40 {
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 2))
+                    .unwrap()
+                    .symbol(),
+                " "
+            );
+        }
     }
 
     #[test]
@@ -967,9 +1009,9 @@ mod tests {
         draw_into(&mut terminal, &mut app);
         assert_eq!(
             row_text(terminal.backend().buffer(), 3),
-            "Esc cancel  Enter  Backspace  F1 help"
+            "Esc cancel Enter Up recall Ctrl-U clear"
         );
-        for column in 37..40 {
+        for column in 39..40 {
             assert_eq!(
                 terminal
                     .backend()
@@ -1031,7 +1073,7 @@ mod tests {
         assert_eq!(row_text(&buffer, 2), "/prefixé終");
         assert_eq!(
             row_text(&buffer, 3),
-            "Esc cancel  Enter  Backspace  F1 help"
+            "Esc cancel Enter Up recall Ctrl-U clear"
         );
     }
 
@@ -1044,7 +1086,15 @@ mod tests {
         assert_eq!(row_text(&full, 0), "TUT keyboard help");
         assert_eq!(row_text(&full, 1), "Navigation");
         assert_eq!(row_text(&full, 11), "Search");
-        assert_eq!(row_text(&full, 16), "General");
+        assert_eq!(
+            row_text(&full, 13),
+            "  Up                   recall current query"
+        );
+        assert_eq!(
+            row_text(&full, 14),
+            "  Ctrl-U               clear search draft"
+        );
+        assert_eq!(row_text(&full, 18), "General");
         assert_eq!(row_text(&full, 23), "Esc/q/F1 close help  Ctrl-C interrupt");
 
         let mut compact = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());

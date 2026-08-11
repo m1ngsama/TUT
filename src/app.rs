@@ -106,6 +106,8 @@ pub(super) enum Action {
     BeginSearch,
     SearchInsert(char),
     SearchBackspace,
+    SearchRecall,
+    SearchClearDraft,
     SearchCommit,
     SearchCancel,
     NextMatch,
@@ -682,6 +684,8 @@ pub(super) struct App {
     queued_rows: i64,
     search_turn: bool,
     repeat: Option<RepeatStatus>,
+    #[cfg(test)]
+    fail_search_recall_reserve: bool,
 }
 
 #[cfg(test)]
@@ -713,6 +717,8 @@ impl App {
             queued_rows: 0,
             search_turn: true,
             repeat: None,
+            #[cfg(test)]
+            fail_search_recall_reserve: false,
         }
     }
 
@@ -1242,6 +1248,8 @@ impl App {
             Action::BeginSearch if reading => self.begin_search(),
             Action::SearchInsert(character) if editing => self.insert_search(character)?,
             Action::SearchBackspace if editing => self.backspace_search(),
+            Action::SearchRecall if editing => self.recall_search()?,
+            Action::SearchClearDraft if editing => self.clear_search_draft(),
             Action::SearchCommit if editing => self.commit_search()?,
             Action::SearchCancel if editing => self.cancel_search(),
             Action::SearchCancel if reading => self.cancel_committed_search(),
@@ -1552,6 +1560,46 @@ impl App {
         };
         draft.truncate(start);
         true
+    }
+
+    fn recall_search(&mut self) -> Result<bool, TutError> {
+        let Mode::Content(ContentMode::SearchInput { draft, .. }) = &self.mode else {
+            return Ok(false);
+        };
+        if !draft.is_empty() {
+            return Ok(false);
+        }
+        let Some(search) = &self.search else {
+            return Ok(false);
+        };
+
+        let query = search.query();
+        let mut recalled = String::new();
+        #[cfg(test)]
+        if self.fail_search_recall_reserve {
+            return Err(TutError::Allocation("search query"));
+        }
+        recalled
+            .try_reserve_exact(query.len())
+            .map_err(|_| TutError::Allocation("search query"))?;
+        recalled.push_str(query);
+
+        let Mode::Content(ContentMode::SearchInput { draft, limit_hit }) = &mut self.mode else {
+            unreachable!("search recall preserves search-input mode");
+        };
+        *draft = recalled;
+        *limit_hit = false;
+        Ok(true)
+    }
+
+    fn clear_search_draft(&mut self) -> bool {
+        let Mode::Content(ContentMode::SearchInput { draft, limit_hit }) = &mut self.mode else {
+            return false;
+        };
+        let changed = !draft.is_empty() || *limit_hit;
+        draft.clear();
+        *limit_hit = false;
+        changed
     }
 
     fn cancel_search(&mut self) -> bool {
@@ -3516,6 +3564,148 @@ mod tests {
         ));
         app.update(Action::SearchCancel).unwrap();
         assert_eq!(app.search.as_ref().unwrap().query(), "alpha");
+    }
+
+    #[test]
+    fn current_search_recall_is_empty_only_transactional_and_source_idle() {
+        let query = "e\u{301}終";
+        let mut app = reader(&format!("zero {query} one {query}"), 20, 5);
+        commit(&mut app, query);
+        app.update(Action::NextMatch).unwrap();
+        settle(&mut app);
+        let selected = app.current_match();
+        let anchor = app.anchor;
+
+        app.update(Action::BeginSearch).unwrap();
+        app.document_cache.reset_metrics();
+        app.search_cache.reset_metrics();
+        assert_eq!(app.update(Action::SearchRecall).unwrap(), Outcome::Changed);
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Draft {
+                draft,
+                limit_hit: false
+            } if draft == query
+        ));
+        assert_eq!(
+            app.update(Action::SearchRecall).unwrap(),
+            Outcome::Unchanged
+        );
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.current_match(), selected);
+        assert!(app.viewport_request.is_none());
+        assert_eq!(app.queued_rows, 0);
+        assert!(!app.has_background_work());
+        assert!(!app.advance_background().unwrap());
+        for metrics in [app.document_cache.metrics(), app.search_cache.metrics()] {
+            assert_eq!(metrics.byte_window_calls(), 0);
+            assert_eq!(metrics.window_calls(), 0);
+            assert_eq!(metrics.grapheme_window_calls(), 0);
+            assert_eq!(metrics.grapheme_emissions(), 0);
+            assert_eq!(metrics.segmentation_runs(), 0);
+        }
+
+        assert_eq!(
+            app.update(Action::SearchClearDraft).unwrap(),
+            Outcome::Changed
+        );
+        app.update(Action::SearchInsert('x')).unwrap();
+        assert_eq!(
+            app.update(Action::SearchRecall).unwrap(),
+            Outcome::Unchanged
+        );
+        app.update(Action::SearchCancel).unwrap();
+        assert_eq!(app.search.as_ref().unwrap().query(), query);
+        assert_eq!(app.current_match(), selected);
+
+        let mut fresh = reader("body", 16, 4);
+        fresh.update(Action::BeginSearch).unwrap();
+        fresh.fail_search_recall_reserve = true;
+        assert_eq!(
+            fresh.update(Action::SearchRecall).unwrap(),
+            Outcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn recalled_exact_limit_queries_and_limit_notices_clear_in_one_action() {
+        let mut query = "界".repeat((SEARCH_DRAFT_LIMIT_BYTES - 1) / "界".len());
+        query.push('x');
+        assert_eq!(query.len(), SEARCH_DRAFT_LIMIT_BYTES);
+        let mut app = reader(&query, 16, 4);
+        commit(&mut app, &query);
+
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchRecall).unwrap();
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Draft {
+                draft,
+                limit_hit: false
+            } if draft == query
+        ));
+        app.update(Action::SearchInsert('z')).unwrap();
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Draft {
+                draft,
+                limit_hit: true
+            } if draft == query
+        ));
+
+        assert_eq!(
+            app.update(Action::SearchClearDraft).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(
+            app.search_status(),
+            SearchStatus::Draft {
+                draft: "",
+                limit_hit: false,
+            }
+        );
+        assert_eq!(
+            app.update(Action::SearchClearDraft).unwrap(),
+            Outcome::Unchanged
+        );
+        app.update(Action::SearchCancel).unwrap();
+        assert_eq!(app.search.as_ref().unwrap().query(), query);
+    }
+
+    #[test]
+    fn search_recall_allocation_failure_is_atomic() {
+        let mut app = reader("alpha beta alpha", 16, 5);
+        commit(&mut app, "alpha");
+        app.update(Action::NextMatch).unwrap();
+        settle(&mut app);
+        let selected = app.current_match();
+        let anchor = app.anchor;
+        app.update(Action::BeginSearch).unwrap();
+        let mode = app.mode.clone();
+        let viewport_request = app.viewport_request;
+        let queued_rows = app.queued_rows;
+        app.document_cache.reset_metrics();
+        app.search_cache.reset_metrics();
+        app.fail_search_recall_reserve = true;
+
+        assert!(matches!(
+            app.update(Action::SearchRecall),
+            Err(TutError::Allocation("search query"))
+        ));
+        assert_eq!(app.mode, mode);
+        assert_eq!(app.search.as_ref().unwrap().query(), "alpha");
+        assert_eq!(app.current_match(), selected);
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.viewport_request, viewport_request);
+        assert_eq!(app.queued_rows, queued_rows);
+        assert!(!app.has_background_work());
+        for metrics in [app.document_cache.metrics(), app.search_cache.metrics()] {
+            assert_eq!(metrics.byte_window_calls(), 0);
+            assert_eq!(metrics.window_calls(), 0);
+            assert_eq!(metrics.grapheme_window_calls(), 0);
+            assert_eq!(metrics.grapheme_emissions(), 0);
+            assert_eq!(metrics.segmentation_runs(), 0);
+        }
     }
 
     #[test]

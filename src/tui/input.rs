@@ -104,6 +104,12 @@ fn map_search_key(key: KeyEvent) -> Option<Action> {
             Some(Action::ShowHelp)
         }
         (KeyCode::Backspace, KeyModifiers::NONE) => Some(Action::SearchBackspace),
+        (KeyCode::Up, KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::SearchRecall)
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) if key.kind == KeyEventKind::Press => {
+            Some(Action::SearchClearDraft)
+        }
         (KeyCode::Enter, KeyModifiers::NONE) => Some(Action::SearchCommit),
         (KeyCode::Esc, KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
             Some(Action::SearchCancel)
@@ -290,6 +296,14 @@ mod tests {
             Some(Action::SearchBackspace)
         );
         assert_eq!(
+            map_event(&mode, false, key(KeyCode::Up, KeyModifiers::NONE)),
+            Some(Action::SearchRecall)
+        );
+        assert_eq!(
+            map_event(&mode, false, key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(Action::SearchClearDraft)
+        );
+        assert_eq!(
             map_event(&mode, false, key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(Action::SearchCommit)
         );
@@ -303,6 +317,18 @@ mod tests {
         );
         assert_eq!(
             map_event(&mode, false, key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            map_event(&mode, false, repeated_key(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            map_event(
+                &mode,
+                false,
+                repeated_key(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
             None
         );
     }
