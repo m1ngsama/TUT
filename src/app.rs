@@ -156,6 +156,13 @@ pub(super) enum ViewActivity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ViewportBoundary {
+    Top,
+    End,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Highlight {
     None,
     Match,
@@ -502,6 +509,7 @@ pub(super) struct RenderState<'a> {
     pub total_lines: Option<u64>,
     pub status: SearchStatus<'a>,
     pub activity: Option<ViewActivity>,
+    pub boundary: Option<ViewportBoundary>,
 }
 
 #[derive(Debug)]
@@ -522,6 +530,7 @@ struct RenderViewportCache {
     geometry: Geometry,
     anchor: SourceOffset,
     viewport: Viewport,
+    at_end: bool,
     rows: RenderRows,
 }
 
@@ -774,6 +783,7 @@ impl App {
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
         debug_assert!(self.reader_frame_ready());
         let viewport = self.current_render_cache().map(|cache| cache.viewport);
+        let boundary = self.viewport_boundary();
         if viewport.is_some() {
             self.document.validate()?;
         }
@@ -806,7 +816,19 @@ impl App {
             total_lines: line.and_then(LinePosition::total),
             status: self.search_status(),
             activity: self.view_activity(),
+            boundary,
         })
+    }
+
+    fn viewport_boundary(&self) -> Option<ViewportBoundary> {
+        let cache = self.current_render_cache()?;
+        let at_top = cache.viewport.first_visible_start == self.document.source_start();
+        match (at_top, cache.at_end) {
+            (true, true) => Some(ViewportBoundary::All),
+            (true, false) => Some(ViewportBoundary::Top),
+            (false, true) => Some(ViewportBoundary::End),
+            (false, false) => None,
+        }
     }
 
     pub(super) fn view_state(&mut self) -> Result<ViewState<'_>, TutError> {
@@ -1532,6 +1554,7 @@ impl App {
                 self.document.validate()?;
                 let rows = sink.finish();
                 debug_assert_eq!(rows.len(), result.rows);
+                let at_end = result.next.is_none();
                 let viewport = Viewport {
                     visible_rows: result.rows,
                     first_visible_start: key.anchor,
@@ -1541,6 +1564,7 @@ impl App {
                     geometry: key.geometry,
                     anchor: key.anchor,
                     viewport,
+                    at_end,
                     rows,
                 });
                 Ok(true)
@@ -2141,6 +2165,10 @@ mod tests {
         panic!("background work exceeded the test step limit");
     }
 
+    fn published_boundary(app: &mut App) -> Option<ViewportBoundary> {
+        app.render_state().unwrap().boundary
+    }
+
     fn advance_until(app: &mut App, ready: impl Fn(&App) -> bool) {
         for _ in 0..BACKGROUND_STEP_LIMIT {
             if ready(app) {
@@ -2232,6 +2260,76 @@ mod tests {
         assert!(app.follow_end);
         app.update(Action::LineUp).unwrap();
         assert!(!app.follow_end);
+    }
+
+    #[test]
+    fn completed_frames_distinguish_visual_viewport_boundaries() {
+        let mut plain = reader("a", 16, 4);
+        let mut trailing_line_feed = reader("\n", 16, 4);
+        let plain_cache = plain.current_render_cache().unwrap();
+        let trailing_cache = trailing_line_feed.current_render_cache().unwrap();
+
+        assert_eq!(plain_cache.viewport, trailing_cache.viewport);
+        assert!(plain_cache.at_end);
+        assert!(!trailing_cache.at_end);
+        assert_eq!(published_boundary(&mut plain), Some(ViewportBoundary::All));
+        assert_eq!(
+            published_boundary(&mut trailing_line_feed),
+            Some(ViewportBoundary::Top)
+        );
+
+        for (text, rows, expected) in [
+            ("", 4, ViewportBoundary::All),
+            ("a", 4, ViewportBoundary::All),
+            ("\n", 4, ViewportBoundary::Top),
+            ("\n", 5, ViewportBoundary::All),
+            ("\u{feff}a\r\n", 4, ViewportBoundary::Top),
+            ("\u{feff}a\r\n", 5, ViewportBoundary::All),
+        ] {
+            let mut app = reader(text, 16, rows);
+            assert_eq!(
+                published_boundary(&mut app),
+                Some(expected),
+                "text={text:?}, rows={rows}"
+            );
+        }
+
+        trailing_line_feed.update(Action::DocumentEnd).unwrap();
+        settle(&mut trailing_line_feed);
+        assert_eq!(
+            published_boundary(&mut trailing_line_feed),
+            Some(ViewportBoundary::End)
+        );
+    }
+
+    #[test]
+    fn soft_wrapped_boundaries_follow_navigation_and_resize() {
+        let mut app = reader(&"x".repeat(80), 16, 5);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::Top));
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        assert_eq!(published_boundary(&mut app), None);
+
+        app.update(Action::DocumentEnd).unwrap();
+        settle(&mut app);
+        assert!(app.follow_end);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::End));
+
+        app.update(Action::Resize(Geometry::new(80, 5))).unwrap();
+        settle(&mut app);
+        assert!(app.follow_end);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::All));
+
+        app.update(Action::Resize(Geometry::new(16, 5))).unwrap();
+        settle(&mut app);
+        assert!(app.follow_end);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::End));
+
+        app.update(Action::DocumentStart).unwrap();
+        settle(&mut app);
+        assert!(!app.follow_end);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::Top));
     }
 
     #[test]
@@ -2818,6 +2916,26 @@ mod tests {
         assert_eq!(app.line_position_cache, line_position_cache);
         assert_eq!(app.pending_highlight_cursors(), pending_highlights);
         assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+    }
+
+    #[test]
+    fn partial_render_steps_do_not_publish_viewport_boundaries() {
+        let mut app = app_from_text(Path::new("partial-boundary.txt"), "x".repeat(4097));
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+        let mut incomplete_steps = 0;
+
+        while !app.reader_frame_ready() {
+            assert!(app.current_render_cache().is_none());
+            assert!(matches!(app.view_state().unwrap(), ViewState::Pending(_)));
+            let changed = app.advance_background().unwrap();
+            if !app.reader_frame_ready() {
+                assert!(!changed);
+                incomplete_steps += 1;
+            }
+        }
+
+        assert!(incomplete_steps > 1);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::Top));
     }
 
     #[test]
@@ -3487,6 +3605,7 @@ mod tests {
                 first_visible_start: SourceOffset::new(1),
                 visible_end: SourceOffset::new(1),
             },
+            at_end: false,
             rows: reusable,
         });
 
@@ -4239,7 +4358,7 @@ mod tests {
         let mut app = App::new(crate::document::load(path.clone()).unwrap());
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
         settle_frame(&mut app);
-        app.render_state().unwrap();
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::All));
 
         fs::write(&path, "other").unwrap();
 
@@ -4254,11 +4373,11 @@ mod tests {
         let mut app = App::new(crate::document::load(path.clone()).unwrap());
         app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
         settle_frame(&mut app);
-        app.render_state().unwrap();
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::Top));
         app.document_cache.reset_metrics();
 
         let before = app.document.stability_checks();
-        app.render_state().unwrap();
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::Top));
         assert_eq!(app.document.stability_checks(), before + 1);
         assert_eq!(
             app.document_cache.metrics(),
@@ -4625,6 +4744,7 @@ mod tests {
 
         let initial = app.render_state().unwrap();
         assert_eq!((initial.current_line, initial.total_lines), (Some(1), None));
+        assert_eq!(initial.boundary, Some(ViewportBoundary::Top));
         assert!(app.has_background_work());
 
         let (advances, redraws) = settle_count(&mut app);
@@ -4636,6 +4756,7 @@ mod tests {
             (complete.current_line, complete.total_lines),
             (Some(1), Some(30_001))
         );
+        assert_eq!(complete.boundary, Some(ViewportBoundary::Top));
     }
 
     #[test]
@@ -4663,8 +4784,19 @@ mod tests {
         fs::write(&path, text).unwrap();
         let mut app = App::new(crate::document::load(path).unwrap());
         app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+        settle_frame(&mut app);
+        assert!(!app.document.line_index_complete());
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::Top));
 
         app.update(Action::DocumentEnd).unwrap();
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Reader(RenderState {
+                activity: Some(ViewActivity::GoingToEnd),
+                boundary: Some(ViewportBoundary::Top),
+                ..
+            })
+        ));
         assert!(!app.advance_background().unwrap());
         assert!(app.locator.is_none());
         assert_eq!(app.anchor, SourceOffset::ZERO);
@@ -4672,6 +4804,7 @@ mod tests {
         settle(&mut app);
         assert_eq!(app.anchor, SourceOffset::new(74_990));
         assert!(app.follow_end);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::End));
     }
 
     #[test]
@@ -4696,5 +4829,7 @@ mod tests {
             layout.last_viewport_start(&mut reader).unwrap()
         });
         assert_eq!(app.progress_percent().unwrap(), 100);
+        assert!(!app.follow_end);
+        assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::End));
     }
 }

@@ -13,7 +13,7 @@ use crate::{
     app::{
         Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, PendingState,
         RenderProjectionKind, RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus,
-        ViewActivity, ViewState,
+        ViewActivity, ViewState, ViewportBoundary,
     },
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
@@ -467,13 +467,18 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
     prefix
         .try_reserve_exact(50)
         .map_err(|_| TutError::Allocation("status text"))?;
+    match state.boundary {
+        Some(ViewportBoundary::Top) => prefix.push_str("TOP"),
+        Some(ViewportBoundary::End) => prefix.push_str("END"),
+        Some(ViewportBoundary::All) => prefix.push_str("ALL"),
+        None => write!(prefix, "{}%", state.progress.min(100))
+            .expect("reserved String formatting is infallible"),
+    }
     match (state.current_line, state.total_lines) {
-        (Some(current), Some(total)) => {
-            write!(prefix, "{}%  {current}/{total}", state.progress.min(100))
-        }
-        (Some(current), None) => write!(prefix, "{}%  {current}/?", state.progress.min(100)),
-        (None, Some(total)) => write!(prefix, "{}%  ?/{total}", state.progress.min(100)),
-        (None, None) => write!(prefix, "{}%  ?/?", state.progress.min(100)),
+        (Some(current), Some(total)) => write!(prefix, "  {current}/{total}"),
+        (Some(current), None) => write!(prefix, "  {current}/?"),
+        (None, Some(total)) => write!(prefix, "  ?/{total}"),
+        (None, None) => write!(prefix, "  ?/?"),
     }
     .expect("reserved String formatting is infallible");
     compose_status(prefix, state.status, state.activity, width)
@@ -829,7 +834,7 @@ mod tests {
         app.update(Action::Resize(Geometry::new(40, 5))).unwrap();
         let buffer = draw(&mut app, 40, 5);
         assert!(row_text(&buffer, 0).starts_with("book.txt"));
-        assert_eq!(row_text(&buffer, 3), "100%  1/1");
+        assert_eq!(row_text(&buffer, 3), "ALL  1/1");
         assert_eq!(
             row_text(&buffer, 4),
             "q quit  F1 help  / search  j/k  Space/b"
@@ -1091,6 +1096,7 @@ mod tests {
                 limit_hit: false,
             },
             activity: None,
+            boundary: None,
         };
 
         assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /…efghij");
@@ -1110,6 +1116,7 @@ mod tests {
                 limit_hit: false,
             },
             activity: None,
+            boundary: None,
         };
         assert_eq!(status_text(&state, 15).unwrap(), "12%  7/9  /…e\u{301}終");
 
@@ -1140,9 +1147,35 @@ mod tests {
                 searching: false,
             },
             activity: None,
+            boundary: None,
         };
 
         assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /abcdef…");
+    }
+
+    #[test]
+    fn viewport_boundaries_replace_only_the_progress_slot() {
+        let mut state = RenderState {
+            filename: "book.txt",
+            path: "/tmp/book.txt",
+            rows: RenderRowsView::empty(),
+            progress: 12,
+            current_line: Some(7),
+            total_lines: Some(9),
+            status: SearchStatus::None,
+            activity: None,
+            boundary: None,
+        };
+
+        assert_eq!(status_text(&state, 40).unwrap(), "12%  7/9");
+        for (boundary, expected) in [
+            (ViewportBoundary::Top, "TOP  7/9"),
+            (ViewportBoundary::End, "END  7/9"),
+            (ViewportBoundary::All, "ALL  7/9"),
+        ] {
+            state.boundary = Some(boundary);
+            assert_eq!(status_text(&state, 40).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -1156,11 +1189,12 @@ mod tests {
             total_lines: Some(9),
             status: SearchStatus::None,
             activity: Some(ViewActivity::PreparingView),
+            boundary: Some(ViewportBoundary::Top),
         };
 
         assert_eq!(
             status_text(&state, 40).unwrap(),
-            "12%  7/9 — preparing view"
+            "TOP  7/9 — preparing view"
         );
         assert_eq!(status_text(&state, 16).unwrap(), "preparing view");
 
@@ -1201,6 +1235,7 @@ mod tests {
             total_lines: None,
             status: SearchStatus::None,
             activity: None,
+            boundary: None,
         };
         assert_eq!(status_text(&state, 40).unwrap(), "12%  7/?");
 
@@ -1222,6 +1257,7 @@ mod tests {
             total_lines: Some(1),
             status: SearchStatus::None,
             activity: None,
+            boundary: None,
         };
         assert_eq!(
             header_text(state.filename, state.path, 40).unwrap(),
