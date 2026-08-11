@@ -290,6 +290,15 @@ pub(super) struct ViewportLocator {
 }
 
 impl ViewportLocator {
+    #[cfg(test)]
+    pub(super) fn bounded_storage_bytes(&self) -> Option<(usize, usize)> {
+        let element = std::mem::size_of::<SourceOffset>();
+        Some((
+            self.history.capacity().checked_mul(element)?,
+            self.prefix_rows.capacity().checked_mul(element)?,
+        ))
+    }
+
     pub(super) fn new(
         target: SourceOffset,
         delta: RowDelta,
