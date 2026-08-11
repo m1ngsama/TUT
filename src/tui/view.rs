@@ -300,31 +300,35 @@ fn header_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
 }
 
 fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> {
-    let (query, suffix) = match state.status {
-        SearchStatus::None => (None, ""),
+    let (query, suffix, preserve_query_tail) = match state.status {
+        SearchStatus::None => (None, "", false),
         SearchStatus::Committed {
             query,
             searching: true,
             ..
-        } => (Some(sanitize_text(query)), " — searching"),
+        } => (Some(sanitize_text(query)), " — searching", false),
         SearchStatus::Committed {
             query,
             no_matches: true,
             searching: false,
-        } => (Some(sanitize_text(query)), " — no matches"),
+        } => (Some(sanitize_text(query)), " — no matches", false),
         SearchStatus::Committed {
             query,
             no_matches: false,
             searching: false,
-        } => (Some(sanitize_text(query)), ""),
+        } => (Some(sanitize_text(query)), "", false),
         SearchStatus::Draft {
             draft,
             limit_hit: false,
-        } => (Some(sanitize_text(draft)), ""),
+        } => (Some(sanitize_text(draft)), "", true),
         SearchStatus::Draft {
             draft,
             limit_hit: true,
-        } => (Some(sanitize_text(draft)), " — query limit: 4096 bytes"),
+        } => (
+            Some(sanitize_text(draft)),
+            " — query limit: 4096 bytes",
+            true,
+        ),
     };
 
     let mut prefix = String::new();
@@ -346,6 +350,7 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
     let fixed_width = display_width(&prefix).saturating_add(display_width(suffix));
     let query_budget = width.saturating_sub(fixed_width);
     let shown_query = match query.as_deref() {
+        Some(query) if preserve_query_tail => ellipsize_start(query, query_budget)?,
         Some(query) => ellipsize_end(query, query_budget)?,
         None => String::new(),
     };
@@ -645,6 +650,71 @@ mod tests {
         assert!(row_text(&draw(&mut app, 48, 4), 2).ends_with("— searching"));
         app.advance_background().unwrap();
         assert!(row_text(&draw(&mut app, 48, 4), 2).ends_with("— no matches"));
+    }
+
+    #[test]
+    fn long_search_drafts_keep_the_latest_text_visible() {
+        let state = RenderState {
+            filename: "book.txt",
+            path: "/tmp/book.txt",
+            rows: RenderRowsView::empty(),
+            progress: 12,
+            current_line: Some(7),
+            total_lines: Some(9),
+            status: SearchStatus::Draft {
+                draft: "abcdefghij",
+                limit_hit: false,
+            },
+        };
+
+        assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /…efghij");
+    }
+
+    #[test]
+    fn search_draft_clipping_preserves_unicode_graphemes_and_limit_notice() {
+        let state = RenderState {
+            filename: "book.txt",
+            path: "/tmp/book.txt",
+            rows: RenderRowsView::empty(),
+            progress: 12,
+            current_line: Some(7),
+            total_lines: Some(9),
+            status: SearchStatus::Draft {
+                draft: "prefixe\u{301}終",
+                limit_hit: false,
+            },
+        };
+        assert_eq!(status_text(&state, 15).unwrap(), "12%  7/9  /…e\u{301}終");
+
+        let state = RenderState {
+            status: SearchStatus::Draft {
+                draft: "abcdefghijklmnopqrstuvwxyz",
+                limit_hit: true,
+            },
+            ..state
+        };
+        let status = status_text(&state, 48).unwrap();
+        assert!(status.contains("/…qrstuvwxyz"), "{status:?}");
+        assert!(status.ends_with(" — query limit: 4096 bytes"));
+    }
+
+    #[test]
+    fn committed_searches_keep_the_query_prefix_visible() {
+        let state = RenderState {
+            filename: "book.txt",
+            path: "/tmp/book.txt",
+            rows: RenderRowsView::empty(),
+            progress: 12,
+            current_line: Some(7),
+            total_lines: Some(9),
+            status: SearchStatus::Committed {
+                query: "abcdefghij",
+                no_matches: false,
+                searching: false,
+            },
+        };
+
+        assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /abcdef…");
     }
 
     #[test]
