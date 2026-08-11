@@ -1,4 +1,4 @@
-use std::{mem::size_of, ops::Range};
+use std::{mem::size_of, num::NonZeroU16, ops::Range};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -23,6 +23,7 @@ use crate::document::SOURCE_WINDOW_BYTES;
 pub(super) const MIN_TERMINAL_COLUMNS: u16 = 16;
 pub(super) const MIN_TERMINAL_ROWS: u16 = 4;
 pub(super) const SEARCH_DRAFT_LIMIT_BYTES: usize = MAX_SEARCH_QUERY_BYTES;
+pub(super) const MAX_REPEAT_COUNT: u16 = 9_999;
 const CHROME_ROWS: u16 = 3;
 const MAX_VISIBLE_RENDER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TRANSIENT_RENDER_TEXT_BYTES: usize =
@@ -91,6 +92,9 @@ impl Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
     Resize(Geometry),
+    RepeatDigit(u8),
+    RepeatBackspace,
+    RepeatCancel,
     LineDown,
     LineUp,
     PageDown,
@@ -147,6 +151,22 @@ pub(super) enum SearchStatus<'a> {
         draft: &'a str,
         limit_hit: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RepeatStatus {
+    value: NonZeroU16,
+    limit_hit: bool,
+}
+
+impl RepeatStatus {
+    pub(super) const fn value(self) -> u16 {
+        self.value.get()
+    }
+
+    pub(super) const fn limit_hit(self) -> bool {
+        self.limit_hit
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +530,7 @@ pub(super) struct RenderState<'a> {
     pub status: SearchStatus<'a>,
     pub activity: Option<ViewActivity>,
     pub boundary: Option<ViewportBoundary>,
+    pub repeat: Option<RepeatStatus>,
 }
 
 #[derive(Debug)]
@@ -517,6 +538,7 @@ pub(super) struct PendingState<'a> {
     pub filename: &'a str,
     pub path: &'a str,
     pub status: SearchStatus<'a>,
+    pub repeat: Option<RepeatStatus>,
 }
 
 #[derive(Debug)]
@@ -659,6 +681,7 @@ pub(super) struct App {
     line_position_cache: Option<CachedLinePosition>,
     queued_rows: i64,
     search_turn: bool,
+    repeat: Option<RepeatStatus>,
 }
 
 #[cfg(test)]
@@ -689,6 +712,7 @@ impl App {
             line_position_cache: None,
             queued_rows: 0,
             search_turn: true,
+            repeat: None,
         }
     }
 
@@ -698,6 +722,15 @@ impl App {
 
     pub(super) fn mode(&self) -> &Mode {
         &self.mode
+    }
+
+    pub(super) const fn repeat_active(&self) -> bool {
+        self.repeat.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn repeat_status(&self) -> Option<RepeatStatus> {
+        self.repeat
     }
 
     #[cfg(test)]
@@ -817,6 +850,7 @@ impl App {
             status: self.search_status(),
             activity: self.view_activity(),
             boundary,
+            repeat: self.repeat,
         })
     }
 
@@ -842,6 +876,7 @@ impl App {
                 filename: self.document.display_name(),
                 path: self.document.display_path(),
                 status: self.search_status(),
+                repeat: self.repeat,
             }));
         }
         self.render_state().map(ViewState::Reader)
@@ -1189,12 +1224,19 @@ impl App {
         let helping = self.mode.is_help();
         let changed = match action {
             Action::Resize(geometry) => self.resize(geometry),
-            Action::LineDown if reading => self.move_rows(true, 1),
-            Action::LineUp if reading => self.move_rows(false, 1),
-            Action::PageDown if reading => self.move_rows(true, self.page_amount()),
-            Action::PageUp if reading => self.move_rows(false, self.page_amount()),
-            Action::HalfPageDown if reading => self.move_rows(true, self.half_page_amount()),
-            Action::HalfPageUp if reading => self.move_rows(false, self.half_page_amount()),
+            Action::RepeatDigit(digit) if reading => self.insert_repeat_digit(digit),
+            Action::RepeatBackspace if reading => self.backspace_repeat(),
+            Action::RepeatCancel if reading => self.cancel_repeat(),
+            Action::LineDown if reading => self.move_rows_repeated(true, 1),
+            Action::LineUp if reading => self.move_rows_repeated(false, 1),
+            Action::PageDown if reading => self.move_rows_repeated(true, self.page_amount()),
+            Action::PageUp if reading => self.move_rows_repeated(false, self.page_amount()),
+            Action::HalfPageDown if reading => {
+                self.move_rows_repeated(true, self.half_page_amount())
+            }
+            Action::HalfPageUp if reading => {
+                self.move_rows_repeated(false, self.half_page_amount())
+            }
             Action::DocumentStart if reading => self.document_start(),
             Action::DocumentEnd if reading => self.document_end(),
             Action::BeginSearch if reading => self.begin_search(),
@@ -1203,8 +1245,8 @@ impl App {
             Action::SearchCommit if editing => self.commit_search()?,
             Action::SearchCancel if editing => self.cancel_search(),
             Action::SearchCancel if reading => self.cancel_committed_search(),
-            Action::NextMatch if reading => self.select_match(true)?,
-            Action::PreviousMatch if reading => self.select_match(false)?,
+            Action::NextMatch if reading => self.select_match_repeated(true)?,
+            Action::PreviousMatch if reading => self.select_match_repeated(false)?,
             Action::ShowHelp if content => self.show_help(),
             Action::DismissHelp if helping => self.dismiss_help(),
             _ => false,
@@ -1232,10 +1274,77 @@ impl App {
         usize::from((self.geometry.body_height().expect("usable geometry").get() / 2).max(1))
     }
 
+    fn insert_repeat_digit(&mut self, digit: u8) -> bool {
+        if digit > 9 {
+            return false;
+        }
+        let Some(repeat) = self.repeat.as_mut() else {
+            let Some(value) = (digit != 0)
+                .then(|| NonZeroU16::new(u16::from(digit)))
+                .flatten()
+            else {
+                return false;
+            };
+            self.repeat = Some(RepeatStatus {
+                value,
+                limit_hit: false,
+            });
+            return true;
+        };
+
+        let next = u32::from(repeat.value.get()) * 10 + u32::from(digit);
+        if next > u32::from(MAX_REPEAT_COUNT) {
+            let changed = !repeat.limit_hit;
+            repeat.limit_hit = true;
+            return changed;
+        }
+        repeat.value = NonZeroU16::new(
+            u16::try_from(next).expect("bounded repeat counts fit unsigned 16-bit integers"),
+        )
+        .expect("appending a repeat digit preserves a nonzero count");
+        repeat.limit_hit = false;
+        true
+    }
+
+    fn backspace_repeat(&mut self) -> bool {
+        let Some(repeat) = self.repeat.as_mut() else {
+            return false;
+        };
+        if repeat.limit_hit {
+            repeat.limit_hit = false;
+            return true;
+        }
+        let previous = repeat.value.get() / 10;
+        if let Some(value) = NonZeroU16::new(previous) {
+            repeat.value = value;
+        } else {
+            self.repeat = None;
+        }
+        true
+    }
+
+    fn cancel_repeat(&mut self) -> bool {
+        self.repeat.take().is_some()
+    }
+
+    fn take_repeat_count(&mut self) -> (usize, bool) {
+        self.repeat
+            .take()
+            .map_or((1, false), |repeat| (usize::from(repeat.value.get()), true))
+    }
+
+    fn move_rows_repeated(&mut self, downward: bool, amount: usize) -> bool {
+        let (repeat, consumed) = self.take_repeat_count();
+        let amount = amount
+            .checked_mul(repeat)
+            .expect("bounded repeat counts and terminal heights fit viewport row counts");
+        self.move_rows(downward, amount) || consumed
+    }
+
     fn resize(&mut self, geometry: Geometry) -> bool {
         let geometry_changed = self.geometry != geometry;
         if !geometry_changed {
-            return false;
+            return !geometry.is_usable() && self.cancel_repeat();
         }
         self.render_body = RenderBody::Empty;
         if let Some(search) = &mut self.search {
@@ -1249,6 +1358,7 @@ impl App {
         self.locator = None;
 
         if !geometry.is_usable() {
+            self.cancel_repeat();
             if self.follow_end && self.viewport_request.is_none() {
                 self.viewport_request = Some(ViewportRequest::End);
                 self.follow_end = false;
@@ -1298,6 +1408,7 @@ impl App {
     }
 
     fn document_start(&mut self) -> bool {
+        let canceled_repeat = self.cancel_repeat();
         let source_start = self.document.source_start();
         let anchor_changed = self.anchor != source_start;
         let canceled_render = anchor_changed && self.cancel_render_scan();
@@ -1307,7 +1418,8 @@ impl App {
             || canceled_viewport
             || canceled_search
             || anchor_changed
-            || self.follow_end;
+            || self.follow_end
+            || canceled_repeat;
         self.anchor = source_start;
         self.anchor_is_row_start = true;
         self.follow_end = false;
@@ -1315,12 +1427,13 @@ impl App {
     }
 
     fn document_end(&mut self) -> bool {
+        let canceled_repeat = self.cancel_repeat();
         let canceled_search = self.cancel_search_motion();
         if self.viewport_request == Some(ViewportRequest::End) {
-            return canceled_search;
+            return canceled_search || canceled_repeat;
         }
         if self.follow_end && self.viewport_request.is_none() {
-            return canceled_search;
+            return canceled_search || canceled_repeat;
         }
         self.cancel_render_scan();
         self.cancel_viewport_request();
@@ -1375,6 +1488,7 @@ impl App {
     }
 
     fn begin_search(&mut self) -> bool {
+        self.cancel_repeat();
         if !matches!(self.viewport_request, Some(ViewportRequest::Reflow { .. })) {
             self.cancel_viewport_request();
         }
@@ -1390,6 +1504,7 @@ impl App {
     }
 
     fn show_help(&mut self) -> bool {
+        self.cancel_repeat();
         let Mode::Content(return_to) =
             std::mem::replace(&mut self.mode, Mode::Content(ContentMode::Reading))
         else {
@@ -1476,12 +1591,21 @@ impl App {
         Ok(true)
     }
 
-    fn select_match(&mut self, forward: bool) -> Result<bool, TutError> {
+    fn select_match_repeated(&mut self, forward: bool) -> Result<bool, TutError> {
+        let (count, consumed) = self.take_repeat_count();
+        let changed = self.select_match(
+            forward,
+            u16::try_from(count).expect("repeat counts fit unsigned 16-bit integers"),
+        )?;
+        Ok(changed || consumed)
+    }
+
+    fn select_match(&mut self, forward: bool, count: u16) -> Result<bool, TutError> {
         let Some(search) = self.search.as_mut() else {
             return Ok(false);
         };
         let mut reader = self.document.reader(&mut self.search_cache);
-        if !search.request_navigation(&mut reader, forward)? {
+        if !search.request_navigation(&mut reader, forward, count)? {
             return Ok(false);
         }
         self.cancel_viewport_request();
@@ -2123,6 +2247,16 @@ mod tests {
             app.update(Action::SearchInsert(character)).unwrap();
         }
         app.update(Action::SearchCommit).unwrap();
+    }
+
+    fn enter_repeat(app: &mut App, digits: &str) {
+        for digit in digits.chars() {
+            app.update(Action::RepeatDigit(
+                u8::try_from(digit.to_digit(10).expect("repeat fixtures use digits"))
+                    .expect("decimal digits fit u8"),
+            ))
+            .unwrap();
+        }
     }
 
     fn commit(app: &mut App, query: &str) {
@@ -2793,6 +2927,174 @@ mod tests {
     }
 
     #[test]
+    fn repeat_prefix_is_bounded_editable_and_explicitly_cancelable() {
+        let mut app = reader("body", 16, 4);
+
+        assert_eq!(
+            app.update(Action::RepeatDigit(0)).unwrap(),
+            Outcome::Unchanged
+        );
+        assert_eq!(app.repeat_status(), None);
+        enter_repeat(&mut app, "9999");
+        assert_eq!(
+            app.repeat_status(),
+            Some(RepeatStatus {
+                value: NonZeroU16::new(MAX_REPEAT_COUNT).unwrap(),
+                limit_hit: false,
+            })
+        );
+
+        assert_eq!(
+            app.update(Action::RepeatDigit(0)).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(app.repeat_status().unwrap().value(), MAX_REPEAT_COUNT);
+        assert!(app.repeat_status().unwrap().limit_hit());
+        assert_eq!(
+            app.update(Action::RepeatDigit(1)).unwrap(),
+            Outcome::Unchanged
+        );
+
+        assert_eq!(
+            app.update(Action::RepeatBackspace).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(app.repeat_status().unwrap().value(), MAX_REPEAT_COUNT);
+        assert!(!app.repeat_status().unwrap().limit_hit());
+        assert_eq!(
+            app.update(Action::RepeatBackspace).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(app.repeat_status().unwrap().value(), 999);
+        for expected in [99, 9] {
+            app.update(Action::RepeatBackspace).unwrap();
+            assert_eq!(app.repeat_status().unwrap().value(), expected);
+        }
+        app.update(Action::RepeatBackspace).unwrap();
+        assert_eq!(app.repeat_status(), None);
+        assert_eq!(
+            app.update(Action::RepeatBackspace).unwrap(),
+            Outcome::Unchanged
+        );
+
+        enter_repeat(&mut app, "12");
+        assert_eq!(app.update(Action::RepeatCancel).unwrap(), Outcome::Changed);
+        assert_eq!(app.repeat_status(), None);
+    }
+
+    #[test]
+    fn counted_relative_moves_batch_into_the_existing_row_queue() {
+        let text = (0..30).map(|line| format!("{line}\n")).collect::<String>();
+
+        let mut lines = reader(&text, 16, 6);
+        enter_repeat(&mut lines, "9");
+        assert_eq!(lines.update(Action::LineDown).unwrap(), Outcome::Changed);
+        assert_eq!(lines.queued_rows, 6);
+        assert!(matches!(
+            lines.viewport_request,
+            Some(ViewportRequest::Move {
+                delta: RowDelta::Forward(3),
+                ..
+            })
+        ));
+        settle(&mut lines);
+        assert_eq!(lines.render_state().unwrap().current_line, Some(10));
+        assert_eq!(lines.repeat_status(), None);
+
+        let mut pages = reader(&text, 16, 6);
+        enter_repeat(&mut pages, "2");
+        pages.update(Action::PageDown).unwrap();
+        settle(&mut pages);
+        assert_eq!(pages.render_state().unwrap().current_line, Some(5));
+
+        let mut halves = reader(&text, 16, 7);
+        enter_repeat(&mut halves, "3");
+        halves.update(Action::HalfPageDown).unwrap();
+        settle(&mut halves);
+        assert_eq!(halves.render_state().unwrap().current_line, Some(7));
+
+        let mut resized_pages = reader(&text, 16, 6);
+        enter_repeat(&mut resized_pages, "2");
+        resized_pages
+            .update(Action::Resize(Geometry::new(20, 7)))
+            .unwrap();
+        settle(&mut resized_pages);
+        assert_eq!(resized_pages.repeat_status().unwrap().value(), 2);
+        resized_pages.update(Action::PageDown).unwrap();
+        settle(&mut resized_pages);
+        assert_eq!(resized_pages.render_state().unwrap().current_line, Some(7));
+    }
+
+    #[test]
+    fn counted_match_navigation_batches_and_wraps_in_both_directions() {
+        let mut app = reader("x x x x x", 16, 4);
+        commit(&mut app, "x");
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::ZERO);
+
+        enter_repeat(&mut app, "3");
+        app.update(Action::NextMatch).unwrap();
+        assert_eq!(app.search.as_ref().unwrap().pending_navigation(), 3);
+        settle(&mut app);
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(6));
+
+        enter_repeat(&mut app, "4");
+        app.update(Action::PreviousMatch).unwrap();
+        assert_eq!(app.search.as_ref().unwrap().pending_navigation(), -4);
+        settle(&mut app);
+        assert_eq!(app.current_match().unwrap().start(), SourceOffset::new(8));
+        assert_eq!(app.repeat_status(), None);
+    }
+
+    #[test]
+    fn absolute_modes_and_tiny_resize_clear_repeat_while_usable_resize_preserves_it() {
+        let mut app = reader("0\n1\n2\n3\n4", 16, 6);
+        enter_repeat(&mut app, "12");
+        app.update(Action::Resize(Geometry::new(20, 6))).unwrap();
+        assert_eq!(app.repeat_status().unwrap().value(), 12);
+
+        app.update(Action::DocumentEnd).unwrap();
+        assert_eq!(app.repeat_status(), None);
+        settle(&mut app);
+        enter_repeat(&mut app, "2");
+        app.update(Action::DocumentStart).unwrap();
+        assert_eq!(app.repeat_status(), None);
+
+        enter_repeat(&mut app, "3");
+        app.update(Action::BeginSearch).unwrap();
+        assert_eq!(app.repeat_status(), None);
+        assert!(matches!(
+            app.mode(),
+            Mode::Content(ContentMode::SearchInput { .. })
+        ));
+        app.update(Action::SearchCancel).unwrap();
+
+        enter_repeat(&mut app, "4");
+        app.update(Action::ShowHelp).unwrap();
+        assert_eq!(app.repeat_status(), None);
+        app.update(Action::DismissHelp).unwrap();
+
+        enter_repeat(&mut app, "5");
+        app.update(Action::Resize(Geometry::new(15, 6))).unwrap();
+        assert!(app.terminal_too_small());
+        assert_eq!(app.repeat_status(), None);
+    }
+
+    #[test]
+    fn repeat_cancel_precedes_clearing_a_committed_search() {
+        let mut app = reader("cat dog cat", 16, 4);
+        commit(&mut app, "cat");
+        enter_repeat(&mut app, "2");
+
+        app.update(Action::RepeatCancel).unwrap();
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Committed { .. }
+        ));
+        app.update(Action::SearchCancel).unwrap();
+        assert_eq!(app.search_status(), SearchStatus::None);
+    }
+
+    #[test]
     fn moves_during_pending_width_reflow_relocate_the_old_anchor() {
         let mut app = reader(&"x".repeat(1024), 20, 7);
         app.anchor = SourceOffset::new(40);
@@ -3138,7 +3440,7 @@ mod tests {
             app.search
                 .as_mut()
                 .unwrap()
-                .request_navigation(&mut reader, true)
+                .request_navigation(&mut reader, true, 1)
                 .unwrap()
         };
         assert!(requested);

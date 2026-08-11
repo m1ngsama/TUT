@@ -834,6 +834,7 @@ mod pty {
             match line {
                 0 => text.push_str("START_SENTINEL\n"),
                 30 => text.push_str("hit ALPHA_SENTINEL\n"),
+                50 => text.push_str("hit MIDDLE_SENTINEL\n"),
                 70 => text.push_str("hit BETA_SENTINEL\n"),
                 99 => text.push_str("END_SENTINEL\n"),
                 _ => text.push_str("ordinary line\n"),
@@ -847,7 +848,7 @@ mod pty {
         pty.wait_for(b"END_SENTINEL").unwrap();
         pty.master.write_all(b"/hit\r").unwrap();
         pty.wait_for(b"ALPHA_SENTINEL").unwrap();
-        pty.master.write_all(b"n").unwrap();
+        pty.master.write_all(b"2n").unwrap();
         pty.wait_for(b"BETA_SENTINEL").unwrap();
         pty.master.write_all(b"q").unwrap();
 
