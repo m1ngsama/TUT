@@ -3,12 +3,16 @@ SHELL = /bin/sh
 prefix ?= /usr/local
 exec_prefix ?= $(prefix)
 bindir ?= $(exec_prefix)/bin
+datarootdir ?= $(prefix)/share
+mandir ?= $(datarootdir)/man
+man1dir ?= $(mandir)/man1
 
 CARGO ?= cargo
 CARGO_TARGET_DIR ?= target
 CARGO_BUILD_TARGET ?=
 INSTALL ?= install
 INSTALL_PROGRAM ?= $(INSTALL)
+INSTALL_DATA ?= $(INSTALL) -m 644
 MKDIR_P ?= $(INSTALL) -d
 RM ?= rm -f
 STRIP ?= strip
@@ -16,6 +20,7 @@ STRIP ?= strip
 CARGO_TARGET_OPTION = $(if $(strip $(CARGO_BUILD_TARGET)),--target $(CARGO_BUILD_TARGET))
 TARGET_RELEASE_DIR = $(CARGO_TARGET_DIR)/$(if $(strip $(CARGO_BUILD_TARGET)),$(CARGO_BUILD_TARGET)/)release
 PROGRAM = $(TARGET_RELEASE_DIR)/tut
+MANPAGE = docs/tut.1
 PACKAGE_VERSION = $(shell $(CARGO) pkgid --locked 2>/dev/null | sed 's/.*[@:]//')
 DIST_ARCHIVE = $(CARGO_TARGET_DIR)/package/tut-$(PACKAGE_VERSION).crate
 
@@ -32,9 +37,11 @@ release-check:
 
 installdirs:
 	$(MKDIR_P) "$(DESTDIR)$(bindir)"
+	$(MKDIR_P) "$(DESTDIR)$(man1dir)"
 
 install: all installdirs
 	$(INSTALL_PROGRAM) -m 755 "$(PROGRAM)" "$(DESTDIR)$(bindir)/tut"
+	$(INSTALL_DATA) "$(MANPAGE)" "$(DESTDIR)$(man1dir)/tut.1"
 
 install-strip: install
 	$(STRIP) "$(DESTDIR)$(bindir)/tut"
@@ -42,9 +49,12 @@ install-strip: install
 installcheck:
 	test "$$("$(DESTDIR)$(bindir)/tut" --version | sed -n '1p')" = "tut (TUT) $(PACKAGE_VERSION)"
 	"$(DESTDIR)$(bindir)/tut" --help >/dev/null
+	test -s "$(DESTDIR)$(man1dir)/tut.1"
+	cmp "$(MANPAGE)" "$(DESTDIR)$(man1dir)/tut.1"
 
 uninstall:
 	$(RM) "$(DESTDIR)$(bindir)/tut"
+	$(RM) "$(DESTDIR)$(man1dir)/tut.1"
 
 dist:
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) package --locked
@@ -59,7 +69,8 @@ distcheck: dist
 	$(MAKE) check release-check CARGO="$(CARGO)" CARGO_TARGET_DIR="$$work/target"; \
 	$(MAKE) install installcheck CARGO="$(CARGO)" CARGO_TARGET_DIR="$$work/target" DESTDIR="$$work/stage" prefix=/usr; \
 	$(MAKE) uninstall DESTDIR="$$work/stage" prefix=/usr; \
-	test ! -e "$$work/stage/usr/bin/tut"
+	test ! -e "$$work/stage/usr/bin/tut"; \
+	test ! -e "$$work/stage/usr/share/man/man1/tut.1"
 
 mostlyclean: clean
 

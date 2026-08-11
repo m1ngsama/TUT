@@ -6,6 +6,8 @@ rust-version = "1.88.0"
 publish = false
 license = "MIT"
 repository = "https://github.com/m1ngsama/TUT"
+homepage = "https://github.com/m1ngsama/TUT"
+readme = "README.md"
 description = "A local plain-text reader for the terminal"
 
 [dependencies]

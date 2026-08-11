@@ -1,0 +1,237 @@
+.TH TUT 1 "August 11, 2026" "TUT" "User Commands"
+.SH NAME
+tut \- read UTF-8 text in the terminal
+.SH SYNOPSIS
+.B tut
+.RI [ OPTION ]... " FILE"
+.SH DESCRIPTION
+.B tut
+is a full-screen reader for local, plain UTF-8 text.
+It displays the document with Unicode-aware soft wrapping and provides
+line, page, document, and literal-search navigation.
+.PP
+The contents of the document are treated as text, not as terminal commands.
+Terminal control characters are displayed as replacement characters rather
+than executed.
+.PP
+When
+.I FILE
+names a path, it must be a regular file and both standard input and standard
+output must be terminals.
+The file is checked while it is read; if it changes during the session,
+.B tut
+reports an error instead of combining inconsistent contents.
+.PP
+When
+.I FILE
+is
+.BR \- ,
+.B tut
+reads standard input completely into a private temporary snapshot before
+opening the reader.
+Standard output must still be a terminal.
+If standard input is not a terminal, interactive commands are read from the
+controlling terminal through
+.BR /dev/tty .
+Consequently, a producer that does not close its output will delay the start
+of the interactive reader.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Display a short help message and exit.
+.TP
+.BR \-V ", " \-\-version
+Display version, copyright, and license information and exit.
+.TP
+.BR \-\-log-file = FILE
+Append typed session and runtime events to
+.IR FILE .
+The log contains aggregate event and timing data, not document contents or
+the document pathname.
+An existing log must be a regular file accessible only by its owner.
+The log must not be a standard stream or the input document.
+The pathname may instead be supplied as the following argument, as in
+.BR "\-\-log-file FILE" .
+.TP
+.B \-\-
+End option processing.
+Use this before a pathname that begins with a hyphen.
+.SH OPERANDS
+.TP
+.I FILE
+The regular UTF-8 text file to read.
+Specify
+.B \-
+to read standard input.
+To read a file literally named
+.BR \- ,
+use a pathname such as
+.BR ./\- .
+Exactly one operand is required.
+.SH INTERACTIVE COMMANDS
+.SS Repeat counts
+A count from 1 through 9999 may precede a relative navigation command.
+For example,
+.B 12j
+moves down twelve visual lines and
+.B 5n
+selects the fifth following search match.
+Zero may extend a count but does not begin one.
+.B Backspace
+edits an active count, and
+.B Esc
+cancels it.
+Any digit that would make the count exceed 9999 is rejected.
+.SS Navigation
+.TP
+.BR j ", " Down
+Move down one visual line.
+.TP
+.BR k ", " Up
+Move up one visual line.
+.TP
+.BR Space ", " PageDown ", " Ctrl-F
+Move forward one page.
+.TP
+.BR b ", " PageUp ", " Ctrl-B
+Move backward one page.
+.TP
+.BR Ctrl-D ", " Ctrl-U
+Move forward or backward one half page.
+.TP
+.BR g ", " Home
+Move to the start of the document.
+.TP
+.BR G ", " End
+Move to the end of the document.
+.SS Search
+Searches find literal, case-sensitive, non-overlapping UTF-8 substrings.
+Match navigation wraps at the ends of the document.
+.TP
+.B /
+Begin entering a search query.
+.TP
+.B Enter
+Apply the search query.
+An empty query clears the current search.
+.TP
+.B Backspace
+Remove the last grapheme from the search draft.
+.TP
+.B Up
+Recall the committed query when the search draft is empty.
+.TP
+.B Ctrl-U
+Clear the search draft.
+.TP
+.B Esc
+Cancel search entry without replacing the committed query.
+In reader mode, clear the committed search and its highlights.
+.TP
+.B n
+Select the next match.
+.TP
+.B N
+Select the previous match.
+.SS General
+.TP
+.B F1
+Open or close the built-in keyboard help.
+.B Esc
+also closes help;
+.B q
+closes help when it was opened from reader mode.
+.TP
+.B q
+Quit normally from reader mode.
+It also remains available while the terminal is too small to display the
+reader.
+.TP
+.B Ctrl-C
+Request interruption.
+After successful session logging and terminal cleanup, exit with status 130.
+.SH ENVIRONMENT
+.TP
+.B TUT_LOG_FILE
+Use its nonempty value as the session log pathname when
+.B \-\-log-file
+was not specified.
+The command-line option takes precedence.
+.SH FILES
+.TP
+.B /dev/tty
+The controlling terminal used for interactive commands when document data is
+read from nonterminal standard input.
+.PP
+.B tut
+does not read a configuration file and does not create a default log file.
+.SH LIMITS
+.IP \(bu 2
+The input document or standard-input snapshot may contain at most 33,554,432
+bytes (32 MiB) and must be valid UTF-8.
+.IP \(bu 2
+Search queries may contain at most 4096 UTF-8 bytes.
+.IP \(bu 2
+Repeat counts are limited to 9999.
+.IP \(bu 2
+A grapheme longer than 1024 UTF-8 bytes is safely replaced instead of being
+rendered verbatim.
+.IP \(bu 2
+The complete reader requires a terminal of at least 16 columns by 4 rows.
+Smaller terminals display resize and quit guidance.
+.IP \(bu 2
+Terminal geometry is limited to 524,288 cells.
+The two fixed cell vectors are also subject to a 64 MiB accounting budget;
+this is not a limit on total process memory or on heap-backed cell symbols.
+.IP \(bu 2
+Visible rendered content is limited to 32 MiB.
+.IP \(bu 2
+The implementation requires Unix terminal interfaces.
+Automated compatibility testing currently covers Linux and macOS.
+.SH EXIT STATUS
+.TP
+.B 0
+The reader or an information option completed successfully.
+.TP
+.B 1
+An input, terminal, rendering, search, logging, allocation, or output error
+occurred.
+.TP
+.B 2
+The command line was invalid.
+.TP
+.B 129, 130, 131, 143
+The active session received SIGHUP, SIGINT, SIGQUIT, or SIGTERM,
+respectively, and cleanup completed successfully.
+.SH SIGNALS
+During an active session,
+.B tut
+handles SIGHUP, SIGINT, SIGQUIT, and SIGTERM and attempts to restore the
+cursor, alternate screen, terminal mode, and installed signal handlers before
+exiting.
+.PP
+On SIGTSTP,
+.B tut
+restores the terminal before stopping.
+After SIGCONT it re-enters the interactive screen and redraws the document.
+.SH BUGS
+Report bugs at
+.UR https://github.com/m1ngsama/TUT/issues
+the TUT issue tracker
+.UE .
+Include the output of
+.B tut \-\-version
+and the operating system and terminal in the report.
+.SH SEE ALSO
+.BR cat (1),
+.BR less (1),
+.BR more (1)
+.PP
+Project home page:
+.UR https://github.com/m1ngsama/TUT
+the TUT source repository
+.UE
+.SH COPYRIGHT
+Copyright \(co 2024\-2026 m1ngsama.
+.br
+Licensed under the MIT License.
