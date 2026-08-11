@@ -386,7 +386,9 @@ impl SearchSession {
         &mut self,
         reader: &mut DocumentReader<'_>,
         forward: bool,
+        count: u16,
     ) -> Result<bool, TutError> {
+        debug_assert!(count > 0);
         if reader.document_id() != self.index.document_id {
             return Err(SearchError::SourceMismatch.into());
         }
@@ -398,10 +400,11 @@ impl SearchSession {
             self.jump_pending = true;
         }
         self.cancel_pending_highlights();
+        let count = i64::from(count);
         self.pending_navigation = if forward {
-            self.pending_navigation.saturating_add(1)
+            self.pending_navigation.saturating_add(count)
         } else {
-            self.pending_navigation.saturating_sub(1)
+            self.pending_navigation.saturating_sub(count)
         };
         Ok(true)
     }
@@ -480,6 +483,11 @@ impl SearchSession {
     #[cfg(test)]
     pub(super) const fn jump_pending(&self) -> bool {
         self.jump_pending
+    }
+
+    #[cfg(test)]
+    pub(super) const fn pending_navigation(&self) -> i64 {
+        self.pending_navigation
     }
 
     #[cfg(test)]
@@ -2130,7 +2138,7 @@ mod tests {
         forward: bool,
     ) -> bool {
         let mut reader = document.reader(cache);
-        session.request_navigation(&mut reader, forward).unwrap()
+        session.request_navigation(&mut reader, forward, 1).unwrap()
     }
 
     #[test]
@@ -2221,7 +2229,7 @@ mod tests {
         let mut reader = second.reader(&mut second_cache);
 
         assert!(matches!(
-            session.request_navigation(&mut reader, true),
+            session.request_navigation(&mut reader, true, 1),
             Err(TutError::Search(SearchError::SourceMismatch))
         ));
         assert!(matches!(

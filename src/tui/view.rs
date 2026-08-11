@@ -12,8 +12,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     app::{
         Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, PendingState,
-        RenderProjectionKind, RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus,
-        ViewActivity, ViewState, ViewportBoundary,
+        RenderProjectionKind, RenderRow, RenderRowsView, RenderSpan, RenderState, RepeatStatus,
+        SearchStatus, ViewActivity, ViewState, ViewportBoundary,
     },
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
@@ -31,7 +31,7 @@ struct CopyTier {
 const READER_FOOTER: &[CopyTier] = &[
     CopyTier {
         min_columns: 80,
-        text: "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends",
+        text: "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  1-9 counts",
     },
     CopyTier {
         min_columns: 40,
@@ -49,7 +49,7 @@ const READER_FOOTER: &[CopyTier] = &[
 const COMMITTED_SEARCH_FOOTER: &[CopyTier] = &[
     CopyTier {
         min_columns: 80,
-        text: "Esc clear search  n/N matches  q quit  F1 help  / new search  j/k lines",
+        text: "Esc clear search  n/N matches  q quit  F1 help  / new search  1-9 counts",
     },
     CopyTier {
         min_columns: 40,
@@ -145,8 +145,9 @@ const TINY_COPY: &[CopyTier] = &[
     },
 ];
 const COMPACT_HELP: &[&str] = &[
-    "j/k or Up/Down        move by line",
+    "1-9 + j/k/page/n/N    repeat relative",
     "/ search   n/N next/previous match",
+    "j/k or Up/Down        move by line",
     "Space/b or PgDn/PgUp  move by page",
     "g/G or Home/End       document ends",
     "Ctrl-D/Ctrl-U         move by half page",
@@ -155,6 +156,7 @@ const COMPACT_HELP: &[&str] = &[
 ];
 const FULL_HELP: &[&str] = &[
     "Navigation",
+    "  1-9 then relative motion repeats it",
     "  j / Down             next line",
     "  k / Up               previous line",
     "  Space / PageDown     next page",
@@ -213,7 +215,7 @@ fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), T
 fn render_pending(frame: &mut Frame<'_>, state: &PendingState<'_>) -> Result<(), TutError> {
     let area = frame.area();
     let header_text = header_text(state.filename, state.path, area.width)?;
-    let status_text = pending_status_text(state.status, area.width)?;
+    let status_text = pending_status_text(state.status, state.repeat, area.width)?;
     let footer_text = footer_for(state.status, area.width);
     let body_height = area.height - 3;
     let header = Rect::new(area.x, area.y, area.width, 1);
@@ -463,6 +465,9 @@ fn header_text(filename: &str, path: &str, width: u16) -> Result<String, TutErro
 }
 
 fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> {
+    if let Some(repeat) = state.repeat {
+        return repeat_status_text(repeat);
+    }
     let mut prefix = String::new();
     prefix
         .try_reserve_exact(50)
@@ -484,8 +489,28 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
     compose_status(prefix, state.status, state.activity, width)
 }
 
-fn pending_status_text(status: SearchStatus<'_>, width: u16) -> Result<String, TutError> {
+fn pending_status_text(
+    status: SearchStatus<'_>,
+    repeat: Option<RepeatStatus>,
+    width: u16,
+) -> Result<String, TutError> {
+    if let Some(repeat) = repeat {
+        return repeat_status_text(repeat);
+    }
     compose_status(String::new(), status, None, width)
+}
+
+fn repeat_status_text(repeat: RepeatStatus) -> Result<String, TutError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(16)
+        .map_err(|_| TutError::Allocation("repeat status text"))?;
+    write!(output, "count {}", repeat.value()).expect("reserved String formatting is infallible");
+    if repeat.limit_hit() {
+        output.push_str(" limit");
+    }
+    debug_assert!(display_width(&output) <= MIN_TERMINAL_COLUMNS);
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,13 +831,17 @@ mod tests {
         );
         assert_eq!(
             footer_for(SearchStatus::None, 80),
-            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends"
+            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  1-9 counts"
         );
         assert_eq!(footer_for(committed, 16), "Esc clear q quit");
         assert_eq!(footer_for(committed, 20), "Esc clear q quit n/N");
         assert_eq!(
             footer_for(committed, 40),
             "Esc clear  n/N matches  q quit  F1 help"
+        );
+        assert_eq!(
+            footer_for(committed, 80),
+            "Esc clear search  n/N matches  q quit  F1 help  / new search  1-9 counts"
         );
         assert_eq!(footer_for(draft, 16), "Esc cancel Enter");
         assert_eq!(footer_for(draft, 20), "Esc cancel  Enter F1");
@@ -837,6 +866,62 @@ mod tests {
         assert_eq!(row_text(&buffer, 3), "ALL  1/1");
         assert_eq!(
             row_text(&buffer, 4),
+            "q quit  F1 help  / search  j/k  Space/b"
+        );
+    }
+
+    #[test]
+    fn repeat_status_preempts_reader_chrome_and_clears_shorter_updates() {
+        let backend = TestBackend::new(16, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), String::new());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "ALL  1/1");
+
+        for digit in [9, 9, 9, 9, 0] {
+            app.update(Action::RepeatDigit(digit)).unwrap();
+        }
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "count 9999 limit");
+        assert_eq!(row_text(terminal.backend().buffer(), 3), "q quit  F1 help");
+
+        app.update(Action::RepeatBackspace).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "count 9999");
+        for column in 10..16 {
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 2))
+                    .unwrap()
+                    .symbol(),
+                " "
+            );
+        }
+
+        app.update(Action::RepeatBackspace).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "count 999");
+        app.update(Action::RepeatCancel).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "ALL  1/1");
+    }
+
+    #[test]
+    fn pending_shell_shows_the_active_repeat_without_document_rows() {
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "x".repeat(4096));
+        app.update(Action::Resize(Geometry::new(40, 4))).unwrap();
+        app.update(Action::RepeatDigit(1)).unwrap();
+        app.update(Action::RepeatDigit(2)).unwrap();
+        assert!(!app.frame_ready());
+
+        let buffer = draw_available(&mut app, 40, 4);
+        assert_eq!(row_text(&buffer, 1).trim(), "Preparing view…");
+        assert_eq!(row_text(&buffer, 2), "count 12");
+        assert_eq!(
+            row_text(&buffer, 3),
             "q quit  F1 help  / search  j/k  Space/b"
         );
     }
@@ -867,7 +952,7 @@ mod tests {
         draw_into(&mut terminal, &mut app);
         assert_eq!(
             row_text(terminal.backend().buffer(), 3),
-            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends"
+            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  1-9 counts"
         );
 
         terminal.backend_mut().resize(40, 4);
@@ -915,7 +1000,7 @@ mod tests {
         assert_eq!(row_text(&normal, 22), "");
         assert_eq!(
             row_text(&normal, 23),
-            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends"
+            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  1-9 counts"
         );
 
         let mut minimum = app_from_text(Path::new("/tmp/book.txt"), "x".repeat(4096));
@@ -958,8 +1043,8 @@ mod tests {
         let full = draw(&mut full, 80, 24);
         assert_eq!(row_text(&full, 0), "TUT keyboard help");
         assert_eq!(row_text(&full, 1), "Navigation");
-        assert_eq!(row_text(&full, 10), "Search");
-        assert_eq!(row_text(&full, 15), "General");
+        assert_eq!(row_text(&full, 11), "Search");
+        assert_eq!(row_text(&full, 16), "General");
         assert_eq!(row_text(&full, 23), "Esc/q/F1 close help  Ctrl-C interrupt");
 
         let mut compact = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
@@ -969,7 +1054,7 @@ mod tests {
         compact.update(Action::ShowHelp).unwrap();
         let compact = draw(&mut compact, 16, 4);
         assert!(row_text(&compact, 0).starts_with("TUT keyboard"));
-        assert!(row_text(&compact, 1).starts_with("j/k or Up/Down"));
+        assert!(row_text(&compact, 1).starts_with("1-9 + j/k"));
         assert!(row_text(&compact, 2).starts_with("/ search"));
         assert_eq!(row_text(&compact, 3), "Esc/q/F1 close");
     }
@@ -1097,6 +1182,7 @@ mod tests {
             },
             activity: None,
             boundary: None,
+            repeat: None,
         };
 
         assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /…efghij");
@@ -1117,6 +1203,7 @@ mod tests {
             },
             activity: None,
             boundary: None,
+            repeat: None,
         };
         assert_eq!(status_text(&state, 15).unwrap(), "12%  7/9  /…e\u{301}終");
 
@@ -1148,6 +1235,7 @@ mod tests {
             },
             activity: None,
             boundary: None,
+            repeat: None,
         };
 
         assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /abcdef…");
@@ -1165,6 +1253,7 @@ mod tests {
             status: SearchStatus::None,
             activity: None,
             boundary: None,
+            repeat: None,
         };
 
         assert_eq!(status_text(&state, 40).unwrap(), "12%  7/9");
@@ -1190,6 +1279,7 @@ mod tests {
             status: SearchStatus::None,
             activity: Some(ViewActivity::PreparingView),
             boundary: Some(ViewportBoundary::Top),
+            repeat: None,
         };
 
         assert_eq!(
@@ -1236,6 +1326,7 @@ mod tests {
             status: SearchStatus::None,
             activity: None,
             boundary: None,
+            repeat: None,
         };
         assert_eq!(status_text(&state, 40).unwrap(), "12%  7/?");
 
@@ -1258,6 +1349,7 @@ mod tests {
             status: SearchStatus::None,
             activity: None,
             boundary: None,
+            repeat: None,
         };
         assert_eq!(
             header_text(state.filename, state.path, 40).unwrap(),

@@ -525,7 +525,12 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
                 Ok(Outcome::Quit) => return Primary::Normal,
                 Err(error) => return Primary::Error(error),
             }
-        } else if let Some(action) = input::map_event(app.mode(), app.terminal_too_small(), event) {
+        } else if let Some(action) = input::map_event(
+            app.mode(),
+            app.repeat_active(),
+            app.terminal_too_small(),
+            event,
+        ) {
             let started = recorder.begin_operation();
             let result = app.update(action);
             recorder.finish_operation(RuntimeOperation::Action, started);
@@ -1006,6 +1011,24 @@ mod tests {
         })
     }
 
+    fn character_event(character: char) -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(character),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn repeated_character_event(character: char) -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(character),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        })
+    }
+
     fn app() -> App {
         app_from_text(Path::new("/tmp/book.txt"), "body".to_owned())
     }
@@ -1236,6 +1259,73 @@ mod tests {
                 .calls
                 .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
         );
+    }
+
+    #[test]
+    fn event_loop_consumes_count_once_then_repeated_motion_is_single_step() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.events.extend([
+            character_event('1'),
+            character_event('2'),
+            repeated_character_event('j'),
+            repeated_character_event('j'),
+            quit_event(),
+        ]);
+        let mut recorder = TraceRecorder::default();
+        let text = (0..30).map(|line| format!("{line}\n")).collect::<String>();
+        let mut app = app_from_text(Path::new("/tmp/repeat.txt"), text);
+        app.update(Action::Resize(Geometry::new(20, 4))).unwrap();
+        while !app.frame_ready() {
+            app.advance_background().unwrap();
+        }
+
+        assert_eq!(
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+        assert!(!app.repeat_active());
+        assert_eq!(recorder.events, 5);
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| *operation == RuntimeOperation::Action)
+                .count(),
+            5
+        );
+        assert!(
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| {
+                    *operation == RuntimeOperation::Background(BackgroundWork::Viewport)
+                })
+                .count()
+                <= 2
+        );
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+        assert_eq!(app.render_state().unwrap().current_line, Some(14));
+    }
+
+    #[test]
+    fn suspension_and_resume_preserve_an_active_repeat_prefix() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.extend([(20, 4), (20, 4)]);
+        driver.events.push_back(quit_event());
+        driver.inject_suspend_on = Some("poll");
+        let mut app = ready_app();
+        app.update(Action::RepeatDigit(7)).unwrap();
+
+        assert_eq!(
+            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
+            RunOutcome::Normal
+        );
+        assert_eq!(app.repeat_status().unwrap().value(), 7);
+        assert_eq!(driver.draws, [DrawKind::Reader, DrawKind::Reader]);
     }
 
     #[test]
