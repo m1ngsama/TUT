@@ -11,14 +11,16 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     app::{
-        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, RenderProjectionKind,
-        RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus, ViewState,
+        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, PendingState,
+        RenderProjectionKind, RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus,
+        ViewActivity, ViewState,
     },
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
 };
 
 const TINY_MESSAGE: &str = "terminal too small — resize";
+const PENDING_MESSAGE: &str = "Preparing view…";
 const READER_FOOTER: &str =
     "F1 help  q quit  j/k lines  Space/b pages  / search  n/N matches  g/G ends";
 const SEARCH_FOOTER: &str = "F1 help  Enter apply  Esc cancel  Backspace delete  Ctrl-C interrupt";
@@ -68,18 +70,16 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &ViewState<'_>) -> Result<(),
 
     match state {
         ViewState::Reader(state) => render_reader(frame, state),
+        ViewState::Pending(state) => render_pending(frame, state),
         ViewState::Help { q_closes } => render_help(frame, *q_closes),
     }
 }
 
 fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), TutError> {
     let area = frame.area();
-    let header_text = header_text(state, area.width)?;
+    let header_text = header_text(state.filename, state.path, area.width)?;
     let status_text = status_text(state, area.width)?;
-    let footer = match state.status {
-        SearchStatus::Draft { .. } => SEARCH_FOOTER,
-        SearchStatus::None | SearchStatus::Committed { .. } => READER_FOOTER,
-    };
+    let footer = footer_for(state.status);
     let help_text = ellipsize_end(footer, area.width)?;
     let body_height = area.height - 3;
     let header = Rect::new(area.x, area.y, area.width, 1);
@@ -92,6 +92,30 @@ fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), T
     render_projected_line(frame, status, &status_text)?;
     render_projected_line(frame, help, &help_text)?;
     Ok(())
+}
+
+fn render_pending(frame: &mut Frame<'_>, state: &PendingState<'_>) -> Result<(), TutError> {
+    let area = frame.area();
+    let header_text = header_text(state.filename, state.path, area.width)?;
+    let status_text = pending_status_text(state.status, area.width)?;
+    let footer_text = ellipsize_end(footer_for(state.status), area.width)?;
+    let body_height = area.height - 3;
+    let header = Rect::new(area.x, area.y, area.width, 1);
+    let body = Rect::new(area.x, area.y + 1, area.width, body_height);
+    let status = Rect::new(area.x, area.y + 1 + body_height, area.width, 1);
+    let footer = Rect::new(area.x, area.y + 2 + body_height, area.width, 1);
+
+    render_projected_line(frame, header, &header_text)?;
+    render_centered_line(frame, body, PENDING_MESSAGE)?;
+    render_projected_line(frame, status, &status_text)?;
+    render_projected_line(frame, footer, &footer_text)
+}
+
+const fn footer_for(status: SearchStatus<'_>) -> &'static str {
+    match status {
+        SearchStatus::Draft { .. } => SEARCH_FOOTER,
+        SearchStatus::None | SearchStatus::Committed { .. } => READER_FOOTER,
+    }
 }
 
 fn render_help(frame: &mut Frame<'_>, q_closes: bool) -> Result<(), TutError> {
@@ -274,9 +298,24 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
     Ok(())
 }
 
-fn header_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> {
-    let filename = sanitize_text(state.filename);
-    let path = sanitize_text(state.path);
+fn render_centered_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Result<(), TutError> {
+    if area.width == 0 || area.height == 0 {
+        return Ok(());
+    }
+    let shown = ellipsize_end(text, area.width)?;
+    let used = display_width(&shown);
+    let x = area.x + area.width.saturating_sub(used) / 2;
+    let y = area.y + area.height.saturating_sub(1) / 2;
+    render_projected_line(
+        frame,
+        Rect::new(x, y, area.right().saturating_sub(x), 1),
+        &shown,
+    )
+}
+
+fn header_text(filename: &str, path: &str, width: u16) -> Result<String, TutError> {
+    let filename = sanitize_text(filename);
+    let path = sanitize_text(path);
     if filename == path {
         return ellipsize_end(&filename, width);
     }
@@ -300,37 +339,6 @@ fn header_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
 }
 
 fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> {
-    let (query, suffix, preserve_query_tail) = match state.status {
-        SearchStatus::None => (None, "", false),
-        SearchStatus::Committed {
-            query,
-            searching: true,
-            ..
-        } => (Some(sanitize_text(query)), " — searching", false),
-        SearchStatus::Committed {
-            query,
-            no_matches: true,
-            searching: false,
-        } => (Some(sanitize_text(query)), " — no matches", false),
-        SearchStatus::Committed {
-            query,
-            no_matches: false,
-            searching: false,
-        } => (Some(sanitize_text(query)), "", false),
-        SearchStatus::Draft {
-            draft,
-            limit_hit: false,
-        } => (Some(sanitize_text(draft)), "", true),
-        SearchStatus::Draft {
-            draft,
-            limit_hit: true,
-        } => (
-            Some(sanitize_text(draft)),
-            " — query limit: 4096 bytes",
-            true,
-        ),
-    };
-
     let mut prefix = String::new();
     prefix
         .try_reserve_exact(50)
@@ -344,10 +352,118 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
         (None, None) => write!(prefix, "{}%  ?/?", state.progress.min(100)),
     }
     .expect("reserved String formatting is infallible");
-    if query.is_some() {
-        prefix.push_str("  /");
+    compose_status(prefix, state.status, state.activity, width)
+}
+
+fn pending_status_text(status: SearchStatus<'_>, width: u16) -> Result<String, TutError> {
+    compose_status(String::new(), status, None, width)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusNotice {
+    Searching,
+    NoMatches,
+    QueryLimit,
+    PreparingView,
+    GoingToEnd,
+}
+
+impl StatusNotice {
+    const fn text(self) -> &'static str {
+        match self {
+            Self::Searching => "searching",
+            Self::NoMatches => "no matches",
+            Self::QueryLimit => "query limit: 4096 bytes",
+            Self::PreparingView => "preparing view",
+            Self::GoingToEnd => "going to end",
+        }
     }
+
+    const fn compact_text(self) -> &'static str {
+        match self {
+            Self::QueryLimit => "query limit",
+            _ => self.text(),
+        }
+    }
+
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Searching => " — searching",
+            Self::NoMatches => " — no matches",
+            Self::QueryLimit => " — query limit: 4096 bytes",
+            Self::PreparingView => " — preparing view",
+            Self::GoingToEnd => " — going to end",
+        }
+    }
+}
+
+fn compose_status(
+    mut prefix: String,
+    status: SearchStatus<'_>,
+    activity: Option<ViewActivity>,
+    width: u16,
+) -> Result<String, TutError> {
+    let (query, search_notice, preserve_query_tail) = match status {
+        SearchStatus::None => (None, None, false),
+        SearchStatus::Committed {
+            query,
+            searching: true,
+            ..
+        } => (
+            Some(sanitize_text(query)),
+            Some(StatusNotice::Searching),
+            false,
+        ),
+        SearchStatus::Committed {
+            query,
+            no_matches: true,
+            searching: false,
+        } => (
+            Some(sanitize_text(query)),
+            Some(StatusNotice::NoMatches),
+            false,
+        ),
+        SearchStatus::Committed {
+            query,
+            no_matches: false,
+            searching: false,
+        } => (Some(sanitize_text(query)), None, false),
+        SearchStatus::Draft {
+            draft,
+            limit_hit: false,
+        } => (Some(sanitize_text(draft)), None, true),
+        SearchStatus::Draft {
+            draft,
+            limit_hit: true,
+        } => (
+            Some(sanitize_text(draft)),
+            Some(StatusNotice::QueryLimit),
+            true,
+        ),
+    };
+    let notice = search_notice.or_else(|| {
+        activity.map(|activity| match activity {
+            ViewActivity::PreparingView => StatusNotice::PreparingView,
+            ViewActivity::GoingToEnd => StatusNotice::GoingToEnd,
+        })
+    });
+
+    if query.is_some() {
+        prefix.push_str(if prefix.is_empty() { "/" } else { "  /" });
+    }
+    let suffix = notice.map_or("", StatusNotice::suffix);
     let fixed_width = display_width(&prefix).saturating_add(display_width(suffix));
+    if fixed_width > width {
+        if let Some(notice) = notice {
+            let notice = if display_width(notice.text()) <= width {
+                notice.text()
+            } else {
+                notice.compact_text()
+            };
+            return ellipsize_end(notice, width);
+        }
+        return ellipsize_end(&prefix, width);
+    }
     let query_budget = width.saturating_sub(fixed_width);
     let shown_query = match query.as_deref() {
         Some(query) if preserve_query_tail => ellipsize_start(query, query_budget)?,
@@ -469,6 +585,10 @@ mod tests {
 
     fn draw_into(terminal: &mut Terminal<TestBackend>, app: &mut crate::app::App) {
         prepare_frame(app);
+        draw_available_into(terminal, app);
+    }
+
+    fn draw_available_into(terminal: &mut Terminal<TestBackend>, app: &mut crate::app::App) {
         let state = app.view_state().unwrap();
         terminal
             .draw(|frame| render(frame, &state).unwrap())
@@ -479,6 +599,13 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         draw_into(&mut terminal, app);
+        terminal.backend().buffer().clone()
+    }
+
+    fn draw_available(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_available_into(&mut terminal, app);
         terminal.backend().buffer().clone()
     }
 
@@ -521,6 +648,48 @@ mod tests {
         app.update(Action::ShowHelp).unwrap();
         let buffer = draw(&mut app, 48, 4);
         assert_eq!(row_text(&buffer, 3), "F1 / Esc close help");
+    }
+
+    #[test]
+    fn pending_shell_is_immediate_static_and_responsive() {
+        let mut normal = app_from_text(Path::new("/tmp/資料e\u{301}/book.txt"), "x".repeat(4096));
+        normal
+            .update(Action::Resize(Geometry::new(80, 24)))
+            .unwrap();
+        assert!(!normal.frame_ready());
+        let normal = draw_available(&mut normal, 80, 24);
+        assert!(row_text(&normal, 0).starts_with("book.txt"));
+        assert_eq!(row_text(&normal, 11).trim(), "Preparing view…");
+        assert_eq!(row_text(&normal, 22), "");
+        assert!(row_text(&normal, 23).starts_with("F1 help  q quit"));
+
+        let mut minimum = app_from_text(Path::new("/tmp/book.txt"), "x".repeat(4096));
+        minimum
+            .update(Action::Resize(Geometry::new(16, 4)))
+            .unwrap();
+        assert!(!minimum.frame_ready());
+        let minimum = draw_available(&mut minimum, 16, 4);
+        assert_eq!(row_text(&minimum, 1), "Preparing view…");
+        assert_eq!(row_text(&minimum, 2), "");
+        assert!(row_text(&minimum, 3).starts_with("F1 help"));
+    }
+
+    #[test]
+    fn pending_shell_preserves_unicode_search_input_without_document_rows() {
+        let mut app = app_from_text(Path::new("/tmp/資料e\u{301}.txt"), "x".repeat(4096));
+        app.update(Action::Resize(Geometry::new(40, 4))).unwrap();
+        app.update(Action::BeginSearch).unwrap();
+        for character in "prefixe\u{301}終".chars() {
+            app.update(Action::SearchInsert(character)).unwrap();
+        }
+
+        let buffer = draw_available(&mut app, 40, 4);
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "資");
+        assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), "料");
+        assert_eq!(buffer.cell((4, 0)).unwrap().symbol(), "é");
+        assert_eq!(row_text(&buffer, 1).trim(), "Preparing view…");
+        assert_eq!(row_text(&buffer, 2), "/prefixé終");
+        assert!(row_text(&buffer, 3).starts_with("F1 help  Enter apply"));
     }
 
     #[test]
@@ -665,6 +834,7 @@ mod tests {
                 draft: "abcdefghij",
                 limit_hit: false,
             },
+            activity: None,
         };
 
         assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /…efghij");
@@ -683,6 +853,7 @@ mod tests {
                 draft: "prefixe\u{301}終",
                 limit_hit: false,
             },
+            activity: None,
         };
         assert_eq!(status_text(&state, 15).unwrap(), "12%  7/9  /…e\u{301}終");
 
@@ -712,9 +883,55 @@ mod tests {
                 no_matches: false,
                 searching: false,
             },
+            activity: None,
         };
 
         assert_eq!(status_text(&state, 18).unwrap(), "12%  7/9  /abcdef…");
+    }
+
+    #[test]
+    fn status_notices_preempt_generic_activity_and_survive_narrow_frames() {
+        let mut state = RenderState {
+            filename: "book.txt",
+            path: "/tmp/book.txt",
+            rows: RenderRowsView::empty(),
+            progress: 12,
+            current_line: Some(7),
+            total_lines: Some(9),
+            status: SearchStatus::None,
+            activity: Some(ViewActivity::PreparingView),
+        };
+
+        assert_eq!(
+            status_text(&state, 40).unwrap(),
+            "12%  7/9 — preparing view"
+        );
+        assert_eq!(status_text(&state, 16).unwrap(), "preparing view");
+
+        state.activity = Some(ViewActivity::GoingToEnd);
+        assert_eq!(status_text(&state, 16).unwrap(), "going to end");
+
+        state.status = SearchStatus::Committed {
+            query: "e\u{301}終needle",
+            no_matches: false,
+            searching: true,
+        };
+        state.activity = Some(ViewActivity::PreparingView);
+        assert_eq!(status_text(&state, 16).unwrap(), "searching");
+
+        state.status = SearchStatus::Committed {
+            query: "needle",
+            no_matches: true,
+            searching: false,
+        };
+        assert_eq!(status_text(&state, 16).unwrap(), "no matches");
+
+        let limit_draft = "x".repeat(4096);
+        state.status = SearchStatus::Draft {
+            draft: &limit_draft,
+            limit_hit: true,
+        };
+        assert_eq!(status_text(&state, 16).unwrap(), "query limit");
     }
 
     #[test]
@@ -727,6 +944,7 @@ mod tests {
             current_line: Some(7),
             total_lines: None,
             status: SearchStatus::None,
+            activity: None,
         };
         assert_eq!(status_text(&state, 40).unwrap(), "12%  7/?");
 
@@ -747,8 +965,12 @@ mod tests {
             current_line: Some(1),
             total_lines: Some(1),
             status: SearchStatus::None,
+            activity: None,
         };
-        assert_eq!(header_text(&state, 40).unwrap(), "standard input");
+        assert_eq!(
+            header_text(state.filename, state.path, 40).unwrap(),
+            "standard input"
+        );
     }
 
     #[test]

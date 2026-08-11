@@ -150,6 +150,12 @@ pub(super) enum SearchStatus<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ViewActivity {
+    PreparingView,
+    GoingToEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Highlight {
     None,
     Match,
@@ -495,11 +501,20 @@ pub(super) struct RenderState<'a> {
     pub current_line: Option<u64>,
     pub total_lines: Option<u64>,
     pub status: SearchStatus<'a>,
+    pub activity: Option<ViewActivity>,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingState<'a> {
+    pub filename: &'a str,
+    pub path: &'a str,
+    pub status: SearchStatus<'a>,
 }
 
 #[derive(Debug)]
 pub(super) enum ViewState<'a> {
     Reader(RenderState<'a>),
+    Pending(PendingState<'a>),
     Help { q_closes: bool },
 }
 
@@ -790,6 +805,7 @@ impl App {
             current_line: line.map(LinePosition::current),
             total_lines: line.and_then(LinePosition::total),
             status: self.search_status(),
+            activity: self.view_activity(),
         })
     }
 
@@ -799,7 +815,24 @@ impl App {
                 q_closes: matches!(return_to, ContentMode::Reading),
             });
         }
+        if !self.reader_frame_ready() {
+            return Ok(ViewState::Pending(PendingState {
+                filename: self.document.display_name(),
+                path: self.document.display_path(),
+                status: self.search_status(),
+            }));
+        }
         self.render_state().map(ViewState::Reader)
+    }
+
+    const fn view_activity(&self) -> Option<ViewActivity> {
+        match self.viewport_request {
+            Some(ViewportRequest::End) => Some(ViewActivity::GoingToEnd),
+            Some(ViewportRequest::Move { .. } | ViewportRequest::Reflow { .. }) => {
+                Some(ViewActivity::PreparingView)
+            }
+            Some(ViewportRequest::Search { .. }) | None => None,
+        }
     }
 
     fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) -> Result<(), TutError> {
@@ -1047,8 +1080,6 @@ impl App {
         located: LocatedViewport,
     ) -> bool {
         self.cancel_render_scan();
-        let old_anchor = self.anchor;
-        let old_follow_end = self.follow_end;
         self.viewport_request = None;
         self.locator = None;
         self.anchor = located.anchor;
@@ -1057,7 +1088,9 @@ impl App {
         if request.is_move() {
             self.start_queued_move();
         }
-        old_anchor != self.anchor || old_follow_end != self.follow_end
+        // Completing a request always changes the published foreground status, even when the
+        // requested motion clamps to the existing anchor. The redraw clears that status.
+        true
     }
 
     fn advance_line_index(&mut self) -> Result<bool, TutError> {
@@ -2754,6 +2787,97 @@ mod tests {
         assert!(!app.frame_ready());
         settle_frame(&mut app);
         assert!(app.frame_ready());
+    }
+
+    #[test]
+    fn pending_view_is_static_and_reader_readiness_stays_separate() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("資料e\u{301}.txt");
+        fs::write(&path, "x".repeat(4096)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+        assert!(!app.reader_frame_ready());
+        assert!(!app.frame_ready());
+
+        app.document_cache.reset_metrics();
+        app.search_cache.reset_metrics();
+        let stability_checks = app.document.stability_checks();
+        let line_position_cache = app.line_position_cache;
+        let pending_highlights = app.pending_highlight_cursors();
+
+        let ViewState::Pending(state) = app.view_state().unwrap() else {
+            panic!("an incomplete reader frame exposes only the static pending shell");
+        };
+        assert_eq!(state.filename, "資料é.txt");
+        assert!(state.path.ends_with("資料é.txt"));
+        assert_eq!(state.status, SearchStatus::None);
+
+        assert_eq!(app.document_cache.metrics(), Default::default());
+        assert_eq!(app.search_cache.metrics(), Default::default());
+        assert_eq!(app.document.stability_checks(), stability_checks);
+        assert_eq!(app.line_position_cache, line_position_cache);
+        assert_eq!(app.pending_highlight_cursors(), pending_highlights);
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+    }
+
+    #[test]
+    fn foreground_activity_is_derived_from_existing_view_requests() {
+        let mut app = reader("0\n1\n2\n3\n4\n", 16, 4);
+
+        assert_eq!(app.update(Action::LineDown).unwrap(), Outcome::Changed);
+        let ViewState::Reader(state) = app.view_state().unwrap() else {
+            panic!("the old complete frame remains visible while locating a move");
+        };
+        assert_eq!(state.activity, Some(ViewActivity::PreparingView));
+
+        settle(&mut app);
+        assert_eq!(app.update(Action::DocumentEnd).unwrap(), Outcome::Changed);
+        let ViewState::Reader(state) = app.view_state().unwrap() else {
+            panic!("the old complete frame remains visible while locating the end");
+        };
+        assert_eq!(state.activity, Some(ViewActivity::GoingToEnd));
+
+        settle(&mut app);
+        let ViewState::Reader(state) = app.view_state().unwrap() else {
+            panic!("settled readers expose a complete frame");
+        };
+        assert_eq!(state.activity, None);
+    }
+
+    #[test]
+    fn passive_line_indexing_has_no_foreground_activity() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("passive-index.txt");
+        fs::write(&path, "line\n".repeat(30_000)).unwrap();
+        let mut app = App::new(crate::document::load(path).unwrap());
+        app.update(Action::Resize(Geometry::new(16, 6))).unwrap();
+        settle_frame(&mut app);
+
+        assert_eq!(app.background_work(), Some(BackgroundWork::LineIndex));
+        let ViewState::Reader(state) = app.view_state().unwrap() else {
+            panic!("a complete reader frame remains drawable during passive indexing");
+        };
+        assert_eq!(state.activity, None);
+    }
+
+    #[test]
+    fn clamped_motion_clears_its_foreground_activity() {
+        let mut app = reader("only", 16, 4);
+        assert_eq!(app.update(Action::LineUp).unwrap(), Outcome::Changed);
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Reader(RenderState {
+                activity: Some(ViewActivity::PreparingView),
+                ..
+            })
+        ));
+
+        assert!(app.advance_background().unwrap());
+        assert!(app.viewport_request.is_none());
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Reader(RenderState { activity: None, .. })
+        ));
     }
 
     #[test]
