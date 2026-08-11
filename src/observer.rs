@@ -55,6 +55,9 @@ pub(super) trait RuntimeRecorder {
     fn event(&mut self);
     fn terminal_session(&mut self);
     fn suspension(&mut self);
+
+    #[cfg(test)]
+    fn capacity_sample(&mut self, _app: &crate::app::App) {}
 }
 
 #[derive(Debug, Default)]

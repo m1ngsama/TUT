@@ -737,6 +737,11 @@ impl<S> ProjectedRowsScanner<S>
 where
     S: ProjectedRowSink,
 {
+    #[cfg(test)]
+    pub(super) const fn bounded_sink(&self) -> &S {
+        &self.sink
+    }
+
     pub(super) fn new(
         reader: &DocumentReader<'_>,
         start: SourceOffset,

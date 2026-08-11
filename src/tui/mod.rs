@@ -388,6 +388,8 @@ fn run_session<T: TerminalDriver, R: RuntimeRecorder>(
         Ok(size) => size,
         Err(primary) => return primary,
     };
+    #[cfg(test)]
+    recorder.capacity_sample(app);
     if let Err(primary) = session.initialize(signals) {
         return primary;
     }
@@ -557,6 +559,8 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             let started = recorder.begin_operation();
             let result = app.update(Action::Resize(size.geometry()));
             recorder.finish_operation(RuntimeOperation::Action, started);
+            #[cfg(test)]
+            recorder.capacity_sample(app);
             if let Err(primary) = check_control(signals) {
                 return primary;
             }
@@ -582,6 +586,8 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             let started = recorder.begin_operation();
             let result = app.update(action);
             recorder.finish_operation(RuntimeOperation::Action, started);
+            #[cfg(test)]
+            recorder.capacity_sample(app);
             match result {
                 Ok(Outcome::Changed) => {
                     redraw = true;
@@ -620,6 +626,8 @@ fn draw_frame<T: TerminalDriver, R: RuntimeRecorder>(
     let started = recorder.begin_operation();
     let result = driver.draw(app);
     recorder.finish_operation(RuntimeOperation::Draw, started);
+    #[cfg(test)]
+    recorder.capacity_sample(app);
     check_control(signals)?;
     result.map_err(Primary::Error)
 }
@@ -634,6 +642,8 @@ fn advance_background<R: RuntimeRecorder>(
     let started = recorder.begin_operation();
     let result = app.advance_background();
     recorder.finish_operation(RuntimeOperation::Background(work), started);
+    #[cfg(test)]
+    recorder.capacity_sample(app);
     check_control(signals)?;
     result.map_err(Primary::Error)
 }
@@ -796,7 +806,8 @@ mod tests {
 
     use super::*;
     use crate::app::{
-        RenderRows, RenderRowsView, RenderState, SearchStatus, ViewState, app_from_text,
+        BoundedCapacityFootprint, BoundedCapacityProbe, RenderRows, RenderRowsView, RenderState,
+        SearchStatus, ViewState, app_from_text,
     };
 
     fn infallible<T>(result: Result<T, Infallible>) -> io::Result<T> {
@@ -897,6 +908,7 @@ mod tests {
         events: VecDeque<Event>,
         inject_on: Option<&'static str>,
         inject_suspend_on: Option<&'static str>,
+        suspend_polls_remaining: usize,
         inject_continue_on: Option<&'static str>,
         signals: SignalState,
         poll_timeouts: Vec<Duration>,
@@ -918,6 +930,7 @@ mod tests {
                 events: VecDeque::new(),
                 inject_on: None,
                 inject_suspend_on: None,
+                suspend_polls_remaining: 0,
                 inject_continue_on: None,
                 signals: signals.clone(),
                 poll_timeouts: Vec::new(),
@@ -1009,6 +1022,10 @@ mod tests {
             }
             if self.inject_suspend_on == Some(name) {
                 self.inject_suspend_on = None;
+                self.signals.store_suspend();
+            }
+            if name == "poll" && self.suspend_polls_remaining > 0 {
+                self.suspend_polls_remaining -= 1;
                 self.signals.store_suspend();
             }
             if self.inject_continue_on == Some(name) {
@@ -1178,6 +1195,7 @@ mod tests {
         terminate_after_search: Option<SignalState>,
         turn: Option<Rc<StateCell<u64>>>,
         background_turns: Vec<u64>,
+        capacity_probe: Option<BoundedCapacityProbe>,
     }
 
     impl RuntimeRecorder for TraceRecorder {
@@ -1229,6 +1247,12 @@ mod tests {
 
         fn suspension(&mut self) {
             self.suspensions = self.suspensions.saturating_add(1);
+        }
+
+        fn capacity_sample(&mut self, app: &App) {
+            if let Some(probe) = &mut self.capacity_probe {
+                probe.observe(app);
+            }
         }
     }
 
@@ -1717,6 +1741,157 @@ mod tests {
         );
         assert_eq!(app.repeat_status().unwrap().value(), 7);
         assert_eq!(driver.draws, [DrawKind::Reader, DrawKind::Reader]);
+    }
+
+    #[test]
+    fn eight_suspend_resume_cycles_do_not_grow_app_capacities_after_warmup() {
+        fn run_round(
+            app: &mut App,
+            limit: Option<BoundedCapacityFootprint>,
+        ) -> BoundedCapacityFootprint {
+            let signals = SignalState::empty();
+            let mut driver = FakeDriver::new(&signals);
+            driver.sizes.extend([(80, 24); 9]);
+            driver.suspend_polls_remaining = 8;
+            driver.quit_after_reader_draw = true;
+            let mut recorder = TraceRecorder {
+                capacity_probe: Some(limit.map_or_else(
+                    BoundedCapacityProbe::warming,
+                    BoundedCapacityProbe::verifying,
+                )),
+                ..TraceRecorder::default()
+            };
+
+            assert_eq!(
+                run_with_test_recorder(app, &mut driver, &signals, &mut recorder).unwrap(),
+                RunOutcome::Normal
+            );
+            assert_eq!(recorder.suspensions, 8);
+            assert_eq!(recorder.terminal_sessions, 9);
+            assert_eq!(
+                driver
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "enable_raw")
+                    .count(),
+                9
+            );
+            assert_eq!(
+                driver
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "disable_raw")
+                    .count(),
+                9
+            );
+            assert!(app.frame_ready());
+            assert!(matches!(app.view_state().unwrap(), ViewState::Reader(_)));
+            recorder
+                .capacity_probe
+                .take()
+                .expect("suspension rounds retain a capacity probe")
+                .finish()
+        }
+
+        let mut app = app_from_text(
+            Path::new("/tmp/suspend-capacity.txt"),
+            format!("{}\n", "x".repeat(1_023)).repeat(64),
+        );
+        let warm = run_round(&mut app, None);
+        assert!(warm.render_body_bytes > 0);
+        for _ in 0..8 {
+            let actual = run_round(&mut app, Some(warm));
+            assert!(actual.componentwise_le(warm));
+        }
+    }
+
+    #[test]
+    fn poll_error_retries_restore_sessions_and_preserve_capacity_bounds() {
+        fn run_attempt(
+            app: &mut App,
+            fail_poll: bool,
+            limit: Option<BoundedCapacityFootprint>,
+        ) -> BoundedCapacityFootprint {
+            let signals = SignalState::empty();
+            let mut driver = FakeDriver::new(&signals);
+            driver.sizes.push_back((80, 24));
+            if fail_poll {
+                driver.failures.push("poll");
+            } else {
+                driver.events.push_back(quit_event());
+            }
+            let mut recorder = TraceRecorder {
+                capacity_probe: Some(limit.map_or_else(
+                    BoundedCapacityProbe::warming,
+                    BoundedCapacityProbe::verifying,
+                )),
+                ..TraceRecorder::default()
+            };
+
+            let result = run_with_test_recorder(app, &mut driver, &signals, &mut recorder);
+            if fail_poll {
+                assert!(matches!(
+                    result,
+                    Err(TutError::Io {
+                        operation: "poll terminal events",
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(result.unwrap(), RunOutcome::Normal);
+            }
+            assert!(
+                driver
+                    .calls
+                    .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+            );
+            recorder
+                .capacity_probe
+                .take()
+                .expect("poll retry attempts retain a capacity probe")
+                .finish()
+        }
+
+        fn run_pair(
+            app: &mut App,
+            limit: Option<BoundedCapacityFootprint>,
+        ) -> BoundedCapacityFootprint {
+            let failed = run_attempt(app, true, limit);
+            let recovered = run_attempt(app, false, limit);
+            failed.componentwise_max(recovered)
+        }
+
+        let mut app = app_from_text(
+            Path::new("/tmp/poll-retry-capacity.txt"),
+            "alpha beta alpha\n".repeat(512),
+        );
+        app.update(Action::Resize(Geometry::new(80, 24))).unwrap();
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+        app.update(Action::BeginSearch).unwrap();
+        for character in "alpha".chars() {
+            app.update(Action::SearchInsert(character)).unwrap();
+        }
+        app.update(Action::SearchCommit).unwrap();
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+        app.render_state().unwrap();
+        while app.has_background_work() {
+            app.advance_background().unwrap();
+        }
+
+        let warm = run_pair(&mut app, None);
+        assert!(warm.search_session_bytes > 0);
+        for _ in 0..8 {
+            let actual = run_pair(&mut app, Some(warm));
+            assert!(actual.componentwise_le(warm));
+            assert!(matches!(
+                app.search_status(),
+                SearchStatus::Committed { query: "alpha", .. }
+            ));
+        }
     }
 
     #[test]
@@ -3154,11 +3329,13 @@ mod tests {
             let mut app = app_from_text(Path::new("/bounded/warm"), "alpha x\n".repeat(16 * 1024));
             run_warm_cycle(&mut app);
             let warm = app
-                .bounded_capacity_bytes()
+                .bounded_capacity_footprint()
+                .and_then(crate::app::BoundedCapacityFootprint::checked_total)
                 .expect("warm bounded capacities fit usize");
             run_warm_cycle(&mut app);
             let after = app
-                .bounded_capacity_bytes()
+                .bounded_capacity_footprint()
+                .and_then(crate::app::BoundedCapacityFootprint::checked_total)
                 .expect("post-warm bounded capacities fit usize");
             let growth = after.saturating_sub(warm);
             assert!(after <= warm);

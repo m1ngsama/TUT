@@ -795,6 +795,171 @@ pub(super) struct BoundedCoreMetrics {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct BoundedCapacityFootprint {
+    pub(super) line_index_bytes: usize,
+    pub(super) document_cache_bytes: usize,
+    pub(super) search_cache_bytes: usize,
+    pub(super) row_neighborhood_bytes: usize,
+    pub(super) locator_history_bytes: usize,
+    pub(super) locator_prefix_rows_bytes: usize,
+    pub(super) render_body_bytes: usize,
+    pub(super) search_session_bytes: usize,
+    pub(super) search_draft_bytes: usize,
+}
+
+#[cfg(test)]
+impl BoundedCapacityFootprint {
+    pub(super) fn checked_total(self) -> Option<usize> {
+        [
+            self.line_index_bytes,
+            self.document_cache_bytes,
+            self.search_cache_bytes,
+            self.row_neighborhood_bytes,
+            self.locator_history_bytes,
+            self.locator_prefix_rows_bytes,
+            self.render_body_bytes,
+            self.search_session_bytes,
+            self.search_draft_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_usize, usize::checked_add)
+    }
+
+    pub(super) fn componentwise_max(self, other: Self) -> Self {
+        Self {
+            line_index_bytes: self.line_index_bytes.max(other.line_index_bytes),
+            document_cache_bytes: self.document_cache_bytes.max(other.document_cache_bytes),
+            search_cache_bytes: self.search_cache_bytes.max(other.search_cache_bytes),
+            row_neighborhood_bytes: self
+                .row_neighborhood_bytes
+                .max(other.row_neighborhood_bytes),
+            locator_history_bytes: self.locator_history_bytes.max(other.locator_history_bytes),
+            locator_prefix_rows_bytes: self
+                .locator_prefix_rows_bytes
+                .max(other.locator_prefix_rows_bytes),
+            render_body_bytes: self.render_body_bytes.max(other.render_body_bytes),
+            search_session_bytes: self.search_session_bytes.max(other.search_session_bytes),
+            search_draft_bytes: self.search_draft_bytes.max(other.search_draft_bytes),
+        }
+    }
+
+    pub(super) fn componentwise_le(self, limit: Self) -> bool {
+        self.line_index_bytes <= limit.line_index_bytes
+            && self.document_cache_bytes <= limit.document_cache_bytes
+            && self.search_cache_bytes <= limit.search_cache_bytes
+            && self.row_neighborhood_bytes <= limit.row_neighborhood_bytes
+            && self.locator_history_bytes <= limit.locator_history_bytes
+            && self.locator_prefix_rows_bytes <= limit.locator_prefix_rows_bytes
+            && self.render_body_bytes <= limit.render_body_bytes
+            && self.search_session_bytes <= limit.search_session_bytes
+            && self.search_draft_bytes <= limit.search_draft_bytes
+    }
+}
+
+#[cfg(test)]
+pub(super) struct BoundedCapacityProbe {
+    peak: BoundedCapacityFootprint,
+    limit: Option<BoundedCapacityFootprint>,
+    samples: usize,
+}
+
+#[cfg(test)]
+impl BoundedCapacityProbe {
+    pub(super) const fn warming() -> Self {
+        Self {
+            peak: BoundedCapacityFootprint {
+                line_index_bytes: 0,
+                document_cache_bytes: 0,
+                search_cache_bytes: 0,
+                row_neighborhood_bytes: 0,
+                locator_history_bytes: 0,
+                locator_prefix_rows_bytes: 0,
+                render_body_bytes: 0,
+                search_session_bytes: 0,
+                search_draft_bytes: 0,
+            },
+            limit: None,
+            samples: 0,
+        }
+    }
+
+    pub(super) const fn verifying(limit: BoundedCapacityFootprint) -> Self {
+        Self {
+            peak: BoundedCapacityFootprint {
+                line_index_bytes: 0,
+                document_cache_bytes: 0,
+                search_cache_bytes: 0,
+                row_neighborhood_bytes: 0,
+                locator_history_bytes: 0,
+                locator_prefix_rows_bytes: 0,
+                render_body_bytes: 0,
+                search_session_bytes: 0,
+                search_draft_bytes: 0,
+            },
+            limit: Some(limit),
+            samples: 0,
+        }
+    }
+
+    pub(super) fn observe(&mut self, app: &App) {
+        let footprint = app
+            .bounded_capacity_footprint()
+            .expect("bounded capacity components fit usize");
+        footprint
+            .checked_total()
+            .expect("bounded capacity total fits usize");
+        if let Some(limit) = self.limit {
+            assert!(
+                footprint.componentwise_le(limit),
+                "capacity exceeded the warm component peak\nactual: {footprint:#?}\nwarm: {limit:#?}"
+            );
+        }
+        self.peak = self.peak.componentwise_max(footprint);
+        self.samples = self
+            .samples
+            .checked_add(1)
+            .expect("bounded capacity sample counts fit usize");
+    }
+
+    pub(super) fn update(&mut self, app: &mut App, action: Action) -> Result<Outcome, TutError> {
+        let result = app.update(action);
+        self.observe(app);
+        result
+    }
+
+    pub(super) fn advance_background(&mut self, app: &mut App) -> Result<bool, TutError> {
+        let result = app.advance_background();
+        self.observe(app);
+        result
+    }
+
+    pub(super) fn settle(&mut self, app: &mut App) -> Result<usize, TutError> {
+        for steps in 0..100_000 {
+            if !app.has_background_work() {
+                return Ok(steps);
+            }
+            self.advance_background(app)?;
+        }
+        panic!("capacity probe background work exceeded 100000 steps");
+    }
+
+    pub(super) fn prepare_view(&mut self, app: &mut App) -> Result<(), TutError> {
+        let _ = app.view_state()?;
+        self.observe(app);
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> BoundedCapacityFootprint {
+        assert!(
+            self.samples > 0,
+            "capacity probes require at least one sample"
+        );
+        self.peak
+    }
+}
+
+#[cfg(test)]
 pub(super) fn app_from_text(path: &std::path::Path, text: String) -> App {
     App::new(Document::from_text(path, text))
 }
@@ -886,21 +1051,35 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(super) fn bounded_capacity_bytes(&self) -> Option<usize> {
-        let render = self
-            .current_render_cache()
-            .map_or(Some(0), |cache| cache.rows.storage().bytes())?;
-        let search = self
+    pub(super) fn bounded_capacity_footprint(&self) -> Option<BoundedCapacityFootprint> {
+        let (locator_history_bytes, locator_prefix_rows_bytes) = self
+            .locator
+            .as_ref()
+            .map_or(Some((0, 0)), ViewportLocator::bounded_storage_bytes)?;
+        let render_body_bytes = match &self.render_body {
+            RenderBody::Empty => 0,
+            RenderBody::Cached(cache) => cache.rows.storage().bytes()?,
+            RenderBody::Scanning(job) => job.scanner.bounded_sink().storage().bytes()?,
+        };
+        let search_session_bytes = self
             .search
             .as_ref()
             .map_or(Some(0), SearchSession::bounded_storage_bytes)?;
-        self.document
-            .bounded_storage_bytes()?
-            .checked_add(self.document_cache.bounded_storage_bytes()?)?
-            .checked_add(self.search_cache.bounded_storage_bytes()?)?
-            .checked_add(self.row_neighborhood.bounded_storage_bytes()?)?
-            .checked_add(render)?
-            .checked_add(search)
+        let search_draft_bytes = match self.mode.content() {
+            ContentMode::Reading => 0,
+            ContentMode::SearchInput { draft, .. } => draft.capacity(),
+        };
+        Some(BoundedCapacityFootprint {
+            line_index_bytes: self.document.bounded_storage_bytes()?,
+            document_cache_bytes: self.document_cache.bounded_storage_bytes()?,
+            search_cache_bytes: self.search_cache.bounded_storage_bytes()?,
+            row_neighborhood_bytes: self.row_neighborhood.bounded_storage_bytes()?,
+            locator_history_bytes,
+            locator_prefix_rows_bytes,
+            render_body_bytes,
+            search_session_bytes,
+            search_draft_bytes,
+        })
     }
 
     pub(super) const fn terminal_too_small(&self) -> bool {
@@ -2649,6 +2828,270 @@ mod tests {
             changes += usize::from(app.advance_background().unwrap());
         }
         panic!("background work exceeded the test step limit");
+    }
+
+    fn verify_stable_capacity_rounds(
+        app: &mut App,
+        mut round: impl FnMut(&mut App, &mut BoundedCapacityProbe, usize),
+    ) -> BoundedCapacityFootprint {
+        let mut warm = BoundedCapacityProbe::warming();
+        warm.observe(app);
+        round(app, &mut warm, 0);
+        let warm_peak = warm.finish();
+        warm_peak
+            .checked_total()
+            .expect("warm capacity peak fits usize");
+
+        for iteration in 1..=8 {
+            let mut verification = BoundedCapacityProbe::verifying(warm_peak);
+            verification.observe(app);
+            round(app, &mut verification, iteration);
+            let verified_peak = verification.finish();
+            assert!(
+                verified_peak.componentwise_le(warm_peak),
+                "verification peak exceeded warm peak at round {iteration}\nverified: {verified_peak:#?}\nwarm: {warm_peak:#?}"
+            );
+        }
+        warm_peak
+    }
+
+    #[test]
+    fn resize_storm_capacities_plateau_componentwise_after_maximum_warm_round() {
+        let line = format!("{}\n", "x".repeat(4_095));
+        let mut app = app_from_text(Path::new("resize-storm.txt"), line.repeat(32));
+        let geometries = [
+            Geometry::new(80, 24),
+            Geometry::new(120, 40),
+            Geometry::new(15, 3),
+            Geometry::new(16, 4),
+            Geometry::new(4_096, 128),
+            Geometry::new(80, 24),
+            Geometry::new(80, 24),
+        ];
+
+        let warm = verify_stable_capacity_rounds(&mut app, |app, probe, _| {
+            for geometry in geometries {
+                assert!(matches!(
+                    probe.update(app, Action::Resize(geometry)).unwrap(),
+                    Outcome::Changed | Outcome::Unchanged
+                ));
+                if app.has_background_work() {
+                    probe.advance_background(app).unwrap();
+                }
+            }
+            probe.settle(app).unwrap();
+            probe.prepare_view(app).unwrap();
+            assert_eq!(app.geometry, Geometry::new(80, 24));
+            assert!(app.frame_ready());
+            assert!(app.current_render_cache().is_some());
+        });
+
+        assert!(warm.line_index_bytes > 0);
+        assert!(warm.document_cache_bytes > 0);
+        assert!(warm.render_body_bytes > 0);
+    }
+
+    #[test]
+    fn capacity_footprint_counts_scanning_stale_render_and_help_draft_storage() {
+        let mut app = app_from_text(Path::new("footprint-transitions.txt"), "x".repeat(8_192));
+        let mut probe = BoundedCapacityProbe::warming();
+        probe.observe(&app);
+        assert_eq!(
+            app.bounded_capacity_footprint().unwrap().render_body_bytes,
+            0
+        );
+        probe
+            .update(&mut app, Action::Resize(Geometry::new(4_096, 4)))
+            .unwrap();
+
+        let mut scanning_bytes = None;
+        for _ in 0..BACKGROUND_STEP_LIMIT {
+            probe.advance_background(&mut app).unwrap();
+            if matches!(app.render_body, RenderBody::Scanning(_)) {
+                scanning_bytes = Some(app.bounded_capacity_footprint().unwrap().render_body_bytes);
+                break;
+            }
+        }
+        assert!(scanning_bytes.is_some_and(|bytes| bytes > 0));
+        probe.settle(&mut app).unwrap();
+        let cached_bytes = app.bounded_capacity_footprint().unwrap().render_body_bytes;
+        assert!(cached_bytes > 0);
+
+        let cached_anchor = app.anchor;
+        app.anchor = SourceOffset::new(cached_anchor.get() + 1);
+        assert!(app.current_render_cache().is_none());
+        assert_eq!(
+            app.bounded_capacity_footprint().unwrap().render_body_bytes,
+            cached_bytes
+        );
+        app.anchor = cached_anchor;
+
+        probe.update(&mut app, Action::BeginSearch).unwrap();
+        for character in "draft".chars() {
+            probe
+                .update(&mut app, Action::SearchInsert(character))
+                .unwrap();
+        }
+        let editing_draft = app.bounded_capacity_footprint().unwrap().search_draft_bytes;
+        assert!(editing_draft >= "draft".len());
+        probe.update(&mut app, Action::ShowHelp).unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Help {
+                return_to: ContentMode::SearchInput { .. }
+            }
+        ));
+        assert_eq!(
+            app.bounded_capacity_footprint().unwrap().search_draft_bytes,
+            editing_draft
+        );
+        let _ = probe.finish();
+    }
+
+    #[test]
+    fn continuous_navigation_capacities_plateau_componentwise() {
+        let text = (0..512)
+            .map(|row| format!("{row:04} {}\n", "x".repeat(74)))
+            .collect::<String>();
+        let mut app = app_from_text(Path::new("navigation-storm.txt"), text);
+
+        let warm = verify_stable_capacity_rounds(&mut app, |app, probe, _| {
+            probe
+                .update(app, Action::Resize(Geometry::new(80, 24)))
+                .unwrap();
+            probe.settle(app).unwrap();
+            probe.prepare_view(app).unwrap();
+
+            for (action, count) in [
+                (Action::LineDown, 128),
+                (Action::PageDown, 8),
+                (Action::LineUp, 64),
+                (Action::PageUp, 8),
+                (Action::DocumentEnd, 1),
+                (Action::DocumentStart, 1),
+            ] {
+                for _ in 0..count {
+                    probe.update(app, action).unwrap();
+                    if app.has_background_work() {
+                        probe.advance_background(app).unwrap();
+                    }
+                }
+            }
+            probe.settle(app).unwrap();
+            probe.prepare_view(app).unwrap();
+            assert_eq!(app.anchor, app.document.source_start());
+            assert!(matches!(
+                app.render_state().unwrap().boundary,
+                Some(ViewportBoundary::Top | ViewportBoundary::All)
+            ));
+        });
+
+        assert!(warm.row_neighborhood_bytes > 0);
+        assert!(warm.locator_history_bytes > 0);
+        assert!(warm.locator_prefix_rows_bytes > 0);
+        assert!(warm.render_body_bytes > 0);
+    }
+
+    #[test]
+    fn repeated_search_capacities_plateau_and_cover_help_return_drafts() {
+        let query = "q".repeat(256);
+        let text = format!("{query} alpha {query}\n").repeat(32);
+        let mut app = app_from_text(Path::new("search-storm.txt"), text);
+
+        let warm = verify_stable_capacity_rounds(&mut app, |app, probe, iteration| {
+            probe
+                .update(app, Action::Resize(Geometry::new(80, 24)))
+                .unwrap();
+            probe.settle(app).unwrap();
+            probe.update(app, Action::BeginSearch).unwrap();
+            for character in query.chars() {
+                probe.update(app, Action::SearchInsert(character)).unwrap();
+            }
+            probe.update(app, Action::ShowHelp).unwrap();
+            assert!(matches!(
+                &app.mode,
+                Mode::Help {
+                    return_to: ContentMode::SearchInput { draft, .. }
+                } if draft == &query
+            ));
+            probe.prepare_view(app).unwrap();
+            probe.update(app, Action::DismissHelp).unwrap();
+            probe.update(app, Action::SearchCommit).unwrap();
+            probe.settle(app).unwrap();
+            probe.prepare_view(app).unwrap();
+            probe.settle(app).unwrap();
+            probe.prepare_view(app).unwrap();
+
+            let navigation_count = if iteration == 0 { 64 } else { 8 };
+            for _ in 0..navigation_count {
+                probe.update(app, Action::NextMatch).unwrap();
+                probe.settle(app).unwrap();
+                probe.prepare_view(app).unwrap();
+                probe.settle(app).unwrap();
+            }
+            assert!(matches!(
+                app.search_status(),
+                SearchStatus::Committed {
+                    query: actual,
+                    searching: false,
+                    ..
+                } if actual == query
+            ));
+            assert!(app.current_match().is_some());
+            probe.update(app, Action::SearchCancel).unwrap();
+            assert_eq!(app.search_status(), SearchStatus::None);
+        });
+
+        assert!(warm.search_cache_bytes > 0);
+        assert!(warm.search_session_bytes > 0);
+        assert!(warm.search_draft_bytes >= query.len());
+    }
+
+    #[test]
+    fn search_recall_allocation_retries_are_atomic_and_capacity_stable() {
+        let mut app = reader("alpha beta alpha beta alpha", 80, 24);
+        commit(&mut app, "alpha");
+        let committed = app.current_match();
+
+        let warm = verify_stable_capacity_rounds(&mut app, |app, probe, _| {
+            probe.update(app, Action::BeginSearch).unwrap();
+            let before = app.bounded_capacity_footprint().unwrap();
+            app.fail_search_recall_reserve = true;
+            assert!(matches!(
+                probe.update(app, Action::SearchRecall),
+                Err(TutError::Allocation("search query"))
+            ));
+            assert_eq!(app.bounded_capacity_footprint().unwrap(), before);
+            assert!(matches!(
+                app.search_status(),
+                SearchStatus::Draft {
+                    draft: "",
+                    limit_hit: false
+                }
+            ));
+
+            app.fail_search_recall_reserve = false;
+            assert_eq!(
+                probe.update(app, Action::SearchRecall).unwrap(),
+                Outcome::Changed
+            );
+            assert!(matches!(
+                app.search_status(),
+                SearchStatus::Draft {
+                    draft: "alpha",
+                    limit_hit: false
+                }
+            ));
+            probe.update(app, Action::SearchCancel).unwrap();
+            assert_eq!(app.current_match(), committed);
+            assert!(matches!(
+                app.search_status(),
+                SearchStatus::Committed { query: "alpha", .. }
+            ));
+        });
+
+        assert!(warm.search_session_bytes > 0);
+        assert!(warm.search_draft_bytes >= "alpha".len());
     }
 
     fn published_boundary(app: &mut App) -> Option<ViewportBoundary> {
