@@ -12,6 +12,9 @@ tag does not describe the present program or its compatibility.
 
 - Heap-backed terminal cell symbols now share the 64 MiB terminal-buffer
   accounting budget and over-budget frames are rejected before publication.
+- Repeated public `tut::run` calls now recover from a closed terminal input when
+  the process binds a different terminal, without leaking signal registrations
+  or losing the original EOF result.
 
 ## 0.0.5 - 2026-08-11
 

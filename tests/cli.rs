@@ -141,6 +141,7 @@ mod pty {
         ffi::CString,
         fs::{File, OpenOptions},
         io::{self, Read, Write},
+        os::fd::{AsRawFd, FromRawFd},
         os::unix::process::{CommandExt, ExitStatusExt},
         path::Path,
         process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio},
@@ -166,6 +167,9 @@ mod pty {
     const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
     const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
     const NESTED_RAW_HELPER: &str = "TUT_TEST_NESTED_RAW_HELPER";
+    const REUSABLE_RUN_HELPER: &str = "TUT_TEST_REUSABLE_RUN_HELPER";
+    const FIRST_RUN_EOF: &[u8] = b"TUT_TEST_FIRST_RUN_EOF";
+    const REPLACEMENT_TTY_FD: libc::c_int = 200;
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn reset_signal_state() -> io::Result<()> {
@@ -226,6 +230,9 @@ mod pty {
         stderr_output: Vec<u8>,
         reaped: bool,
         command_master: Option<File>,
+        replacement_master: Option<File>,
+        replacement_probe: Option<File>,
+        replacement_initial: Option<Termios>,
         _input: Option<ChildStdin>,
     }
 
@@ -339,6 +346,64 @@ mod pty {
             )
         }
 
+        fn spawn_reusable_run_helper(path: &Path) -> io::Result<Self> {
+            let (master, stdout, controlling_name, _controlling_initial) = open_test_pty()?;
+            let (command_master, terminal_input, _input_name, input_initial) = open_test_pty()?;
+            let input_probe = terminal_input.try_clone()?;
+            let (replacement_master, replacement_input, _replacement_name, replacement_initial) =
+                open_test_pty()?;
+            let replacement_probe = replacement_input.try_clone()?;
+            let replacement_flags = rustix::io::fcntl_getfd(&replacement_input)?;
+            rustix::io::fcntl_setfd(
+                &replacement_input,
+                replacement_flags | rustix::io::FdFlags::CLOEXEC,
+            )?;
+            let replacement_fd = replacement_input.as_raw_fd();
+
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "pty::public_run_rebinds_terminal_input_after_eof",
+                    "--nocapture",
+                ])
+                .env(REUSABLE_RUN_HELPER, path)
+                .stdin(Stdio::from(terminal_input))
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::piped());
+            configure_child_session(&mut command, Some(controlling_name));
+            // The child setup only duplicates an already-open descriptor onto a fixed inherited
+            // slot. dup2 and fcntl are async-signal-safe on both supported test targets.
+            unsafe {
+                command.pre_exec(move || {
+                    let result = if replacement_fd == REPLACEMENT_TTY_FD {
+                        libc::fcntl(REPLACEMENT_TTY_FD, libc::F_SETFD, 0)
+                    } else {
+                        libc::dup2(replacement_fd, REPLACEMENT_TTY_FD)
+                    };
+                    if result == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            let child = command.spawn()?;
+            drop(replacement_input);
+            let mut child = Self::finish_spawn(
+                child,
+                TestInput::Path(path),
+                master,
+                input_probe,
+                input_initial,
+                Some(command_master),
+            )?;
+            child.replacement_master = Some(replacement_master);
+            child.replacement_probe = Some(replacement_probe);
+            child.replacement_initial = Some(replacement_initial);
+            Ok(child)
+        }
+
         fn spawn_inner(
             input: TestInput<'_>,
             cli_log: Option<&Path>,
@@ -415,6 +480,9 @@ mod pty {
                 stderr_output: Vec::new(),
                 reaped: false,
                 command_master,
+                replacement_master: None,
+                replacement_probe: None,
+                replacement_initial: None,
                 _input: retained_input,
             })
         }
@@ -466,6 +534,13 @@ mod pty {
                 .ok_or_else(|| io::Error::other("separate terminal input is not configured"))?;
             drop(master);
             Ok(())
+        }
+
+        fn write_replacement_command(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.replacement_master
+                .as_mut()
+                .ok_or_else(|| io::Error::other("replacement terminal input is not configured"))?
+                .write_all(bytes)
         }
 
         fn pump(&mut self) -> io::Result<()> {
@@ -609,6 +684,19 @@ mod pty {
                 }
                 Err(error) => panic!("failed to inspect restored terminal input: {error}"),
             }
+        }
+
+        fn assert_replacement_restored(&self) {
+            let probe = self
+                .replacement_probe
+                .as_ref()
+                .expect("replacement terminal probe is configured");
+            let expected = self
+                .replacement_initial
+                .as_ref()
+                .expect("replacement terminal state is configured");
+            let after = termios::tcgetattr(probe).unwrap();
+            assert_terminal_configuration(&after, expected);
         }
 
         fn terminate_and_reap(&mut self) {
@@ -763,6 +851,31 @@ mod pty {
         assert_terminal_configuration(&restored, &initial);
     }
 
+    fn exercise_reusable_run(path: &Path) {
+        let first = tut::run([path.as_os_str().to_owned()]).unwrap_err();
+        match first {
+            tut::TutError::Io { operation, source } => {
+                assert_eq!(operation, "poll terminal events");
+                assert_eq!(source.kind(), io::ErrorKind::UnexpectedEof);
+                assert_eq!(source.to_string(), "terminal input closed");
+            }
+            error => panic!("expected terminal EOF from the first run, got {error:?}"),
+        }
+
+        // SAFETY: the parent installed this owned inherited descriptor before exec and invokes
+        // this branch only in the dedicated helper process. File takes over the inherited slot.
+        let replacement = unsafe { File::from_raw_fd(REPLACEMENT_TTY_FD) };
+        rustix::stdio::dup2_stdin(&replacement).unwrap();
+        drop(replacement);
+        io::stdout().write_all(FIRST_RUN_EOF).unwrap();
+        io::stdout().flush().unwrap();
+
+        assert_eq!(
+            tut::run([path.as_os_str().to_owned()]).unwrap(),
+            tut::RunResult::Completed(tut::RunOutcome::Normal)
+        );
+    }
+
     #[test]
     fn nested_crossterm_raw_owner_is_preserved() {
         if let Some(path) = std::env::var_os(NESTED_RAW_HELPER) {
@@ -784,6 +897,47 @@ mod pty {
             );
         }
         pty.assert_restored();
+    }
+
+    #[test]
+    fn public_run_rebinds_terminal_input_after_eof() {
+        if let Some(path) = std::env::var_os(REUSABLE_RUN_HELPER) {
+            exercise_reusable_run(Path::new(&path));
+            return;
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "reusable public run\n").unwrap();
+        let mut pty = PtyChild::spawn_reusable_run_helper(file.path()).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+
+        pty.disconnect_terminal_input().unwrap();
+        pty.wait_for(FIRST_RUN_EOF).unwrap();
+        let marker_end = pty
+            .output
+            .windows(FIRST_RUN_EOF.len())
+            .position(|window| window == FIRST_RUN_EOF)
+            .unwrap()
+            + FIRST_RUN_EOF.len();
+        pty.wait_for_after(marker_end, HIDE_CURSOR).unwrap();
+        pty.write_replacement_command(b"q").unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        let first_output = &pty.output[..marker_end - FIRST_RUN_EOF.len()];
+        let second_output = &pty.output[marker_end..];
+        for sequence in [ENTER_ALT, HIDE_CURSOR, SHOW_CURSOR, LEAVE_ALT] {
+            for (run, output) in [("first", first_output), ("second", second_output)] {
+                assert!(
+                    output
+                        .windows(sequence.len())
+                        .any(|window| window == sequence),
+                    "{run} public run must emit {sequence:?}"
+                );
+            }
+        }
+        pty.assert_restored_after_input_disconnect();
+        pty.assert_replacement_restored();
     }
 
     #[test]
