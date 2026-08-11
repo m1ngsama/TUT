@@ -19,14 +19,131 @@ use crate::{
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
 };
 
-const TINY_MESSAGE: &str = "terminal too small — resize";
 const PENDING_MESSAGE: &str = "Preparing view…";
-const READER_FOOTER: &str =
-    "F1 help  q quit  j/k lines  Space/b pages  / search  n/N matches  g/G ends";
-const SEARCH_FOOTER: &str = "F1 help  Enter apply  Esc cancel  Backspace delete  Ctrl-C interrupt";
 const HELP_TITLE: &str = "TUT keyboard help";
-const HELP_FOOTER: &str = "F1 / Esc close help";
-const READER_HELP_FOOTER: &str = "F1 / Esc / q close help";
+
+#[derive(Clone, Copy)]
+struct CopyTier {
+    min_columns: u16,
+    text: &'static str,
+}
+
+const READER_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "q quit  F1 help  / search  j/k  Space/b",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "q quit  F1 help  /",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "q quit  F1 help",
+    },
+];
+const COMMITTED_SEARCH_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "Esc clear search  n/N matches  q quit  F1 help  / new search  j/k lines",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "Esc clear  n/N matches  q quit  F1 help",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "Esc clear q quit n/N",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "Esc clear q quit",
+    },
+];
+const SEARCH_INPUT_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "Esc cancel  Enter apply  Backspace delete  F1 help  Ctrl-C interrupt",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "Esc cancel  Enter  Backspace  F1 help",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "Esc cancel  Enter F1",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "Esc cancel Enter",
+    },
+];
+const READER_HELP_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "Esc/q/F1 close help  Ctrl-C interrupt",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "Esc/q/F1 close help  Ctrl-C interrupt",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "Esc/q/F1 close help",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "Esc/q/F1 close",
+    },
+];
+const SEARCH_HELP_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "Esc/F1 close help  Ctrl-C interrupt",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "Esc/F1 close help  Ctrl-C interrupt",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "Esc/F1 close help",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "Esc/F1 close",
+    },
+];
+const TINY_COPY: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "terminal too small  resize  q quit  Ctrl-C interrupt",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "terminal too small  resize  q quit",
+    },
+    CopyTier {
+        min_columns: 14,
+        text: "resize  q quit",
+    },
+    CopyTier {
+        min_columns: 8,
+        text: "resize q",
+    },
+    CopyTier {
+        min_columns: 6,
+        text: "resize",
+    },
+    CopyTier {
+        min_columns: 1,
+        text: "q",
+    },
+];
 const COMPACT_HELP: &[&str] = &[
     "j/k or Up/Down        move by line",
     "/ search   n/N next/previous match",
@@ -63,7 +180,7 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &ViewState<'_>) -> Result<(),
         render_projected_line(
             frame,
             Rect::new(area.x, area.y, area.width, area.height.min(1)),
-            TINY_MESSAGE,
+            pick_copy(area.width, TINY_COPY),
         )?;
         return Ok(());
     }
@@ -79,8 +196,7 @@ fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), T
     let area = frame.area();
     let header_text = header_text(state.filename, state.path, area.width)?;
     let status_text = status_text(state, area.width)?;
-    let footer = footer_for(state.status);
-    let help_text = ellipsize_end(footer, area.width)?;
+    let help_text = footer_for(state.status, area.width);
     let body_height = area.height - 3;
     let header = Rect::new(area.x, area.y, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, body_height);
@@ -90,7 +206,7 @@ fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), T
     render_projected_line(frame, header, &header_text)?;
     render_body(frame, body, state.rows);
     render_projected_line(frame, status, &status_text)?;
-    render_projected_line(frame, help, &help_text)?;
+    render_projected_line(frame, help, help_text)?;
     Ok(())
 }
 
@@ -98,7 +214,7 @@ fn render_pending(frame: &mut Frame<'_>, state: &PendingState<'_>) -> Result<(),
     let area = frame.area();
     let header_text = header_text(state.filename, state.path, area.width)?;
     let status_text = pending_status_text(state.status, area.width)?;
-    let footer_text = ellipsize_end(footer_for(state.status), area.width)?;
+    let footer_text = footer_for(state.status, area.width);
     let body_height = area.height - 3;
     let header = Rect::new(area.x, area.y, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, body_height);
@@ -108,13 +224,21 @@ fn render_pending(frame: &mut Frame<'_>, state: &PendingState<'_>) -> Result<(),
     render_projected_line(frame, header, &header_text)?;
     render_centered_line(frame, body, PENDING_MESSAGE)?;
     render_projected_line(frame, status, &status_text)?;
-    render_projected_line(frame, footer, &footer_text)
+    render_projected_line(frame, footer, footer_text)
 }
 
-const fn footer_for(status: SearchStatus<'_>) -> &'static str {
+fn pick_copy(columns: u16, tiers: &[CopyTier]) -> &'static str {
+    tiers
+        .iter()
+        .find(|tier| columns >= tier.min_columns)
+        .map_or("", |tier| tier.text)
+}
+
+fn footer_for(status: SearchStatus<'_>, columns: u16) -> &'static str {
     match status {
-        SearchStatus::Draft { .. } => SEARCH_FOOTER,
-        SearchStatus::None | SearchStatus::Committed { .. } => READER_FOOTER,
+        SearchStatus::None => pick_copy(columns, READER_FOOTER),
+        SearchStatus::Committed { .. } => pick_copy(columns, COMMITTED_SEARCH_FOOTER),
+        SearchStatus::Draft { .. } => pick_copy(columns, SEARCH_INPUT_FOOTER),
     }
 }
 
@@ -134,15 +258,15 @@ fn render_help(frame: &mut Frame<'_>, q_closes: bool) -> Result<(), TutError> {
         let y = area.y + 1 + u16::try_from(relative_y).expect("help rows fit the terminal height");
         render_projected_line(frame, Rect::new(area.x, y, area.width, 1), line)?;
     }
-    let footer_text = ellipsize_end(
+    let footer_text = pick_copy(
+        area.width,
         if q_closes {
             READER_HELP_FOOTER
         } else {
-            HELP_FOOTER
+            SEARCH_HELP_FOOTER
         },
-        area.width,
-    )?;
-    render_projected_line(frame, footer, &footer_text)
+    );
+    render_projected_line(frame, footer, footer_text)
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, rows: RenderRowsView<'_>) {
@@ -626,6 +750,79 @@ mod tests {
             .to_owned()
     }
 
+    fn assert_copy_tiers(tiers: &[CopyTier]) {
+        assert!(
+            tiers
+                .windows(2)
+                .all(|pair| pair[0].min_columns > pair[1].min_columns)
+        );
+        for (index, tier) in tiers.iter().enumerate() {
+            assert_eq!(pick_copy(tier.min_columns, tiers), tier.text);
+            assert_eq!(
+                pick_copy(tier.min_columns.saturating_add(1), tiers),
+                tier.text
+            );
+            let narrower = tier.min_columns.saturating_sub(1);
+            let expected = tiers.get(index + 1).map_or("", |next| next.text);
+            assert_eq!(pick_copy(narrower, tiers), expected);
+            assert!(tier.text.is_ascii());
+            assert!(!tier.text.contains('…'));
+            assert!(display_width(tier.text) <= tier.min_columns);
+        }
+    }
+
+    #[test]
+    fn responsive_copy_tiers_are_complete_and_fit_their_breakpoints() {
+        for tiers in [
+            READER_FOOTER,
+            COMMITTED_SEARCH_FOOTER,
+            SEARCH_INPUT_FOOTER,
+            READER_HELP_FOOTER,
+            SEARCH_HELP_FOOTER,
+            TINY_COPY,
+        ] {
+            assert_copy_tiers(tiers);
+        }
+
+        let committed = SearchStatus::Committed {
+            query: "needle",
+            no_matches: false,
+            searching: false,
+        };
+        let draft = SearchStatus::Draft {
+            draft: "needle",
+            limit_hit: false,
+        };
+        assert_eq!(footer_for(SearchStatus::None, 16), "q quit  F1 help");
+        assert_eq!(footer_for(SearchStatus::None, 20), "q quit  F1 help  /");
+        assert_eq!(
+            footer_for(SearchStatus::None, 40),
+            "q quit  F1 help  / search  j/k  Space/b"
+        );
+        assert_eq!(
+            footer_for(SearchStatus::None, 80),
+            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends"
+        );
+        assert_eq!(footer_for(committed, 16), "Esc clear q quit");
+        assert_eq!(footer_for(committed, 20), "Esc clear q quit n/N");
+        assert_eq!(
+            footer_for(committed, 40),
+            "Esc clear  n/N matches  q quit  F1 help"
+        );
+        assert_eq!(footer_for(draft, 16), "Esc cancel Enter");
+        assert_eq!(footer_for(draft, 20), "Esc cancel  Enter F1");
+        assert_eq!(
+            footer_for(draft, 40),
+            "Esc cancel  Enter  Backspace  F1 help"
+        );
+        assert_eq!(pick_copy(16, READER_HELP_FOOTER), "Esc/q/F1 close");
+        assert_eq!(pick_copy(16, SEARCH_HELP_FOOTER), "Esc/F1 close");
+        assert_eq!(pick_copy(0, TINY_COPY), "");
+        assert_eq!(pick_copy(6, TINY_COPY), "resize");
+        assert_eq!(pick_copy(12, TINY_COPY), "resize q");
+        assert_eq!(pick_copy(16, TINY_COPY), "resize  q quit");
+    }
+
     #[test]
     fn frame_renders_fixed_regions_and_empty_progress() {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), String::new());
@@ -633,7 +830,10 @@ mod tests {
         let buffer = draw(&mut app, 40, 5);
         assert!(row_text(&buffer, 0).starts_with("book.txt"));
         assert_eq!(row_text(&buffer, 3), "100%  1/1");
-        assert!(row_text(&buffer, 4).starts_with("F1 help"));
+        assert_eq!(
+            row_text(&buffer, 4),
+            "q quit  F1 help  / search  j/k  Space/b"
+        );
     }
 
     #[test]
@@ -643,11 +843,58 @@ mod tests {
         app.update(Action::BeginSearch).unwrap();
 
         let buffer = draw(&mut app, 48, 4);
-        assert!(row_text(&buffer, 3).starts_with("F1 help  Enter apply  Esc cancel"));
+        assert_eq!(
+            row_text(&buffer, 3),
+            "Esc cancel  Enter  Backspace  F1 help"
+        );
 
         app.update(Action::ShowHelp).unwrap();
         let buffer = draw(&mut app, 48, 4);
-        assert_eq!(row_text(&buffer, 3), "F1 / Esc close help");
+        assert_eq!(row_text(&buffer, 3), "Esc/F1 close help  Ctrl-C interrupt");
+    }
+
+    #[test]
+    fn responsive_footer_clears_hints_across_mode_and_width_changes() {
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
+        app.update(Action::Resize(Geometry::new(80, 4))).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(
+            row_text(terminal.backend().buffer(), 3),
+            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends"
+        );
+
+        terminal.backend_mut().resize(40, 4);
+        app.update(Action::Resize(Geometry::new(40, 4))).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(
+            row_text(terminal.backend().buffer(), 3),
+            "q quit  F1 help  / search  j/k  Space/b"
+        );
+
+        app.update(Action::BeginSearch).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(
+            row_text(terminal.backend().buffer(), 3),
+            "Esc cancel  Enter  Backspace  F1 help"
+        );
+        for column in 37..40 {
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 3))
+                    .unwrap()
+                    .symbol(),
+                " "
+            );
+        }
+
+        terminal.backend_mut().resize(16, 4);
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(row_text(terminal.backend().buffer(), 3), "Esc cancel Enter");
     }
 
     #[test]
@@ -661,7 +908,10 @@ mod tests {
         assert!(row_text(&normal, 0).starts_with("book.txt"));
         assert_eq!(row_text(&normal, 11).trim(), "Preparing view…");
         assert_eq!(row_text(&normal, 22), "");
-        assert!(row_text(&normal, 23).starts_with("F1 help  q quit"));
+        assert_eq!(
+            row_text(&normal, 23),
+            "q quit  F1 help  / search  j/k lines  Space/b pages  n/N matches  g/G ends"
+        );
 
         let mut minimum = app_from_text(Path::new("/tmp/book.txt"), "x".repeat(4096));
         minimum
@@ -671,7 +921,7 @@ mod tests {
         let minimum = draw_available(&mut minimum, 16, 4);
         assert_eq!(row_text(&minimum, 1), "Preparing view…");
         assert_eq!(row_text(&minimum, 2), "");
-        assert!(row_text(&minimum, 3).starts_with("F1 help"));
+        assert_eq!(row_text(&minimum, 3), "q quit  F1 help");
     }
 
     #[test]
@@ -689,7 +939,10 @@ mod tests {
         assert_eq!(buffer.cell((4, 0)).unwrap().symbol(), "é");
         assert_eq!(row_text(&buffer, 1).trim(), "Preparing view…");
         assert_eq!(row_text(&buffer, 2), "/prefixé終");
-        assert!(row_text(&buffer, 3).starts_with("F1 help  Enter apply"));
+        assert_eq!(
+            row_text(&buffer, 3),
+            "Esc cancel  Enter  Backspace  F1 help"
+        );
     }
 
     #[test]
@@ -702,7 +955,7 @@ mod tests {
         assert_eq!(row_text(&full, 1), "Navigation");
         assert_eq!(row_text(&full, 10), "Search");
         assert_eq!(row_text(&full, 15), "General");
-        assert_eq!(row_text(&full, 23), "F1 / Esc / q close help");
+        assert_eq!(row_text(&full, 23), "Esc/q/F1 close help  Ctrl-C interrupt");
 
         let mut compact = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
         compact
@@ -713,7 +966,7 @@ mod tests {
         assert!(row_text(&compact, 0).starts_with("TUT keyboard"));
         assert!(row_text(&compact, 1).starts_with("j/k or Up/Down"));
         assert!(row_text(&compact, 2).starts_with("/ search"));
-        assert!(row_text(&compact, 3).starts_with("F1 / Esc"));
+        assert_eq!(row_text(&compact, 3), "Esc/q/F1 close");
     }
 
     #[test]
@@ -735,7 +988,10 @@ mod tests {
             "reader body"
         );
         assert_eq!(row_text(terminal.backend().buffer(), 2), "");
-        assert!(row_text(terminal.backend().buffer(), 7).starts_with("F1 help"));
+        assert_eq!(
+            row_text(terminal.backend().buffer(), 7),
+            "q quit  F1 help  / search  j/k  Space/b"
+        );
     }
 
     #[test]
@@ -974,10 +1230,10 @@ mod tests {
     }
 
     #[test]
-    fn tiny_frames_render_only_the_resize_message() {
+    fn tiny_frames_prioritize_recovery_and_exit_hints() {
         let mut app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
         let buffer = draw(&mut app, 12, 3);
-        assert_eq!(row_text(&buffer, 0), "terminal too");
+        assert_eq!(row_text(&buffer, 0), "resize q");
         assert_eq!(row_text(&buffer, 1), "");
     }
 
