@@ -5,7 +5,6 @@ use ratatui::{
     buffer::{Buffer, CellDiffOption},
     layout::Rect,
     style::{Modifier, Style},
-    widgets::Widget,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -17,6 +16,7 @@ use crate::{
     },
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
+    tui::FrameSymbolMeter,
 };
 
 const PENDING_MESSAGE: &str = "Preparing view…";
@@ -179,25 +179,34 @@ const FULL_HELP: &[&str] = &[
     "  Ctrl-C               interrupt",
 ];
 
-pub(super) fn render(frame: &mut Frame<'_>, state: &ViewState<'_>) -> Result<(), TutError> {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    state: &ViewState<'_>,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
     let area = frame.area();
     if area.width < MIN_TERMINAL_COLUMNS || area.height < MIN_TERMINAL_ROWS {
         render_projected_line(
-            frame,
+            frame.buffer_mut(),
             Rect::new(area.x, area.y, area.width, area.height.min(1)),
             pick_copy(area.width, TINY_COPY),
+            symbols,
         )?;
         return Ok(());
     }
 
     match state {
-        ViewState::Reader(state) => render_reader(frame, state),
-        ViewState::Pending(state) => render_pending(frame, state),
-        ViewState::Help { q_closes } => render_help(frame, *q_closes),
+        ViewState::Reader(state) => render_reader(frame, state, symbols),
+        ViewState::Pending(state) => render_pending(frame, state, symbols),
+        ViewState::Help { q_closes } => render_help(frame, *q_closes, symbols),
     }
 }
 
-fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), TutError> {
+fn render_reader(
+    frame: &mut Frame<'_>,
+    state: &RenderState<'_>,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
     let area = frame.area();
     let header_text = header_text(state.filename, state.path, area.width)?;
     let status_text = status_text(state, area.width)?;
@@ -208,14 +217,18 @@ fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), T
     let status = Rect::new(area.x, area.y + 1 + body_height, area.width, 1);
     let help = Rect::new(area.x, area.y + 2 + body_height, area.width, 1);
 
-    render_projected_line(frame, header, &header_text)?;
-    render_body(frame, body, state.rows);
-    render_projected_line(frame, status, &status_text)?;
-    render_projected_line(frame, help, help_text)?;
+    render_projected_line(frame.buffer_mut(), header, &header_text, symbols)?;
+    render_body(frame.buffer_mut(), body, state.rows, symbols)?;
+    render_projected_line(frame.buffer_mut(), status, &status_text, symbols)?;
+    render_projected_line(frame.buffer_mut(), help, help_text, symbols)?;
     Ok(())
 }
 
-fn render_pending(frame: &mut Frame<'_>, state: &PendingState<'_>) -> Result<(), TutError> {
+fn render_pending(
+    frame: &mut Frame<'_>,
+    state: &PendingState<'_>,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
     let area = frame.area();
     let header_text = header_text(state.filename, state.path, area.width)?;
     let status_text = pending_status_text(state.status, state.repeat, area.width)?;
@@ -226,10 +239,10 @@ fn render_pending(frame: &mut Frame<'_>, state: &PendingState<'_>) -> Result<(),
     let status = Rect::new(area.x, area.y + 1 + body_height, area.width, 1);
     let footer = Rect::new(area.x, area.y + 2 + body_height, area.width, 1);
 
-    render_projected_line(frame, header, &header_text)?;
-    render_centered_line(frame, body, PENDING_MESSAGE)?;
-    render_projected_line(frame, status, &status_text)?;
-    render_projected_line(frame, footer, footer_text)
+    render_projected_line(frame.buffer_mut(), header, &header_text, symbols)?;
+    render_centered_line(frame.buffer_mut(), body, PENDING_MESSAGE, symbols)?;
+    render_projected_line(frame.buffer_mut(), status, &status_text, symbols)?;
+    render_projected_line(frame.buffer_mut(), footer, footer_text, symbols)
 }
 
 fn pick_copy(columns: u16, tiers: &[CopyTier]) -> &'static str {
@@ -247,7 +260,11 @@ fn footer_for(status: SearchStatus<'_>, columns: u16) -> &'static str {
     }
 }
 
-fn render_help(frame: &mut Frame<'_>, q_closes: bool) -> Result<(), TutError> {
+fn render_help(
+    frame: &mut Frame<'_>,
+    q_closes: bool,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
     let area = frame.area();
     let title = Rect::new(area.x, area.y, area.width, 1);
     let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
@@ -258,10 +275,15 @@ fn render_help(frame: &mut Frame<'_>, q_closes: bool) -> Result<(), TutError> {
         COMPACT_HELP
     };
 
-    render_projected_line(frame, title, HELP_TITLE)?;
+    render_projected_line(frame.buffer_mut(), title, HELP_TITLE, symbols)?;
     for (relative_y, line) in lines.iter().take(usize::from(body_height)).enumerate() {
         let y = area.y + 1 + u16::try_from(relative_y).expect("help rows fit the terminal height");
-        render_projected_line(frame, Rect::new(area.x, y, area.width, 1), line)?;
+        render_projected_line(
+            frame.buffer_mut(),
+            Rect::new(area.x, y, area.width, 1),
+            line,
+            symbols,
+        )?;
     }
     let footer_text = pick_copy(
         area.width,
@@ -271,26 +293,21 @@ fn render_help(frame: &mut Frame<'_>, q_closes: bool) -> Result<(), TutError> {
             SEARCH_HELP_FOOTER
         },
     );
-    render_projected_line(frame, footer, footer_text)
+    render_projected_line(frame.buffer_mut(), footer, footer_text, symbols)
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, rows: RenderRowsView<'_>) {
-    frame.render_widget(ReaderBody { rows }, area);
-}
-
-struct ReaderBody<'a> {
-    rows: RenderRowsView<'a>,
-}
-
-impl Widget for ReaderBody<'_> {
-    fn render(self, area: Rect, buffer: &mut Buffer) {
-        let mut highlights = self.rows.highlight_cursor();
-        for (relative_y, row) in self.rows.iter().take(usize::from(area.height)).enumerate() {
-            let y =
-                area.y + u16::try_from(relative_y).expect("visible row count fits terminal height");
-            write_render_row(buffer, area, y, row, &mut highlights);
-        }
+fn render_body(
+    buffer: &mut Buffer,
+    area: Rect,
+    rows: RenderRowsView<'_>,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
+    let mut highlights = rows.highlight_cursor();
+    for (relative_y, row) in rows.iter().take(usize::from(area.height)).enumerate() {
+        let y = area.y + u16::try_from(relative_y).expect("visible row count fits terminal height");
+        write_render_row(buffer, area, y, row, &mut highlights, symbols)?;
     }
+    Ok(())
 }
 
 fn write_render_row(
@@ -299,8 +316,13 @@ fn write_render_row(
     y: u16,
     row: RenderRow<'_>,
     highlights: &mut MatchCursor<'_>,
-) {
-    let mut x = area.x;
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
+    let mut cursor = RowCursor {
+        x: area.x,
+        y,
+        right: area.right(),
+    };
     let mut pending: Option<(RenderSpan, Highlight)> = None;
     for span in row.spans {
         let highlight = highlights.role_for(span.source());
@@ -311,33 +333,54 @@ fn write_render_row(
             continue;
         }
         if let Some((current, current_highlight)) = pending.take()
-            && !write_render_run(buffer, area, &mut x, y, row, &current, current_highlight)
+            && !write_render_run(
+                buffer,
+                &mut cursor,
+                row,
+                &current,
+                current_highlight,
+                symbols,
+            )?
         {
-            return;
+            return Ok(());
         }
         pending = Some((span.clone(), highlight));
     }
     if let Some((span, highlight)) = pending {
-        write_render_run(buffer, area, &mut x, y, row, &span, highlight);
+        write_render_run(buffer, &mut cursor, row, &span, highlight, symbols)?;
     }
+    Ok(())
+}
+
+struct RowCursor {
+    x: u16,
+    y: u16,
+    right: u16,
 }
 
 fn write_render_run(
     buffer: &mut Buffer,
-    area: Rect,
-    x: &mut u16,
-    y: u16,
+    cursor: &mut RowCursor,
     row: RenderRow<'_>,
     span: &RenderSpan,
     highlight: Highlight,
-) -> bool {
+    symbols: &mut FrameSymbolMeter,
+) -> Result<bool, TutError> {
     let width =
         u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
-    if width > area.right().saturating_sub(*x) {
-        return false;
+    if width > cursor.right.saturating_sub(cursor.x) {
+        return Ok(false);
     }
-    *x += write_render_span(buffer, *x, y, row.span_text(span), span, highlight);
-    true
+    cursor.x += write_render_span(
+        buffer,
+        cursor.x,
+        cursor.y,
+        row.span_text(span),
+        span,
+        highlight,
+        symbols,
+    )?;
+    Ok(true)
 }
 
 fn write_render_span(
@@ -347,7 +390,8 @@ fn write_render_span(
     text: &str,
     span: &RenderSpan,
     highlight: Highlight,
-) -> u16 {
+    symbols: &mut FrameSymbolMeter,
+) -> Result<u16, TutError> {
     let width =
         u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
     let style = style_for(highlight);
@@ -359,11 +403,12 @@ fn write_render_span(
                 .cell_mut((x + offset, y))
                 .expect("span was clipped to the buffer area");
             cell.reset();
+            symbols.charge(" ")?;
             cell.set_symbol(" ")
                 .set_style(style)
                 .set_diff_option(CellDiffOption::ForcedWidth(one));
         }
-        return width;
+        return Ok(width);
     }
 
     let forced_width = NonZeroU16::new(width).expect("projected atoms have nonzero width");
@@ -371,6 +416,7 @@ fn write_render_span(
         .cell_mut((x, y))
         .expect("span was clipped to the buffer area");
     cell.reset();
+    symbols.charge(text)?;
     cell.set_symbol(text)
         .set_style(style)
         .set_diff_option(CellDiffOption::ForcedWidth(forced_width));
@@ -381,7 +427,7 @@ fn write_render_span(
         cell.reset();
         cell.set_diff_option(CellDiffOption::Skip);
     }
-    width
+    Ok(width)
 }
 
 fn style_for(highlight: Highlight) -> Style {
@@ -393,7 +439,12 @@ fn style_for(highlight: Highlight) -> Style {
     }
 }
 
-fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Result<(), TutError> {
+fn render_projected_line(
+    buffer: &mut Buffer,
+    area: Rect,
+    text: &str,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
     let Some(content_width) = ContentWidth::new(area.width) else {
         return Ok(());
     };
@@ -415,19 +466,25 @@ fn render_projected_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Resul
             break;
         }
         x += write_render_span(
-            frame.buffer_mut(),
+            buffer,
             x,
             area.y,
             span.standalone_text(&row),
             &span,
             Highlight::None,
-        );
+            symbols,
+        )?;
         column = DisplayColumn::new(column.get() + u32::from(width));
     }
     Ok(())
 }
 
-fn render_centered_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Result<(), TutError> {
+fn render_centered_line(
+    buffer: &mut Buffer,
+    area: Rect,
+    text: &str,
+    symbols: &mut FrameSymbolMeter,
+) -> Result<(), TutError> {
     if area.width == 0 || area.height == 0 {
         return Ok(());
     }
@@ -436,9 +493,10 @@ fn render_centered_line(frame: &mut Frame<'_>, area: Rect, text: &str) -> Result
     let x = area.x + area.width.saturating_sub(used) / 2;
     let y = area.y + area.height.saturating_sub(1) / 2;
     render_projected_line(
-        frame,
+        buffer,
         Rect::new(x, y, area.right().saturating_sub(x), 1),
         &shown,
+        symbols,
     )
 }
 
@@ -747,8 +805,9 @@ mod tests {
 
     fn draw_available_into(terminal: &mut Terminal<TestBackend>, app: &mut crate::app::App) {
         let state = app.view_state().unwrap();
+        let mut symbols = FrameSymbolMeter::new(u64::MAX);
         terminal
-            .draw(|frame| render(frame, &state).unwrap())
+            .draw(|frame| render(frame, &state, &mut symbols).unwrap())
             .unwrap();
     }
 
@@ -771,7 +830,8 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         prepare_frame(app);
         let state = app.render_state().unwrap();
-        ReaderBody { rows: state.rows }.render(area, &mut buffer);
+        let mut symbols = FrameSymbolMeter::new(u64::MAX);
+        render_body(&mut buffer, area, state.rows, &mut symbols).unwrap();
         buffer
     }
 
@@ -781,6 +841,21 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_owned()
+    }
+
+    fn actual_symbol_heap_bytes(buffer: &Buffer) -> u64 {
+        buffer
+            .content()
+            .iter()
+            .map(|cell| {
+                let length = cell.symbol().len();
+                if length <= 24 {
+                    0
+                } else {
+                    u64::try_from(length.max(32)).unwrap()
+                }
+            })
+            .sum()
     }
 
     fn assert_copy_tiers(tiers: &[CopyTier]) {
@@ -862,6 +937,88 @@ mod tests {
         assert_eq!(pick_copy(6, TINY_COPY), "resize");
         assert_eq!(pick_copy(12, TINY_COPY), "resize q");
         assert_eq!(pick_copy(16, TINY_COPY), "resize  q quit");
+    }
+
+    #[test]
+    fn body_chrome_and_tiny_paths_charge_actual_buffer_symbols() {
+        let heap_grapheme = format!("a{}", "\u{0301}".repeat(12));
+        assert_eq!(heap_grapheme.len(), 25);
+
+        let mut app = app_from_text(Path::new("/tmp/body.txt"), heap_grapheme.clone());
+        app.update(Action::Resize(Geometry::new(16, 4))).unwrap();
+        prepare_frame(&mut app);
+        let state = app.render_state().unwrap();
+        let area = Rect::new(0, 0, 16, 1);
+        let mut body = Buffer::empty(area);
+        let mut body_symbols = FrameSymbolMeter::new(u64::MAX);
+        render_body(&mut body, area, state.rows, &mut body_symbols).unwrap();
+        assert_eq!(body.cell((0, 0)).unwrap().symbol(), heap_grapheme);
+        assert_eq!(body_symbols.used(), 32);
+        assert_eq!(body_symbols.used(), actual_symbol_heap_bytes(&body));
+
+        let mut chrome = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut chrome_symbols = FrameSymbolMeter::new(u64::MAX);
+        render_projected_line(
+            &mut chrome,
+            Rect::new(0, 0, 4, 1),
+            &heap_grapheme,
+            &mut chrome_symbols,
+        )
+        .unwrap();
+        assert_eq!(chrome.cell((0, 0)).unwrap().symbol(), heap_grapheme);
+        assert_eq!(chrome_symbols.used(), 32);
+        assert_eq!(chrome_symbols.used(), actual_symbol_heap_bytes(&chrome));
+
+        let mut tiny_app = app_from_text(Path::new("/tmp/tiny.txt"), "body".to_owned());
+        let state = tiny_app.view_state().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        let mut tiny_symbols = FrameSymbolMeter::new(u64::MAX);
+        terminal
+            .draw(|frame| render(frame, &state, &mut tiny_symbols).unwrap())
+            .unwrap();
+        assert_eq!(row_text(terminal.backend().buffer(), 0), "resize q");
+        assert_eq!(tiny_symbols.used(), 0);
+        assert_eq!(
+            tiny_symbols.used(),
+            actual_symbol_heap_bytes(terminal.backend().buffer())
+        );
+    }
+
+    #[test]
+    fn fresh_frames_and_smaller_resizes_do_not_accumulate_symbol_charges() {
+        let heap_grapheme = format!("a{}", "\u{0301}".repeat(12));
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+
+        for _ in 0..2 {
+            let mut symbols = FrameSymbolMeter::new(32);
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_projected_line(frame.buffer_mut(), area, &heap_grapheme, &mut symbols)
+                        .unwrap();
+                })
+                .unwrap();
+            assert_eq!(symbols.used(), 32);
+            assert_eq!(actual_symbol_heap_bytes(terminal.backend().buffer()), 32);
+        }
+
+        terminal.resize(Rect::new(0, 0, 2, 1)).unwrap();
+        let mut symbols = FrameSymbolMeter::new(0);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_projected_line(frame.buffer_mut(), area, "x", &mut symbols).unwrap();
+            })
+            .unwrap();
+        assert_eq!(symbols.used(), 0);
+        assert_eq!(actual_symbol_heap_bytes(terminal.backend().buffer()), 0);
+        assert!(
+            terminal
+                .current_buffer_mut()
+                .content()
+                .iter()
+                .all(|cell| cell == &ratatui::buffer::Cell::default())
+        );
     }
 
     #[test]

@@ -463,6 +463,65 @@ impl RenderRows {
             self.rows.as_ptr(),
         )
     }
+
+    #[cfg(test)]
+    pub(super) fn storage_bytes(&self) -> usize {
+        self.storage()
+            .bytes()
+            .expect("render-row storage capacities fit usize")
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_prebuilt_runs(
+        run: &str,
+        count: usize,
+        cell_width: u16,
+    ) -> Result<Self, TutError> {
+        let text_bytes = run
+            .len()
+            .checked_mul(count)
+            .ok_or(TutError::Allocation("test render rows"))?;
+        let mut text = String::new();
+        text.try_reserve_exact(text_bytes)
+            .map_err(|_| TutError::Allocation("test render rows"))?;
+        let mut spans = Vec::new();
+        spans
+            .try_reserve_exact(count)
+            .map_err(|_| TutError::Allocation("test render rows"))?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count)
+            .map_err(|_| TutError::Allocation("test render rows"))?;
+
+        for _ in 0..count {
+            let start = text.len();
+            text.push_str(run);
+            let end = text.len();
+            let span = spans.len();
+            spans.push(RenderSpan {
+                text: RenderTextRange::new(start, end),
+                source: GraphemeRange::new(
+                    SourceOffset::from_usize(start),
+                    SourceOffset::from_usize(end),
+                )
+                .expect("prebuilt test runs are nonempty"),
+                projection: RenderProjectionKind::Text,
+                cell_width: DisplayColumn::new(u32::from(cell_width)),
+            });
+            rows.push(RenderRowRange {
+                text: start..end,
+                spans: span..span + 1,
+            });
+        }
+
+        let rows = Self {
+            text,
+            spans,
+            rows,
+            reserve_attempts: RenderReserveAttempts::ZERO,
+        };
+        rows.storage().require(MAX_VISIBLE_RENDER_BYTES)?;
+        Ok(rows)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -488,6 +547,11 @@ impl<'a> RenderRowsView<'a> {
     #[cfg(test)]
     pub(super) const fn empty() -> Self {
         Self::new(&EMPTY_RENDER_ROWS, &[], None)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn from_rows(rows: &'a RenderRows) -> Self {
+        Self::new(rows, &[], None)
     }
 
     pub(super) fn iter(self) -> impl ExactSizeIterator<Item = RenderRow<'a>> + 'a {
