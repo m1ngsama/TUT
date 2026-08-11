@@ -859,6 +859,41 @@ mod pty {
     }
 
     #[test]
+    fn search_draft_recall_clear_and_replace_work_through_a_real_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        let mut text = String::new();
+        for line in 0..100 {
+            match line {
+                0 => text.push_str("START_SENTINEL\n"),
+                30 => text.push_str("alpha FIRST_RECALL_TARGET\n"),
+                70 => text.push_str("beta SECOND_REPLACEMENT_TARGET\n"),
+                _ => text.push_str("ordinary line\n"),
+            }
+        }
+        std::fs::write(file.path(), text).unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(b"START_SENTINEL").unwrap();
+        pty.master.write_all(b"/alpha\r").unwrap();
+        pty.wait_for(b"FIRST_RECALL_TARGET").unwrap();
+
+        let recall_start = pty.output.len();
+        pty.master.write_all(b"/\x1b[A").unwrap();
+        pty.wait_for_after(recall_start, b"alpha").unwrap();
+
+        let replacement_start = pty.output.len();
+        pty.master.write_all(b"\x15beta\r").unwrap();
+        pty.wait_for_after(replacement_start, b"SECOND_REPLACEMENT_TARGET")
+            .unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
     fn oversized_terminal_sequence_hits_a_bound_and_restores_the_terminal() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "bounded input\n").unwrap();
