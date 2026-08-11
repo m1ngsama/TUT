@@ -1,6 +1,6 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::app::{Action, Geometry, Mode};
+use crate::app::{Action, ContentMode, Geometry, Mode};
 
 const NON_TEXT_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
     .union(KeyModifiers::ALT)
@@ -28,8 +28,9 @@ pub(super) fn map_event(mode: &Mode, terminal_too_small: bool, event: Event) -> 
     }
 
     match mode {
-        Mode::Reading => map_reading_key(key),
-        Mode::SearchInput { .. } => map_search_key(key),
+        Mode::Content(ContentMode::Reading) => map_reading_key(key),
+        Mode::Content(ContentMode::SearchInput { .. }) => map_search_key(key),
+        Mode::Help { return_to } => map_help_key(return_to, key),
     }
 }
 
@@ -50,17 +51,43 @@ fn map_reading_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Char('/'), KeyModifiers::NONE) => Some(Action::BeginSearch),
         (KeyCode::Char('n'), KeyModifiers::NONE) => Some(Action::NextMatch),
         (KeyCode::Char('N'), KeyModifiers::SHIFT) => Some(Action::PreviousMatch),
-        (KeyCode::Esc, KeyModifiers::NONE) => Some(Action::SearchCancel),
-        (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Action::Quit),
+        (KeyCode::F(1), KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::ShowHelp)
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::SearchCancel)
+        }
+        (KeyCode::Char('q'), KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::Quit)
+        }
+        _ => None,
+    }
+}
+
+fn map_help_key(return_to: &ContentMode, key: KeyEvent) -> Option<Action> {
+    match (key.code, key.modifiers) {
+        (KeyCode::F(1) | KeyCode::Esc, KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::DismissHelp)
+        }
+        (KeyCode::Char('q'), KeyModifiers::NONE)
+            if key.kind == KeyEventKind::Press && matches!(return_to, ContentMode::Reading) =>
+        {
+            Some(Action::DismissHelp)
+        }
         _ => None,
     }
 }
 
 fn map_search_key(key: KeyEvent) -> Option<Action> {
     match (key.code, key.modifiers) {
+        (KeyCode::F(1), KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::ShowHelp)
+        }
         (KeyCode::Backspace, KeyModifiers::NONE) => Some(Action::SearchBackspace),
         (KeyCode::Enter, KeyModifiers::NONE) => Some(Action::SearchCommit),
-        (KeyCode::Esc, KeyModifiers::NONE) => Some(Action::SearchCancel),
+        (KeyCode::Esc, KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
+            Some(Action::SearchCancel)
+        }
         (KeyCode::Char(character), modifiers) if !modifiers.intersects(NON_TEXT_MODIFIERS) => {
             Some(Action::SearchInsert(character))
         }
@@ -81,6 +108,19 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         })
+    }
+
+    fn repeated_key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    const fn reading_mode() -> Mode {
+        Mode::Content(ContentMode::Reading)
     }
 
     #[test]
@@ -124,6 +164,7 @@ mod tests {
                 key(KeyCode::Char('N'), KeyModifiers::SHIFT),
                 Action::PreviousMatch,
             ),
+            (key(KeyCode::F(1), KeyModifiers::NONE), Action::ShowHelp),
             (key(KeyCode::Esc, KeyModifiers::NONE), Action::SearchCancel),
             (
                 key(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -131,19 +172,31 @@ mod tests {
             ),
             (key(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit),
         ] {
-            assert_eq!(map_event(&Mode::Reading, false, event), Some(action));
+            assert_eq!(map_event(&reading_mode(), false, event), Some(action));
         }
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key(KeyCode::Char('?'), KeyModifiers::SHIFT)
+            ),
+            None
+        );
     }
 
     #[test]
     fn search_mode_accepts_text_editing_but_not_reading_commands() {
-        let mode = Mode::SearchInput {
+        let mode = Mode::Content(ContentMode::SearchInput {
             draft: String::new(),
             limit_hit: false,
-        };
+        });
         assert_eq!(
             map_event(&mode, false, key(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::SearchInsert('q'))
+        );
+        assert_eq!(
+            map_event(&mode, false, key(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            Some(Action::SearchInsert('?'))
         );
         assert_eq!(
             map_event(&mode, false, key(KeyCode::Backspace, KeyModifiers::NONE)),
@@ -152,6 +205,10 @@ mod tests {
         assert_eq!(
             map_event(&mode, false, key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(Action::SearchCommit)
+        );
+        assert_eq!(
+            map_event(&mode, false, key(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(Action::ShowHelp)
         );
         assert_eq!(
             map_event(&mode, false, key(KeyCode::Esc, KeyModifiers::NONE)),
@@ -164,14 +221,90 @@ mod tests {
     }
 
     #[test]
+    fn help_mode_maps_dismissal_but_not_reader_commands() {
+        for event in [
+            key(KeyCode::F(1), KeyModifiers::NONE),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            key(KeyCode::Char('q'), KeyModifiers::NONE),
+        ] {
+            assert_eq!(
+                map_event(
+                    &Mode::Help {
+                        return_to: ContentMode::Reading,
+                    },
+                    false,
+                    event,
+                ),
+                Some(Action::DismissHelp)
+            );
+        }
+        assert_eq!(
+            map_event(
+                &Mode::Help {
+                    return_to: ContentMode::Reading,
+                },
+                false,
+                key(KeyCode::Char('j'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            map_event(
+                &Mode::Help {
+                    return_to: ContentMode::SearchInput {
+                        draft: "draft".to_owned(),
+                        limit_hit: false,
+                    },
+                },
+                false,
+                repeated_key(KeyCode::Char('q'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            map_event(
+                &Mode::Help {
+                    return_to: ContentMode::SearchInput {
+                        draft: "draft".to_owned(),
+                        limit_hit: false,
+                    },
+                },
+                false,
+                key(KeyCode::Char('q'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        assert_eq!(
+            map_event(
+                &Mode::Help {
+                    return_to: ContentMode::Reading,
+                },
+                false,
+                key(KeyCode::Char('?'), KeyModifiers::SHIFT)
+            ),
+            None
+        );
+        assert_eq!(
+            map_event(
+                &Mode::Help {
+                    return_to: ContentMode::Reading,
+                },
+                false,
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::Interrupt)
+        );
+    }
+
+    #[test]
     fn resize_and_tiny_terminal_rules_are_mode_aware() {
         assert_eq!(
-            map_event(&Mode::Reading, true, Event::Resize(80, 24)),
+            map_event(&reading_mode(), true, Event::Resize(80, 24)),
             Some(Action::Resize(Geometry::new(80, 24)))
         );
         assert_eq!(
             map_event(
-                &Mode::Reading,
+                &reading_mode(),
                 true,
                 key(KeyCode::Char('j'), KeyModifiers::NONE)
             ),
@@ -179,16 +312,16 @@ mod tests {
         );
         assert_eq!(
             map_event(
-                &Mode::Reading,
+                &reading_mode(),
                 true,
                 key(KeyCode::Char('q'), KeyModifiers::NONE)
             ),
             Some(Action::Quit)
         );
-        let search = Mode::SearchInput {
+        let search = Mode::Content(ContentMode::SearchInput {
             draft: String::new(),
             limit_hit: false,
-        };
+        });
         assert_eq!(
             map_event(&search, true, key(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::Quit)
@@ -201,6 +334,17 @@ mod tests {
             ),
             Some(Action::Interrupt)
         );
+
+        let help = Mode::Help {
+            return_to: ContentMode::Reading,
+        };
+        assert_eq!(
+            map_event(&help, true, key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::Quit)
+        );
+        for code in [KeyCode::F(1), KeyCode::Esc] {
+            assert_eq!(map_event(&help, true, key(code, KeyModifiers::NONE)), None);
+        }
     }
 
     #[test]
@@ -211,10 +355,40 @@ mod tests {
             kind: KeyEventKind::Release,
             state: KeyEventState::NONE,
         });
-        assert_eq!(map_event(&Mode::Reading, false, release), None);
+        assert_eq!(map_event(&reading_mode(), false, release), None);
         assert_eq!(
             map_event(
-                &Mode::Reading,
+                &reading_mode(),
+                false,
+                repeated_key(KeyCode::Char('j'), KeyModifiers::NONE)
+            ),
+            Some(Action::LineDown)
+        );
+        for code in [KeyCode::F(1), KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(
+                map_event(
+                    &reading_mode(),
+                    false,
+                    repeated_key(code, KeyModifiers::NONE)
+                ),
+                None
+            );
+        }
+        for code in [KeyCode::F(1), KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(
+                map_event(
+                    &Mode::Help {
+                        return_to: ContentMode::Reading,
+                    },
+                    false,
+                    repeated_key(code, KeyModifiers::NONE),
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            map_event(
+                &reading_mode(),
                 false,
                 Event::Mouse(MouseEvent {
                     kind: MouseEventKind::Moved,
