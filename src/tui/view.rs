@@ -12,16 +12,50 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     app::{
         Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, RenderProjectionKind,
-        RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus,
+        RenderRow, RenderRowsView, RenderSpan, RenderState, SearchStatus, ViewState,
     },
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
 };
 
 const TINY_MESSAGE: &str = "terminal too small — resize";
-const KEY_HELP: &str = "j/k ↑/↓ move  Space/b page  / search  n/N match  g/G ends  q quit";
+const READER_FOOTER: &str =
+    "F1 help  q quit  j/k lines  Space/b pages  / search  n/N matches  g/G ends";
+const SEARCH_FOOTER: &str = "F1 help  Enter apply  Esc cancel  Backspace delete  Ctrl-C interrupt";
+const HELP_TITLE: &str = "TUT keyboard help";
+const HELP_FOOTER: &str = "F1 / Esc close help";
+const READER_HELP_FOOTER: &str = "F1 / Esc / q close help";
+const COMPACT_HELP: &[&str] = &[
+    "j/k or Up/Down        move by line",
+    "/ search   n/N next/previous match",
+    "Space/b or PgDn/PgUp  move by page",
+    "g/G or Home/End       document ends",
+    "Ctrl-D/Ctrl-U         move by half page",
+    "Esc                   cancel or clear search",
+    "q quits reader        Ctrl-C interrupts",
+];
+const FULL_HELP: &[&str] = &[
+    "Navigation",
+    "  j / Down             next line",
+    "  k / Up               previous line",
+    "  Space / PageDown     next page",
+    "  b / PageUp           previous page",
+    "  Ctrl-F / Ctrl-B      next / previous page",
+    "  Ctrl-D / Ctrl-U      half page down / up",
+    "  g / Home             document start",
+    "  G / End              document end",
+    "Search",
+    "  /                    enter search",
+    "  Enter                apply search",
+    "  Esc                  cancel or clear search",
+    "  n / N                next / previous match",
+    "General",
+    "  F1                   open / close help",
+    "  q                    quit from reader mode",
+    "  Ctrl-C               interrupt",
+];
 
-pub(super) fn render(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), TutError> {
+pub(super) fn render(frame: &mut Frame<'_>, state: &ViewState<'_>) -> Result<(), TutError> {
     let area = frame.area();
     if area.width < MIN_TERMINAL_COLUMNS || area.height < MIN_TERMINAL_ROWS {
         render_projected_line(
@@ -32,9 +66,21 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(
         return Ok(());
     }
 
+    match state {
+        ViewState::Reader(state) => render_reader(frame, state),
+        ViewState::Help { q_closes } => render_help(frame, *q_closes),
+    }
+}
+
+fn render_reader(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(), TutError> {
+    let area = frame.area();
     let header_text = header_text(state, area.width)?;
     let status_text = status_text(state, area.width)?;
-    let help_text = ellipsize_end(KEY_HELP, area.width)?;
+    let footer = match state.status {
+        SearchStatus::Draft { .. } => SEARCH_FOOTER,
+        SearchStatus::None | SearchStatus::Committed { .. } => READER_FOOTER,
+    };
+    let help_text = ellipsize_end(footer, area.width)?;
     let body_height = area.height - 3;
     let header = Rect::new(area.x, area.y, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, body_height);
@@ -46,6 +92,33 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &RenderState<'_>) -> Result<(
     render_projected_line(frame, status, &status_text)?;
     render_projected_line(frame, help, &help_text)?;
     Ok(())
+}
+
+fn render_help(frame: &mut Frame<'_>, q_closes: bool) -> Result<(), TutError> {
+    let area = frame.area();
+    let title = Rect::new(area.x, area.y, area.width, 1);
+    let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+    let body_height = area.height - 2;
+    let lines = if usize::from(body_height) >= FULL_HELP.len() {
+        FULL_HELP
+    } else {
+        COMPACT_HELP
+    };
+
+    render_projected_line(frame, title, HELP_TITLE)?;
+    for (relative_y, line) in lines.iter().take(usize::from(body_height)).enumerate() {
+        let y = area.y + 1 + u16::try_from(relative_y).expect("help rows fit the terminal height");
+        render_projected_line(frame, Rect::new(area.x, y, area.width, 1), line)?;
+    }
+    let footer_text = ellipsize_end(
+        if q_closes {
+            READER_HELP_FOOTER
+        } else {
+            HELP_FOOTER
+        },
+        area.width,
+    )?;
+    render_projected_line(frame, footer, &footer_text)
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, rows: RenderRowsView<'_>) {
@@ -391,7 +464,7 @@ mod tests {
 
     fn draw_into(terminal: &mut Terminal<TestBackend>, app: &mut crate::app::App) {
         prepare_frame(app);
-        let state = app.render_state().unwrap();
+        let state = app.view_state().unwrap();
         terminal
             .draw(|frame| render(frame, &state).unwrap())
             .unwrap();
@@ -428,7 +501,67 @@ mod tests {
         let buffer = draw(&mut app, 40, 5);
         assert!(row_text(&buffer, 0).starts_with("book.txt"));
         assert_eq!(row_text(&buffer, 3), "100%  1/1");
-        assert!(row_text(&buffer, 4).contains("move"));
+        assert!(row_text(&buffer, 4).starts_with("F1 help"));
+    }
+
+    #[test]
+    fn footer_tracks_search_input_context() {
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
+        app.update(Action::Resize(Geometry::new(48, 4))).unwrap();
+        app.update(Action::BeginSearch).unwrap();
+
+        let buffer = draw(&mut app, 48, 4);
+        assert!(row_text(&buffer, 3).starts_with("F1 help  Enter apply  Esc cancel"));
+
+        app.update(Action::ShowHelp).unwrap();
+        let buffer = draw(&mut app, 48, 4);
+        assert_eq!(row_text(&buffer, 3), "F1 / Esc close help");
+    }
+
+    #[test]
+    fn help_renders_full_and_compact_keyboard_guides() {
+        let mut full = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
+        full.update(Action::Resize(Geometry::new(80, 24))).unwrap();
+        full.update(Action::ShowHelp).unwrap();
+        let full = draw(&mut full, 80, 24);
+        assert_eq!(row_text(&full, 0), "TUT keyboard help");
+        assert_eq!(row_text(&full, 1), "Navigation");
+        assert_eq!(row_text(&full, 10), "Search");
+        assert_eq!(row_text(&full, 15), "General");
+        assert_eq!(row_text(&full, 23), "F1 / Esc / q close help");
+
+        let mut compact = app_from_text(Path::new("/tmp/book.txt"), "body".to_owned());
+        compact
+            .update(Action::Resize(Geometry::new(16, 4)))
+            .unwrap();
+        compact.update(Action::ShowHelp).unwrap();
+        let compact = draw(&mut compact, 16, 4);
+        assert!(row_text(&compact, 0).starts_with("TUT keyboard"));
+        assert!(row_text(&compact, 1).starts_with("j/k or Up/Down"));
+        assert!(row_text(&compact, 2).starts_with("/ search"));
+        assert!(row_text(&compact, 3).starts_with("F1 / Esc"));
+    }
+
+    #[test]
+    fn dismissing_help_restores_reader_content_and_clears_overlay_rows() {
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_from_text(Path::new("/tmp/book.txt"), "reader body".to_owned());
+        app.update(Action::Resize(Geometry::new(40, 8))).unwrap();
+        draw_into(&mut terminal, &mut app);
+
+        app.update(Action::ShowHelp).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert!(row_text(terminal.backend().buffer(), 2).starts_with("/ search"));
+
+        app.update(Action::DismissHelp).unwrap();
+        draw_into(&mut terminal, &mut app);
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
+            "reader body"
+        );
+        assert_eq!(row_text(terminal.backend().buffer(), 2), "");
+        assert!(row_text(terminal.backend().buffer(), 7).starts_with("F1 help"));
     }
 
     #[test]

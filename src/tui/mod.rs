@@ -594,7 +594,7 @@ impl TerminalDriver for CrosstermDriver {
     }
 
     fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
-        let state = app.render_state()?;
+        let state = app.view_state()?;
         let mut view_result = Ok(());
         self.terminal
             .draw(|frame| {
@@ -934,6 +934,15 @@ mod tests {
         })
     }
 
+    fn help_event() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::F(1),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
     fn app() -> App {
         app_from_text(Path::new("/tmp/book.txt"), "body".to_owned())
     }
@@ -1245,6 +1254,44 @@ mod tests {
         );
         assert!(!driver.calls.contains(&"draw"));
         assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+    }
+
+    #[test]
+    fn help_draws_before_the_initial_reader_frame_is_complete() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((4096, 4));
+        driver
+            .events
+            .extend([help_event(), quit_event(), quit_event()]);
+        let mut recorder = TraceRecorder::default();
+        let mut app = app_from_text(Path::new("/tmp/help-render.txt"), "x".repeat(4096));
+
+        assert_eq!(
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+
+        assert_eq!(
+            driver.calls.iter().filter(|call| **call == "draw").count(),
+            1
+        );
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+        assert!(matches!(
+            app.mode(),
+            crate::app::Mode::Content(crate::app::ContentMode::Reading)
+        ));
+        assert_eq!(
+            recorder.operations,
+            [
+                (RuntimeOperation::Action, 0),
+                (RuntimeOperation::Background(BackgroundWork::Render), 1),
+                (RuntimeOperation::Draw, 2),
+                (RuntimeOperation::Action, 3),
+                (RuntimeOperation::Background(BackgroundWork::Render), 4),
+                (RuntimeOperation::Action, 5),
+            ]
+        );
     }
 
     #[test]

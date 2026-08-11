@@ -61,9 +61,31 @@ impl Geometry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Mode {
+pub(super) enum ContentMode {
     Reading,
     SearchInput { draft: String, limit_hit: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Mode {
+    Content(ContentMode),
+    Help { return_to: ContentMode },
+}
+
+impl Mode {
+    const fn content(&self) -> &ContentMode {
+        match self {
+            Self::Content(content) | Self::Help { return_to: content } => content,
+        }
+    }
+
+    const fn is_help(&self) -> bool {
+        matches!(self, Self::Help { .. })
+    }
+
+    const fn content_is_reading(&self) -> bool {
+        matches!(self.content(), ContentMode::Reading)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +106,8 @@ pub(super) enum Action {
     SearchCancel,
     NextMatch,
     PreviousMatch,
+    ShowHelp,
+    DismissHelp,
     Interrupt,
     Quit,
 }
@@ -473,6 +497,12 @@ pub(super) struct RenderState<'a> {
     pub status: SearchStatus<'a>,
 }
 
+#[derive(Debug)]
+pub(super) enum ViewState<'a> {
+    Reader(RenderState<'a>),
+    Help { q_closes: bool },
+}
+
 struct RenderViewportCache {
     geometry: Geometry,
     anchor: SourceOffset,
@@ -624,7 +654,7 @@ impl App {
             anchor_is_row_start: true,
             follow_end: false,
             geometry: Geometry::new(0, 0),
-            mode: Mode::Reading,
+            mode: Mode::Content(ContentMode::Reading),
             search: None,
             viewport_request: None,
             locator: None,
@@ -652,12 +682,12 @@ impl App {
     }
 
     pub(super) fn search_status(&self) -> SearchStatus<'_> {
-        match &self.mode {
-            Mode::SearchInput { draft, limit_hit } => SearchStatus::Draft {
+        match self.mode.content() {
+            ContentMode::SearchInput { draft, limit_hit } => SearchStatus::Draft {
                 draft,
                 limit_hit: *limit_hit,
             },
-            Mode::Reading => match &self.search {
+            ContentMode::Reading => match &self.search {
                 None => SearchStatus::None,
                 Some(search) => SearchStatus::Committed {
                     query: search.query(),
@@ -709,8 +739,12 @@ impl App {
             .filter(|cache| cache.geometry == key.geometry && cache.anchor == key.anchor)
     }
 
-    pub(super) fn frame_ready(&self) -> bool {
+    fn reader_frame_ready(&self) -> bool {
         !self.geometry.is_usable() || self.current_render_cache().is_some()
+    }
+
+    pub(super) fn frame_ready(&self) -> bool {
+        self.mode.is_help() || self.reader_frame_ready()
     }
 
     fn cancel_render_scan(&mut self) -> bool {
@@ -723,7 +757,7 @@ impl App {
     }
 
     pub(super) fn render_state(&mut self) -> Result<RenderState<'_>, TutError> {
-        debug_assert!(self.frame_ready());
+        debug_assert!(self.reader_frame_ready());
         let viewport = self.current_render_cache().map(|cache| cache.viewport);
         if viewport.is_some() {
             self.document.validate()?;
@@ -759,6 +793,15 @@ impl App {
         })
     }
 
+    pub(super) fn view_state(&mut self) -> Result<ViewState<'_>, TutError> {
+        if let Mode::Help { return_to } = &self.mode {
+            return Ok(ViewState::Help {
+                q_closes: matches!(return_to, ContentMode::Reading),
+            });
+        }
+        self.render_state().map(ViewState::Reader)
+    }
+
     fn prepare_search_highlights(&mut self, viewport: Option<Viewport>) -> Result<(), TutError> {
         let Some(_) = viewport else {
             if let Some(search) = &mut self.search {
@@ -766,7 +809,7 @@ impl App {
             }
             return Ok(());
         };
-        if !matches!(self.mode, Mode::Reading) {
+        if !matches!(self.mode, Mode::Content(ContentMode::Reading)) {
             if let Some(search) = &mut self.search {
                 search.invalidate_highlights();
             }
@@ -844,8 +887,7 @@ impl App {
     fn background_schedule(&self) -> Option<BackgroundSchedule> {
         let viewport_pending = self.geometry.is_usable()
             && self.viewport_request.is_some_and(|request| {
-                matches!(self.mode, Mode::Reading)
-                    || matches!(request, ViewportRequest::Reflow { .. })
+                self.mode.content_is_reading() || matches!(request, ViewportRequest::Reflow { .. })
             });
         if viewport_pending {
             let request = self
@@ -861,14 +903,14 @@ impl App {
             });
         }
 
-        if self.geometry.is_usable() && !self.frame_ready() {
+        if self.geometry.is_usable() && !self.reader_frame_ready() {
             return Some(BackgroundSchedule {
                 work: BackgroundWork::Render,
                 next_search_turn: None,
             });
         }
 
-        let search_pending = matches!(self.mode, Mode::Reading)
+        let search_pending = self.mode.content_is_reading()
             && self.geometry.is_usable()
             && self.search.as_ref().is_some_and(SearchSession::has_work);
         let line_pending = !self.document.line_index_complete();
@@ -1086,8 +1128,10 @@ impl App {
             return Ok(Outcome::Quit);
         }
 
-        let reading = matches!(self.mode, Mode::Reading);
-        let editing = matches!(self.mode, Mode::SearchInput { .. });
+        let reading = matches!(self.mode, Mode::Content(ContentMode::Reading));
+        let editing = matches!(self.mode, Mode::Content(ContentMode::SearchInput { .. }));
+        let content = matches!(self.mode, Mode::Content(_));
+        let helping = self.mode.is_help();
         let changed = match action {
             Action::Resize(geometry) => self.resize(geometry),
             Action::LineDown if reading => self.move_rows(true, 1),
@@ -1106,6 +1150,8 @@ impl App {
             Action::SearchCancel if reading => self.cancel_committed_search(),
             Action::NextMatch if reading => self.select_match(true)?,
             Action::PreviousMatch if reading => self.select_match(false)?,
+            Action::ShowHelp if content => self.show_help(),
+            Action::DismissHelp if helping => self.dismiss_help(),
             _ => false,
         };
 
@@ -1281,15 +1327,35 @@ impl App {
         if let Some(search) = &mut self.search {
             search.invalidate_highlights();
         }
-        self.mode = Mode::SearchInput {
+        self.mode = Mode::Content(ContentMode::SearchInput {
             draft: String::new(),
             limit_hit: false,
+        });
+        true
+    }
+
+    fn show_help(&mut self) -> bool {
+        let Mode::Content(return_to) =
+            std::mem::replace(&mut self.mode, Mode::Content(ContentMode::Reading))
+        else {
+            return false;
         };
+        self.mode = Mode::Help { return_to };
+        true
+    }
+
+    fn dismiss_help(&mut self) -> bool {
+        let Mode::Help { return_to } =
+            std::mem::replace(&mut self.mode, Mode::Content(ContentMode::Reading))
+        else {
+            return false;
+        };
+        self.mode = Mode::Content(return_to);
         true
     }
 
     fn insert_search(&mut self, character: char) -> Result<bool, TutError> {
-        let Mode::SearchInput { draft, limit_hit } = &mut self.mode else {
+        let Mode::Content(ContentMode::SearchInput { draft, limit_hit }) = &mut self.mode else {
             return Ok(false);
         };
         if draft.len() + character.len_utf8() > SEARCH_DRAFT_LIMIT_BYTES {
@@ -1306,7 +1372,7 @@ impl App {
     }
 
     fn backspace_search(&mut self) -> bool {
-        let Mode::SearchInput { draft, limit_hit } = &mut self.mode else {
+        let Mode::Content(ContentMode::SearchInput { draft, limit_hit }) = &mut self.mode else {
             return false;
         };
         let old_limit = *limit_hit;
@@ -1319,7 +1385,7 @@ impl App {
     }
 
     fn cancel_search(&mut self) -> bool {
-        self.mode = Mode::Reading;
+        self.mode = Mode::Content(ContentMode::Reading);
         true
     }
 
@@ -1336,7 +1402,8 @@ impl App {
     }
 
     fn commit_search(&mut self) -> Result<bool, TutError> {
-        let Mode::SearchInput { draft, .. } = std::mem::replace(&mut self.mode, Mode::Reading)
+        let Mode::Content(ContentMode::SearchInput { draft, .. }) =
+            std::mem::replace(&mut self.mode, Mode::Content(ContentMode::Reading))
         else {
             return Ok(false);
         };
@@ -2012,7 +2079,7 @@ mod tests {
 
     fn settle_frame(app: &mut App) {
         for _ in 0..BACKGROUND_STEP_LIMIT {
-            if app.frame_ready() {
+            if app.reader_frame_ready() {
                 return;
             }
             app.advance_background().unwrap();
@@ -2666,6 +2733,120 @@ mod tests {
     }
 
     #[test]
+    fn help_is_drawable_while_reader_render_continues() {
+        let mut app = app_from_text(Path::new("help-render.txt"), "x".repeat(4096));
+        app.update(Action::Resize(Geometry::new(4096, 4))).unwrap();
+        assert!(!app.reader_frame_ready());
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+
+        assert_eq!(app.update(Action::ShowHelp).unwrap(), Outcome::Changed);
+        assert!(app.frame_ready());
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Help { q_closes: true }
+        ));
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+        assert!(!app.advance_background().unwrap());
+        assert!(matches!(app.mode, Mode::Help { .. }));
+
+        assert_eq!(app.update(Action::DismissHelp).unwrap(), Outcome::Changed);
+        assert!(matches!(app.mode, Mode::Content(ContentMode::Reading)));
+        assert!(!app.frame_ready());
+        settle_frame(&mut app);
+        assert!(app.frame_ready());
+    }
+
+    #[test]
+    fn help_round_trip_preserves_search_drafts_and_reader_state() {
+        let mut app = reader("alpha beta alpha", 20, 4);
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::SearchInsert('α')).unwrap();
+        app.update(Action::SearchInsert('?')).unwrap();
+
+        assert_eq!(app.update(Action::ShowHelp).unwrap(), Outcome::Changed);
+        assert!(matches!(
+            &app.mode,
+            Mode::Help {
+                return_to: ContentMode::SearchInput { draft, limit_hit: false }
+            } if draft == "α?"
+        ));
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Help { q_closes: false }
+        ));
+        assert_eq!(app.update(Action::LineDown).unwrap(), Outcome::Unchanged);
+
+        assert_eq!(app.update(Action::DismissHelp).unwrap(), Outcome::Changed);
+        assert!(matches!(
+            &app.mode,
+            Mode::Content(ContentMode::SearchInput { draft, limit_hit: false })
+                if draft == "α?"
+        ));
+        assert_eq!(app.anchor, SourceOffset::ZERO);
+    }
+
+    #[test]
+    fn help_view_does_not_invalidate_search_highlights() {
+        let mut app = reader("cat cat", 16, 4);
+        commit(&mut app, "cat");
+        app.render_state().unwrap();
+        assert!(app.pending_highlight_cursors().is_some());
+        let pending = app.pending_highlight_cursors();
+
+        app.update(Action::ShowHelp).unwrap();
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Help { q_closes: true }
+        ));
+        assert_eq!(app.pending_highlight_cursors(), pending);
+        app.update(Action::DismissHelp).unwrap();
+
+        settle(&mut app);
+        app.render_state().unwrap();
+        let published = app.published_highlight_count();
+        assert!(published > 0);
+        app.update(Action::ShowHelp).unwrap();
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Help { q_closes: true }
+        ));
+        assert_eq!(app.published_highlight_count(), published);
+    }
+
+    #[test]
+    fn help_uses_the_underlying_mode_for_background_policy() {
+        let mut app = reader("0\n1\n2\n3\n4\n", 16, 4);
+        app.update(Action::LineDown).unwrap();
+        assert!(app.viewport_request.is_some());
+        app.update(Action::ShowHelp).unwrap();
+        settle_viewport(&mut app);
+        assert_eq!(app.anchor, SourceOffset::new(2));
+        assert!(matches!(
+            app.mode,
+            Mode::Help {
+                return_to: ContentMode::Reading
+            }
+        ));
+
+        app.update(Action::DismissHelp).unwrap();
+        submit(&mut app, "4");
+        assert!(app.search.as_ref().unwrap().has_work());
+        app.update(Action::BeginSearch).unwrap();
+        app.update(Action::ShowHelp).unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Help {
+                return_to: ContentMode::SearchInput { .. }
+            }
+        ));
+        assert!(!matches!(
+            app.background_work(),
+            Some(BackgroundWork::Viewport | BackgroundWork::Search)
+        ));
+        assert!(app.search.as_ref().unwrap().has_work());
+    }
+
+    #[test]
     fn explicit_navigation_cancels_a_pending_document_end() {
         let text = "x".repeat(SOURCE_WINDOW_BYTES * 2);
         let mut app = reader(&text, 16, 4);
@@ -2764,7 +2945,7 @@ mod tests {
         let mut app = reader("line", 10, 3);
         assert!(app.terminal_too_small());
         assert_eq!(app.update(Action::BeginSearch).unwrap(), Outcome::Unchanged);
-        assert!(matches!(app.mode(), Mode::Reading));
+        assert!(matches!(app.mode(), Mode::Content(ContentMode::Reading)));
         assert_eq!(app.update(Action::Interrupt).unwrap(), Outcome::Interrupt);
         assert_eq!(app.update(Action::Quit).unwrap(), Outcome::Quit);
     }
@@ -3690,7 +3871,10 @@ mod tests {
         app.update(Action::BeginSearch).unwrap();
         app.update(Action::SearchInsert('q')).unwrap();
 
-        assert!(matches!(app.mode, Mode::SearchInput { .. }));
+        assert!(matches!(
+            app.mode,
+            Mode::Content(ContentMode::SearchInput { .. })
+        ));
         assert!(matches!(
             &app.render_body,
             RenderBody::Scanning(job) if job.key == key
