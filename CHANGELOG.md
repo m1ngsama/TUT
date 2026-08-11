@@ -8,6 +8,8 @@ tag does not describe the present program or its compatibility.
 
 ## Unreleased
 
+## 0.0.5 - 2026-08-11
+
 ### Added
 
 - An in-application F1 help screen that can be opened while reading or entering
@@ -19,12 +21,18 @@ tag does not describe the present program or its compatibility.
 - Bounded numeric prefixes, up to 9999, for relative row, page, half-page, and
   search-match movement.
 - Search-draft recall with Up and whole-draft clearing with Ctrl-U.
+- Added the README, tut(1) manual, project principles, contribution and
+  security guidance, and automated documentation-contract checks.
 
 ### Changed
 
 - Long search drafts keep the most recently entered text visible.
 - Adjacent viewport movement reuses validated cached row frontiers instead of
   repeatedly projecting the full screen.
+- Make installation, verification, distribution checks, and uninstallation now
+  include the tut(1) manual page.
+
+See the [v0.0.5 release notes][v0.0.5] for the complete release description.
 
 ## 0.0.4 - 2026-08-11
 
@@ -64,6 +72,7 @@ See the [v0.0.3 release notes][v0.0.3] for the complete release description.
 
 See the [v0.0.2 release notes][v0.0.2] for the complete release description.
 
+[v0.0.5]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.5
 [v0.0.4]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.4
 [v0.0.3]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.3
 [v0.0.2]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.2
