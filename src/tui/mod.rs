@@ -425,22 +425,20 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
     recorder: &mut R,
 ) -> Primary {
     let mut redraw = true;
+    // Pending is a static shell. Background phases may request redraws while it stays visually
+    // identical, so only input, resize, or a completed frame starts another pending episode.
+    let mut pending_drawn = false;
 
     loop {
         if let Err(primary) = check_control(signals) {
             return primary;
         }
         if redraw && app.frame_ready() {
-            let started = recorder.begin_operation();
-            let result = driver.draw(app);
-            recorder.finish_operation(RuntimeOperation::Draw, started);
-            if let Err(primary) = check_control(signals) {
+            if let Err(primary) = draw_frame(app, driver, signals, recorder) {
                 return primary;
             }
-            if let Err(error) = result {
-                return Primary::Error(error);
-            }
             redraw = false;
+            pending_drawn = false;
         }
 
         let background_work = app.background_work();
@@ -465,6 +463,13 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             return primary;
         }
         if !ready {
+            if redraw && !app.frame_ready() && !pending_drawn {
+                if let Err(primary) = draw_frame(app, driver, signals, recorder) {
+                    return primary;
+                }
+                redraw = false;
+                pending_drawn = true;
+            }
             if let Some(work) = background_work {
                 match advance_background(app, signals, recorder, work) {
                     Ok(changed) => redraw |= changed,
@@ -491,6 +496,7 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             return primary;
         }
 
+        let mut input_changed = false;
         if let Event::Resize(width, height) = event {
             let validated = TerminalSize::new(width, height);
             if let Err(primary) = check_control(signals) {
@@ -512,6 +518,8 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
                         return primary;
                     }
                     redraw = true;
+                    pending_drawn = false;
+                    input_changed = true;
                 }
                 Ok(Outcome::Interrupt) => return Primary::Signal(ExternalSignal::Interrupt),
                 Ok(Outcome::Quit) => return Primary::Normal,
@@ -522,12 +530,23 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             let result = app.update(action);
             recorder.finish_operation(RuntimeOperation::Action, started);
             match result {
-                Ok(Outcome::Changed) => redraw = true,
+                Ok(Outcome::Changed) => {
+                    redraw = true;
+                    pending_drawn = false;
+                    input_changed = true;
+                }
                 Ok(Outcome::Unchanged) => {}
                 Ok(Outcome::Interrupt) => return Primary::Signal(ExternalSignal::Interrupt),
                 Ok(Outcome::Quit) => return Primary::Normal,
                 Err(error) => return Primary::Error(error),
             }
+        }
+        if input_changed && redraw && !app.frame_ready() && !pending_drawn {
+            if let Err(primary) = draw_frame(app, driver, signals, recorder) {
+                return primary;
+            }
+            redraw = false;
+            pending_drawn = true;
         }
         if let Some(work) = app.background_work() {
             match advance_background(app, signals, recorder, work) {
@@ -536,6 +555,20 @@ fn event_loop<T: TerminalDriver, R: RuntimeRecorder>(
             }
         }
     }
+}
+
+fn draw_frame<T: TerminalDriver, R: RuntimeRecorder>(
+    app: &mut App,
+    driver: &mut T,
+    signals: &SignalState,
+    recorder: &mut R,
+) -> Result<(), Primary> {
+    check_control(signals)?;
+    let started = recorder.begin_operation();
+    let result = driver.draw(app);
+    recorder.finish_operation(RuntimeOperation::Draw, started);
+    check_control(signals)?;
+    result.map_err(Primary::Error)
 }
 
 fn advance_background<R: RuntimeRecorder>(
@@ -676,7 +709,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::app::app_from_text;
+    use crate::app::{ViewState, app_from_text};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DrawKind {
+        Pending,
+        Reader,
+        Help,
+    }
 
     struct FakeDriver {
         calls: Vec<&'static str>,
@@ -691,6 +731,8 @@ mod tests {
         signals: SignalState,
         poll_timeouts: Vec<Duration>,
         signal_handlers_active: Option<Rc<StateCell<bool>>>,
+        draws: Vec<DrawKind>,
+        quit_after_reader_draw: bool,
     }
 
     impl FakeDriver {
@@ -708,6 +750,8 @@ mod tests {
                 signals: signals.clone(),
                 poll_timeouts: Vec::new(),
                 signal_handlers_active: None,
+                draws: Vec::new(),
+                quit_after_reader_draw: false,
             }
         }
 
@@ -820,11 +864,21 @@ mod tests {
         }
 
         fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
-            assert!(app.frame_ready());
+            let kind = match app.view_state()? {
+                ViewState::Pending(_) => DrawKind::Pending,
+                ViewState::Reader(_) => DrawKind::Reader,
+                ViewState::Help { .. } => DrawKind::Help,
+            };
+            self.draws.push(kind);
             self.call("draw").map_err(|source| TutError::Io {
                 operation: "draw terminal frame",
                 source,
-            })
+            })?;
+            if self.quit_after_reader_draw && kind == DrawKind::Reader {
+                self.quit_after_reader_draw = false;
+                self.events.push_back(quit_event());
+            }
+            Ok(())
         }
 
         fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
@@ -938,6 +992,15 @@ mod tests {
         Event::Key(KeyEvent {
             code: KeyCode::F(1),
             modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn document_end_event() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('G'),
+            modifiers: KeyModifiers::SHIFT,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         })
@@ -1227,9 +1290,156 @@ mod tests {
             RunOutcome::Normal
         );
 
+        assert!(driver.draws.is_empty());
         assert!(!driver.calls.contains(&"draw"));
         assert_eq!(recorder.operations, [(RuntimeOperation::Action, 0)]);
         assert!(app.has_background_work());
+    }
+
+    #[test]
+    fn initial_multistep_render_draws_one_pending_before_the_reader() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((4096, 4));
+        driver.quit_after_reader_draw = true;
+        let mut recorder = TraceRecorder::default();
+        let mut app = app_from_text(Path::new("/tmp/pending-render.txt"), "x".repeat(4096));
+
+        assert_eq!(
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+
+        assert_eq!(driver.draws, [DrawKind::Pending, DrawKind::Reader]);
+        let render_steps = recorder
+            .operations
+            .iter()
+            .filter(|(operation, _)| {
+                *operation == RuntimeOperation::Background(BackgroundWork::Render)
+            })
+            .count();
+        assert!(render_steps > 1);
+        assert_eq!(
+            recorder.operations.first().unwrap().0,
+            RuntimeOperation::Draw
+        );
+        assert_eq!(
+            recorder.operations[recorder.operations.len() - 2].0,
+            RuntimeOperation::Draw
+        );
+        assert_eq!(
+            recorder.operations.last().unwrap().0,
+            RuntimeOperation::Action
+        );
+    }
+
+    #[test]
+    fn document_end_before_the_first_reader_draws_one_pending_for_all_background_stages() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((16, 4));
+        driver.events.push_back(document_end_event());
+        driver.quit_after_reader_draw = true;
+        let mut recorder = TraceRecorder::default();
+        let mut app = app_from_text(
+            Path::new("/tmp/pending-document-end.txt"),
+            "x".repeat(crate::document::SOURCE_WINDOW_BYTES * 2 + 17),
+        );
+
+        assert_eq!(
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+
+        assert_eq!(driver.draws, [DrawKind::Pending, DrawKind::Reader]);
+        let pending_draw = recorder
+            .operations
+            .iter()
+            .position(|(operation, _)| *operation == RuntimeOperation::Draw)
+            .unwrap();
+        let first_viewport_step = recorder
+            .operations
+            .iter()
+            .position(|(operation, _)| {
+                *operation == RuntimeOperation::Background(BackgroundWork::Viewport)
+            })
+            .unwrap();
+        assert_eq!(recorder.operations[0].0, RuntimeOperation::Action);
+        assert!(pending_draw < first_viewport_step);
+        assert!(
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| {
+                    *operation == RuntimeOperation::Background(BackgroundWork::Viewport)
+                })
+                .count()
+                > 1
+        );
+    }
+
+    #[test]
+    fn pending_draw_failure_preempts_background_work() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.push_back((4096, 4));
+        driver.failures.push("draw");
+        let mut recorder = TraceRecorder::default();
+        let mut app = app_from_text(Path::new("/tmp/pending-failure.txt"), "x".repeat(4096));
+
+        let error =
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TutError::Io {
+                operation: "draw terminal frame",
+                ..
+            }
+        ));
+        assert_eq!(driver.draws, [DrawKind::Pending]);
+        assert_eq!(recorder.operations, [(RuntimeOperation::Draw, 0)]);
+        assert_eq!(app.background_work(), Some(BackgroundWork::Render));
+        assert!(
+            driver
+                .calls
+                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+        );
+    }
+
+    #[test]
+    fn pending_is_redrawn_once_after_suspend_and_resume() {
+        let signals = SignalState::empty();
+        let mut driver = FakeDriver::new(&signals);
+        driver.sizes.extend([(4096, 4), (4096, 4)]);
+        driver.quit_after_reader_draw = true;
+        let mut recorder = TraceRecorder {
+            suspend_after_render: Some(signals.clone()),
+            ..TraceRecorder::default()
+        };
+        let mut app = app_from_text(Path::new("/tmp/pending-resume.txt"), "x".repeat(4096));
+
+        assert_eq!(
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
+            RunOutcome::Normal
+        );
+
+        assert_eq!(
+            driver.draws,
+            [DrawKind::Pending, DrawKind::Pending, DrawKind::Reader]
+        );
+        assert_eq!(recorder.terminal_sessions, 2);
+        assert_eq!(recorder.suspensions, 1);
+        assert!(
+            recorder
+                .operations
+                .iter()
+                .filter(|(operation, _)| {
+                    *operation == RuntimeOperation::Background(BackgroundWork::Render)
+                })
+                .count()
+                > 1
+        );
     }
 
     #[test]
@@ -1257,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn help_draws_before_the_initial_reader_frame_is_complete() {
+    fn help_draws_before_the_initial_reader_frame_is_complete_and_closes_to_pending() {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.sizes.push_back((4096, 4));
@@ -1272,10 +1482,7 @@ mod tests {
             RunOutcome::Normal
         );
 
-        assert_eq!(
-            driver.calls.iter().filter(|call| **call == "draw").count(),
-            1
-        );
+        assert_eq!(driver.draws, [DrawKind::Help, DrawKind::Pending]);
         assert_eq!(app.background_work(), Some(BackgroundWork::Render));
         assert!(matches!(
             app.mode(),
@@ -1288,8 +1495,9 @@ mod tests {
                 (RuntimeOperation::Background(BackgroundWork::Render), 1),
                 (RuntimeOperation::Draw, 2),
                 (RuntimeOperation::Action, 3),
-                (RuntimeOperation::Background(BackgroundWork::Render), 4),
-                (RuntimeOperation::Action, 5),
+                (RuntimeOperation::Draw, 4),
+                (RuntimeOperation::Background(BackgroundWork::Render), 5),
+                (RuntimeOperation::Action, 6),
             ]
         );
     }
@@ -1789,11 +1997,14 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.inject_on = Some("poll");
+        let mut recorder = TraceRecorder::default();
 
         assert_eq!(
-            run_with_driver(&mut app, &mut driver, &signals).unwrap(),
+            run_with_test_recorder(&mut app, &mut driver, &signals, &mut recorder).unwrap(),
             RunOutcome::Signal(ExternalSignal::Terminate)
         );
+        assert!(driver.draws.is_empty());
+        assert!(recorder.operations.is_empty());
         assert_eq!(app.background_work(), Some(BackgroundWork::Render));
         assert_eq!(driver.poll_timeouts, vec![BACKGROUND_POLL]);
         assert!(
@@ -1820,9 +2031,12 @@ mod tests {
         );
         assert_eq!(
             recorder.operations,
-            [(RuntimeOperation::Background(BackgroundWork::Render), 0)]
+            [
+                (RuntimeOperation::Draw, 0),
+                (RuntimeOperation::Background(BackgroundWork::Render), 1)
+            ]
         );
-        assert!(!driver.calls.contains(&"draw"));
+        assert_eq!(driver.draws, [DrawKind::Pending]);
         assert_eq!(app.background_work(), Some(BackgroundWork::Render));
         assert!(
             driver
