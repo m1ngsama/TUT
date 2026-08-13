@@ -1131,7 +1131,7 @@ mod tests {
     use std::{cell::Cell, fs, path::Path};
 
     use super::*;
-    use crate::document::{Document, DocumentCache, load};
+    use crate::document::{Document, DocumentCache, load, overwrite_with_distinct_fingerprint};
     use tempfile::tempdir;
 
     struct Fixture {
@@ -1874,7 +1874,7 @@ mod tests {
             scanner
         };
 
-        fs::write(path, "x yzuvw").unwrap();
+        overwrite_with_distinct_fingerprint(&path, "x yzuvw");
         cache.reset_metrics();
         let error = {
             let mut reader = document.reader(&mut cache);

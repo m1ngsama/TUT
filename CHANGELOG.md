@@ -8,6 +8,8 @@ tag does not describe the present program or its compatibility.
 
 ## Unreleased
 
+## 0.0.6 - 2026-08-13
+
 ### Fixed
 
 - Heap-backed terminal cell symbols now share the 64 MiB terminal-buffer
@@ -15,6 +17,16 @@ tag does not describe the present program or its compatibility.
 - Repeated public `tut::run` calls now recover from a closed terminal input when
   the process binds a different terminal, without leaking signal registrations
   or losing the original EOF result.
+- CSI-u and Kitty keyboard events now preserve shifted and Caps-Lock ASCII
+  letters, distinguish physical command modifiers, and retain numeric prefixes
+  across separately reported modifier presses.
+- Zero-valued cursor and mouse coordinates from terminal event reports now
+  clamp to the origin instead of overflowing during parsing.
+- Session-log input-alias checks now re-resolve semantic path aliases before
+  opening and verify the opened file again before logging begins, rejecting
+  replacements already visible at either check.
+
+See the [v0.0.6 release notes][v0.0.6] for the complete release description.
 
 ## 0.0.5 - 2026-08-11
 
@@ -80,6 +92,7 @@ See the [v0.0.3 release notes][v0.0.3] for the complete release description.
 
 See the [v0.0.2 release notes][v0.0.2] for the complete release description.
 
+[v0.0.6]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.6
 [v0.0.5]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.5
 [v0.0.4]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.4
 [v0.0.3]: https://github.com/m1ngsama/TUT/releases/tag/v0.0.3

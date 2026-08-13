@@ -253,11 +253,21 @@ impl ActiveObserver {
                 path: path.clone(),
                 source,
             })?;
-        if input_identity.is_some_and(|input| {
-            input.pathname_matches(bound.identity(), resolved.identity())
+        // The retained anchor protects the slot opened at load time. Re-resolve the original
+        // pathname as well so a rebound symlink parent cannot expose a replacement as the log.
+        if let Some(input) = input_identity {
+            let current_location_matches = input
+                .current_location_matches(resolved.location())
+                .map_err(|source| LogError::Inspect {
+                    path: path.clone(),
+                    source,
+                })?;
+            if input.pathname_matches(bound.identity(), resolved.identity())
                 || input.location_matches(resolved.location())
-        }) {
-            return Err(LogError::InputConflict(path));
+                || current_location_matches
+            {
+                return Err(LogError::InputConflict(path));
+            }
         }
         // The compared pathname slot and the log open stay anchored to this directory fd.
         let descriptor = resolved
@@ -275,13 +285,20 @@ impl ActiveObserver {
                 source,
             })?;
         let file = File::from(descriptor);
+        // Repeat the current-path comparison against the opened fd to narrow the rebind window.
         if let Some(input) = input_identity
-            && input
+            && (input
                 .current_leaf_matches(&file)
                 .map_err(|source| LogError::Inspect {
                     path: path.clone(),
                     source,
                 })?
+                || input
+                    .current_path_matches(&file)
+                    .map_err(|source| LogError::Inspect {
+                        path: path.clone(),
+                        source,
+                    })?)
         {
             return Err(LogError::InputConflict(path));
         }
@@ -679,6 +696,43 @@ mod tests {
                 document.input_identity(),
             ),
             Err(LogError::InputConflict(path)) if path == input
+        ));
+        assert_eq!(fs::read(real.join("input.txt")).unwrap(), expected);
+    }
+
+    #[test]
+    fn semantic_alias_rebinding_cannot_turn_the_current_replacement_into_a_log() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        let child = real.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(real.join("input.txt"), "original input").unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let input = alias.join("..").join("input.txt");
+        let document = crate::document::load(input).unwrap();
+
+        fs::rename(&real, directory.path().join("moved")).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        fs::write(real.join("input.txt"), "replacement must remain unchanged").unwrap();
+        fs::set_permissions(real.join("input.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = fs::read(real.join("input.txt")).unwrap();
+        let lexical_component = directory.path().join("lexical-component");
+        fs::create_dir(&lexical_component).unwrap();
+        let log_alias = lexical_component
+            .join("..")
+            .join("alias")
+            .join("..")
+            .join("input.txt");
+        let mut observer = Observer::new(Some(log_alias.clone()));
+
+        assert!(matches!(
+            observer.start(
+                InputKind::Path,
+                document.content_len(),
+                document.input_identity(),
+            ),
+            Err(LogError::InputConflict(path)) if path == log_alias
         ));
         assert_eq!(fs::read(real.join("input.txt")).unwrap(), expected);
     }

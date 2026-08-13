@@ -191,6 +191,7 @@ The normal local checks mirror the CI gates:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --locked
+cargo audit --file Cargo.lock
 make distcheck
 ```
 

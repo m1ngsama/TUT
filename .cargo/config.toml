@@ -1,2 +1,2 @@
 [patch.crates-io]
-crossterm = { git = "https://github.com/m1ngsama/crossterm.git", rev = "e3888223b5064543484cc08c3966cc05d711003a" }
+crossterm = { git = "https://github.com/m1ngsama/crossterm.git", rev = "0e7e884bafd39135bf926fe60e9ae70852f304a8" }
