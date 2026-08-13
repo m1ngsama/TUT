@@ -1,4 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 use crate::app::{Action, ContentMode, Geometry, Mode};
 
@@ -7,6 +7,33 @@ const NON_TEXT_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
     .union(KeyModifiers::SUPER)
     .union(KeyModifiers::HYPER)
     .union(KeyModifiers::META);
+
+fn normalize_key_case(mut key: KeyEvent) -> KeyEvent {
+    let KeyCode::Char(character) = key.code else {
+        return key;
+    };
+    if !character.is_ascii_alphabetic() {
+        return key;
+    }
+
+    // Legacy and original CSI-u input contain the produced character, while Kitty-style CSI-u's
+    // primary codepoint is the unshifted key. Crossterm can also consume SHIFT when a Kitty
+    // alternate keycode supplies the produced character. Treat an uppercase codepoint as the
+    // consumed SHIFT representation, then apply Caps Lock only to text-like keys. Lock state must
+    // not change physical Ctrl/Alt shortcut matching (for example, Ctrl-C remains Ctrl-C while
+    // Caps Lock is on).
+    let shifted = character.is_ascii_uppercase() || key.modifiers.contains(KeyModifiers::SHIFT);
+    let uppercase = shifted
+        ^ (key.state.contains(KeyEventState::CAPS_LOCK)
+            && !key.modifiers.intersects(NON_TEXT_MODIFIERS));
+    key.code = KeyCode::Char(if uppercase {
+        character.to_ascii_uppercase()
+    } else {
+        character.to_ascii_lowercase()
+    });
+    key.modifiers.set(KeyModifiers::SHIFT, uppercase);
+    key
+}
 
 pub(super) fn map_event(
     mode: &Mode,
@@ -24,11 +51,17 @@ pub(super) fn map_event(
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
+    // Crossterm treats `Char('g') + SHIFT` and `Char('G') + SHIFT` as the same key,
+    // but different terminal protocols can emit either representation. Canonicalize before
+    // matching commands or inserting search text so their behavior agrees as well.
+    let key = normalize_key_case(key);
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
         return Some(Action::Interrupt);
     }
     if terminal_too_small {
-        return (key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE)
+        return (key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('q')
+            && key.modifiers == KeyModifiers::NONE)
             .then_some(Action::Quit);
     }
 
@@ -79,6 +112,12 @@ fn map_reading_key(key: KeyEvent, repeat_active: bool) -> Option<Action> {
         (KeyCode::Char('q'), KeyModifiers::NONE) if key.kind == KeyEventKind::Press => {
             Some(Action::Quit)
         }
+        // Kitty can report modifier and lock keys separately. They change the following chord
+        // rather than acting as unknown commands, so they must not discard an active repeat
+        // prefix.
+        (KeyCode::Modifier(_) | KeyCode::CapsLock | KeyCode::ScrollLock | KeyCode::NumLock, _) => {
+            None
+        }
         _ if key.kind == KeyEventKind::Press && repeat_active => Some(Action::RepeatCancel),
         _ => None,
     }
@@ -123,7 +162,7 @@ fn map_search_key(key: KeyEvent) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyEventState, MouseEvent, MouseEventKind};
+    use crossterm::event::{ModifierKeyCode, MouseEvent, MouseEventKind};
 
     use super::*;
 
@@ -137,11 +176,24 @@ mod tests {
     }
 
     fn repeated_key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        key_with_kind_and_state(code, modifiers, KeyEventKind::Repeat, KeyEventState::NONE)
+    }
+
+    fn key_with_state(code: KeyCode, modifiers: KeyModifiers, state: KeyEventState) -> Event {
+        key_with_kind_and_state(code, modifiers, KeyEventKind::Press, state)
+    }
+
+    fn key_with_kind_and_state(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        kind: KeyEventKind,
+        state: KeyEventState,
+    ) -> Event {
         Event::Key(KeyEvent {
             code,
             modifiers,
-            kind: KeyEventKind::Repeat,
-            state: KeyEventState::NONE,
+            kind,
+            state,
         })
     }
 
@@ -251,6 +303,21 @@ mod tests {
             map(true, key(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             Some(Action::RepeatCancel)
         );
+        for (code, modifiers) in [
+            (ModifierKeyCode::LeftShift, KeyModifiers::SHIFT),
+            (ModifierKeyCode::RightControl, KeyModifiers::CONTROL),
+            (ModifierKeyCode::LeftAlt, KeyModifiers::ALT),
+            (ModifierKeyCode::RightSuper, KeyModifiers::SUPER),
+            (ModifierKeyCode::LeftHyper, KeyModifiers::HYPER),
+            (ModifierKeyCode::RightMeta, KeyModifiers::META),
+            (ModifierKeyCode::IsoLevel3Shift, KeyModifiers::NONE),
+            (ModifierKeyCode::IsoLevel5Shift, KeyModifiers::NONE),
+        ] {
+            assert_eq!(map(true, key(KeyCode::Modifier(code), modifiers)), None);
+        }
+        for code in [KeyCode::CapsLock, KeyCode::ScrollLock, KeyCode::NumLock] {
+            assert_eq!(map(true, key(code, KeyModifiers::NONE)), None);
+        }
         assert_eq!(
             map(true, key(KeyCode::Char('g'), KeyModifiers::NONE)),
             Some(Action::DocumentStart)
@@ -315,10 +382,19 @@ mod tests {
             map_event(&mode, false, key(KeyCode::Esc, KeyModifiers::NONE)),
             Some(Action::SearchCancel)
         );
-        assert_eq!(
-            map_event(&mode, false, key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
-            None
-        );
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ] {
+            assert_eq!(
+                map_event(&mode, false, key(KeyCode::Char('x'), modifiers)),
+                None
+            );
+        }
         assert_eq!(
             map_event(&mode, false, repeated_key(KeyCode::Up, KeyModifiers::NONE)),
             None
@@ -330,6 +406,171 @@ mod tests {
                 repeated_key(KeyCode::Char('u'), KeyModifiers::CONTROL)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn csi_u_case_representations_are_normalized_before_mapping() {
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key(KeyCode::Char('g'), KeyModifiers::SHIFT)
+            ),
+            Some(Action::DocumentEnd)
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key(KeyCode::Char('N'), KeyModifiers::NONE)
+            ),
+            Some(Action::PreviousMatch)
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key(KeyCode::Char('q'), KeyModifiers::SHIFT)
+            ),
+            None
+        );
+
+        let search = Mode::Content(ContentMode::SearchInput {
+            draft: String::new(),
+            limit_hit: false,
+        });
+        assert_eq!(
+            map_event(&search, false, key(KeyCode::Char('a'), KeyModifiers::SHIFT)),
+            Some(Action::SearchInsert('A'))
+        );
+    }
+
+    #[test]
+    fn reader_commands_and_interrupt_require_exact_physical_modifiers() {
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        ] {
+            for character in ['g', 'n', 'q'] {
+                assert_eq!(
+                    map_event(
+                        &reading_mode(),
+                        false,
+                        key(KeyCode::Char(character), modifiers),
+                    ),
+                    None
+                );
+            }
+        }
+
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                map_event(&reading_mode(), false, key(KeyCode::Char('c'), modifiers),),
+                None
+            );
+        }
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            Some(Action::Interrupt)
+        );
+    }
+
+    #[test]
+    fn kitty_caps_lock_state_preserves_text_case_without_changing_control_shortcuts() {
+        let caps_lock = KeyEventState::CAPS_LOCK;
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key_with_state(KeyCode::Char('g'), KeyModifiers::NONE, caps_lock),
+            ),
+            Some(Action::DocumentEnd)
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key_with_state(KeyCode::Char('n'), KeyModifiers::NONE, caps_lock),
+            ),
+            Some(Action::PreviousMatch)
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key_with_state(KeyCode::Char('q'), KeyModifiers::NONE, caps_lock),
+            ),
+            None
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key_with_state(KeyCode::Char('g'), KeyModifiers::SHIFT, caps_lock),
+            ),
+            Some(Action::DocumentStart)
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                false,
+                key_with_state(KeyCode::Char('q'), KeyModifiers::SHIFT, caps_lock),
+            ),
+            Some(Action::Quit)
+        );
+
+        for (modifiers, expected) in [
+            (KeyModifiers::CONTROL, Some(Action::Interrupt)),
+            (KeyModifiers::CONTROL | KeyModifiers::SHIFT, None),
+        ] {
+            assert_eq!(
+                map_event(
+                    &reading_mode(),
+                    false,
+                    key_with_state(KeyCode::Char('c'), modifiers, caps_lock),
+                ),
+                expected
+            );
+        }
+
+        let search = Mode::Content(ContentMode::SearchInput {
+            draft: String::new(),
+            limit_hit: false,
+        });
+        assert_eq!(
+            map_event(
+                &search,
+                false,
+                key_with_state(KeyCode::Char('a'), KeyModifiers::NONE, caps_lock),
+            ),
+            Some(Action::SearchInsert('A'))
+        );
+        assert_eq!(
+            map_event(
+                &search,
+                false,
+                key_with_state(KeyCode::Char('a'), KeyModifiers::SHIFT, caps_lock),
+            ),
+            Some(Action::SearchInsert('a'))
         );
     }
 
@@ -441,6 +682,14 @@ mod tests {
                 key(KeyCode::Char('q'), KeyModifiers::NONE)
             ),
             Some(Action::Quit)
+        );
+        assert_eq!(
+            map_event(
+                &reading_mode(),
+                true,
+                repeated_key(KeyCode::Char('q'), KeyModifiers::NONE)
+            ),
+            None
         );
         let search = Mode::Content(ContentMode::SearchInput {
             draft: String::new(),

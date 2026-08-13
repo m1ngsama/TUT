@@ -2699,7 +2699,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::layout::DisplayAtoms;
+    use crate::{document::overwrite_with_distinct_fingerprint, layout::DisplayAtoms};
 
     const BACKGROUND_STEP_LIMIT: usize = 100_000;
 
@@ -3579,7 +3579,7 @@ mod tests {
         app.update(Action::LineDown).unwrap();
         assert_eq!(app.background_work(), Some(BackgroundWork::Viewport));
 
-        fs::write(path, "y".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+        overwrite_with_distinct_fingerprint(&path, "y".repeat(SOURCE_WINDOW_BYTES * 3));
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
         assert_eq!(app.anchor, anchor);
@@ -3606,7 +3606,7 @@ mod tests {
         app.update(Action::LineDown).unwrap();
         let request = app.viewport_request.unwrap();
         assert_eq!(app.cached_viewport_location(request), None);
-        fs::write(path, "y".repeat(SOURCE_WINDOW_BYTES * 3)).unwrap();
+        overwrite_with_distinct_fingerprint(&path, "y".repeat(SOURCE_WINDOW_BYTES * 3));
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
         assert_eq!(app.anchor, warm_anchor);
@@ -5599,7 +5599,7 @@ mod tests {
         settle_frame(&mut app);
         assert_eq!(published_boundary(&mut app), Some(ViewportBoundary::All));
 
-        fs::write(&path, "other").unwrap();
+        overwrite_with_distinct_fingerprint(&path, "other");
 
         assert!(matches!(app.render_state(), Err(TutError::Load(_))));
     }
@@ -5697,7 +5697,7 @@ mod tests {
 
         assert!(!app.advance_background().unwrap());
         assert!(matches!(app.render_body, RenderBody::Scanning(_)));
-        fs::write(path, "y".repeat(4096)).unwrap();
+        overwrite_with_distinct_fingerprint(&path, "y".repeat(4096));
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
         assert!(matches!(app.render_body, RenderBody::Empty));
@@ -5716,7 +5716,7 @@ mod tests {
 
         app.update(Action::LineDown).unwrap();
         settle_viewport(&mut app);
-        fs::write(path, "y".repeat(128)).unwrap();
+        overwrite_with_distinct_fingerprint(&path, "y".repeat(128));
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
         assert!(app.render_cache().is_none());
@@ -5819,7 +5819,7 @@ mod tests {
         app.update(Action::LineDown).unwrap();
         settle(&mut app);
 
-        fs::write(&path, "y".repeat(64)).unwrap();
+        overwrite_with_distinct_fingerprint(&path, "y".repeat(64));
         app.update(Action::LineUp).unwrap();
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
@@ -5856,7 +5856,7 @@ mod tests {
             let old_anchor = app.anchor;
             let old_follow_end = app.follow_end;
 
-            fs::write(&path, "y".repeat(83)).unwrap();
+            overwrite_with_distinct_fingerprint(&path, "y".repeat(83));
 
             assert!(
                 matches!(app.advance_viewport_locator(), Err(TutError::Load(_))),
@@ -5881,7 +5881,7 @@ mod tests {
         settle(&mut app);
         assert!(app.search.as_ref().unwrap().has_cached_block());
 
-        fs::write(&path, "dog dog dog").unwrap();
+        overwrite_with_distinct_fingerprint(&path, "dog dog dog");
         app.update(Action::NextMatch).unwrap();
 
         assert!(matches!(app.advance_background(), Err(TutError::Load(_))));
@@ -5897,7 +5897,7 @@ mod tests {
         commit(&mut app, "dog");
         assert!(app.search.as_ref().unwrap().no_matches());
 
-        fs::write(&path, "dog").unwrap();
+        overwrite_with_distinct_fingerprint(&path, "dog");
 
         assert!(matches!(
             app.update(Action::NextMatch),

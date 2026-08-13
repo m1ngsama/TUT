@@ -1242,6 +1242,21 @@ pub(super) struct InputIdentity<'a> {
 }
 
 impl InputIdentity<'_> {
+    fn current_path(self) -> std::io::Result<Option<ResolvedPath>> {
+        match ResolvedPath::parent(self.path.pathname.exact_path()) {
+            Ok(current) => Ok(Some(current)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn pathname_matches(self, pathname: &PathIdentity, resolved: &PathIdentity) -> bool {
         self.path.pathname.exactly_matches(pathname)
             || (self.path.lexical_location
@@ -1253,11 +1268,29 @@ impl InputIdentity<'_> {
         self.path.resolved.location() == location
     }
 
+    pub(super) fn current_location_matches(
+        self,
+        location: &ResolvedPathLocation,
+    ) -> std::io::Result<bool> {
+        Ok(self
+            .current_path()?
+            .is_some_and(|current| current.location() == location))
+    }
+
     pub(super) fn current_leaf_matches(
         self,
         file: &impl std::os::fd::AsFd,
     ) -> std::io::Result<bool> {
         self.path.resolved.current_leaf_matches(file)
+    }
+
+    pub(super) fn current_path_matches(
+        self,
+        file: &impl std::os::fd::AsFd,
+    ) -> std::io::Result<bool> {
+        self.current_path()?.map_or(Ok(false), |current| {
+            current.into_anchor().current_leaf_matches(file)
+        })
     }
 
     pub(super) fn file_matches(self, metadata: &std::fs::Metadata) -> bool {
@@ -1287,6 +1320,41 @@ impl FileFingerprint {
     const fn identity(self) -> FileIdentity {
         FileIdentity::new(self.device, self.inode)
     }
+}
+
+#[cfg(test)]
+/// Overwrites a tracked test file while making the fingerprint change deterministic.
+///
+/// Some filesystems coalesce rapid timestamp updates, so an equal-length write can otherwise
+/// leave the complete metadata fingerprint unchanged even though the contents differ.
+pub(super) fn overwrite_with_distinct_fingerprint(path: &Path, contents: impl AsRef<[u8]>) {
+    let before_metadata = std::fs::metadata(path).expect("test input metadata is readable");
+    let before = FileFingerprint::from_metadata(&before_metadata);
+    std::fs::write(path, contents).expect("test input can be overwritten");
+
+    let mut after = FileFingerprint::from_metadata(
+        &std::fs::metadata(path).expect("overwritten test input metadata is readable"),
+    );
+    if after == before {
+        let modified = before_metadata
+            .modified()
+            .expect("test input has a modification time")
+            .checked_add(std::time::Duration::from_secs(1))
+            .expect("test input modification time can advance");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("overwritten test input can be reopened")
+            .set_modified(modified)
+            .expect("test input modification time can advance");
+        after = FileFingerprint::from_metadata(
+            &std::fs::metadata(path).expect("retimed test input metadata is readable"),
+        );
+    }
+    assert_ne!(
+        after, before,
+        "test input overwrite must change its tracked fingerprint"
+    );
 }
 
 impl FileStore {
@@ -2032,7 +2100,7 @@ mod tests {
         let path = directory.path().join("changing.txt");
         fs::write(&path, "stable").unwrap();
         let document = load(path.clone()).unwrap();
-        fs::write(path, "change").unwrap();
+        overwrite_with_distinct_fingerprint(&path, "change");
 
         let mut cache = DocumentCache::default();
         let mut reader = document.reader(&mut cache);
@@ -2063,7 +2131,7 @@ mod tests {
             );
         }
 
-        fs::write(path, "change").unwrap();
+        overwrite_with_distinct_fingerprint(&path, "change");
         let mut reader = document.reader(&mut cache);
         assert!(matches!(
             reader.graphemes(SourceOffset::ZERO),

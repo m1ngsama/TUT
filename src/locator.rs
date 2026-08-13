@@ -675,7 +675,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::{Document, DocumentCache, SOURCE_WINDOW_BYTES, load},
+        document::{
+            Document, DocumentCache, SOURCE_WINDOW_BYTES, load, overwrite_with_distinct_fingerprint,
+        },
         error::LayoutError,
         layout::rebuild_viewport_layout,
     };
@@ -1494,7 +1496,7 @@ mod tests {
         );
         assert!(locator.row_scan.is_some());
         let history = locator.history.clone();
-        fs::write(path, "y".repeat(2_048)).unwrap();
+        overwrite_with_distinct_fingerprint(&path, "y".repeat(2_048));
 
         assert!(matches!(
             advance(&mut locator, &layout, &document, &mut cache, &mut rows),

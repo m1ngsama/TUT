@@ -21,6 +21,19 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
+Audit the locked dependency graph with the same `cargo-audit` release used by
+CI:
+
+```sh
+cargo install cargo-audit --locked --version '=0.22.2'
+cargo audit --file Cargo.lock
+```
+
+CI runs this RustSec vulnerability check for every pull request and main-branch
+push, and weekly so newly published advisories are detected without a dependency
+change. Informational warnings remain visible for review but do not fail the
+gate.
+
 Before requesting review, also run the release and distribution checks when the
 change can affect arithmetic, packaging, installation, or terminal behavior:
 

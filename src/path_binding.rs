@@ -78,6 +78,10 @@ impl PathIdentity {
         self.exact == other.exact
     }
 
+    pub(super) fn exact_path(&self) -> &Path {
+        &self.exact
+    }
+
     pub(super) fn normalized_matches(&self, other: &Self) -> bool {
         self.normalized == other.normalized
     }

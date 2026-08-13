@@ -168,8 +168,8 @@ mod pty {
     const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
     const NESTED_RAW_HELPER: &str = "TUT_TEST_NESTED_RAW_HELPER";
     const REUSABLE_RUN_HELPER: &str = "TUT_TEST_REUSABLE_RUN_HELPER";
+    const REUSABLE_RUN_FD: &str = "TUT_TEST_REUSABLE_RUN_FD";
     const FIRST_RUN_EOF: &[u8] = b"TUT_TEST_FIRST_RUN_EOF";
-    const REPLACEMENT_TTY_FD: libc::c_int = 200;
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn reset_signal_state() -> io::Result<()> {
@@ -368,19 +368,17 @@ mod pty {
                     "--nocapture",
                 ])
                 .env(REUSABLE_RUN_HELPER, path)
+                .env(REUSABLE_RUN_FD, replacement_fd.to_string())
                 .stdin(Stdio::from(terminal_input))
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::piped());
             configure_child_session(&mut command, Some(controlling_name));
-            // The child setup only duplicates an already-open descriptor onto a fixed inherited
-            // slot. dup2 and fcntl are async-signal-safe on both supported test targets.
+            // The child setup only clears close-on-exec on an already-open descriptor. fcntl is
+            // async-signal-safe on both supported test targets. Passing the allocated descriptor
+            // avoids assuming that a fixed high slot is below the process file-descriptor limit.
             unsafe {
                 command.pre_exec(move || {
-                    let result = if replacement_fd == REPLACEMENT_TTY_FD {
-                        libc::fcntl(REPLACEMENT_TTY_FD, libc::F_SETFD, 0)
-                    } else {
-                        libc::dup2(replacement_fd, REPLACEMENT_TTY_FD)
-                    };
+                    let result = libc::fcntl(replacement_fd, libc::F_SETFD, 0);
                     if result == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -851,7 +849,7 @@ mod pty {
         assert_terminal_configuration(&restored, &initial);
     }
 
-    fn exercise_reusable_run(path: &Path) {
+    fn exercise_reusable_run(path: &Path, replacement_fd: libc::c_int) {
         let first = tut::run([path.as_os_str().to_owned()]).unwrap_err();
         match first {
             tut::TutError::Io { operation, source } => {
@@ -862,9 +860,9 @@ mod pty {
             error => panic!("expected terminal EOF from the first run, got {error:?}"),
         }
 
-        // SAFETY: the parent installed this owned inherited descriptor before exec and invokes
-        // this branch only in the dedicated helper process. File takes over the inherited slot.
-        let replacement = unsafe { File::from_raw_fd(REPLACEMENT_TTY_FD) };
+        // SAFETY: the parent preserved this owned descriptor across exec and invokes this branch
+        // only in the dedicated helper process. File takes over the inherited descriptor.
+        let replacement = unsafe { File::from_raw_fd(replacement_fd) };
         rustix::stdio::dup2_stdin(&replacement).unwrap();
         drop(replacement);
         io::stdout().write_all(FIRST_RUN_EOF).unwrap();
@@ -902,7 +900,11 @@ mod pty {
     #[test]
     fn public_run_rebinds_terminal_input_after_eof() {
         if let Some(path) = std::env::var_os(REUSABLE_RUN_HELPER) {
-            exercise_reusable_run(Path::new(&path));
+            let replacement_fd = std::env::var(REUSABLE_RUN_FD)
+                .expect("reusable-run helper descriptor is configured")
+                .parse()
+                .expect("reusable-run helper descriptor is numeric");
+            exercise_reusable_run(Path::new(&path), replacement_fd);
             return;
         }
 
@@ -1106,6 +1108,82 @@ mod pty {
 
         let status = pty.wait().unwrap();
         assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn zero_mouse_coordinates_remain_bounded_through_a_real_terminal() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "coordinate input\n").unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+        pty.master
+            .write_all(b"\x1b[M\x20\x20\x20\x1b[<0;0;0Mq")
+            .unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+    }
+
+    #[test]
+    fn enhanced_keyboard_letters_preserve_commands_search_case_and_caps_lock() {
+        let file = NamedTempFile::new().unwrap();
+        let mut text = String::new();
+        for line in 0..100 {
+            match line {
+                0 => text.push_str("START_SENTINEL\n"),
+                30 => text.push_str("ALPHA? FIRST_ENHANCED_KEYBOARD_TARGET\n"),
+                50 => text.push_str("ALPHA? PREFIX_PRESERVED_TARGET\n"),
+                70 => text.push_str("ALPHA? SINGLE_PREVIOUS_TARGET\n"),
+                99 => text.push_str("END_SENTINEL\n"),
+                _ => text.push_str("ordinary line\n"),
+            }
+        }
+        std::fs::write(file.path(), text).unwrap();
+
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(b"START_SENTINEL").unwrap();
+        // Kitty alternate-key reporting supplies the shifted codepoint and Crossterm consumes the
+        // Shift modifier. The command must still agree with legacy uppercase G.
+        pty.master.write_all(b"\x1b[103:71;2:2u").unwrap();
+        pty.wait_for(b"END_SENTINEL").unwrap();
+
+        // With all-key reporting, Caps Lock is state rather than part of the primary codepoint.
+        // Caps+Shift+G produces lowercase g and Caps+G produces uppercase G.
+        let start = pty.output.len();
+        pty.master.write_all(b"\x1b[103;66u").unwrap();
+        pty.wait_for_after(start, b"START_SENTINEL").unwrap();
+        let end = pty.output.len();
+        pty.master.write_all(b"\x1b[103;65u").unwrap();
+        pty.wait_for_after(end, b"END_SENTINEL").unwrap();
+
+        let search_start = pty.output.len();
+        // Kitty CSI-u without alternate reporting encodes shifted letters as lower-case codepoints
+        // plus Shift. Repeat text is inserted, release text is ignored, and an alternate codepoint
+        // preserves shifted punctuation after Crossterm consumes its Shift modifier.
+        pty.master
+            .write_all(b"/\x1b[97;2u\x1b[108;2:2uPHA\x1b[120;1:3u\x1b[47:63;2u\r")
+            .unwrap();
+        pty.wait_for_after(search_start, b"FIRST_ENHANCED_KEYBOARD_TARGET")
+            .unwrap();
+
+        // A separately reported modifier press belongs to the following chord and must not clear
+        // the numeric prefix. Two previous-match steps select the middle of the three matches; if
+        // the modifier event cleared the prefix, the single-previous sentinel would be selected.
+        let prefix_start = pty.output.len();
+        pty.master.write_all(b"2\x1b[57441;2u\x1b[110;2u").unwrap();
+        pty.wait_for_after(prefix_start, b"PREFIX_PRESERVED_TARGET")
+            .unwrap();
+
+        // Caps+Q is uppercase text, not the unmodified quit command.
+        pty.master.write_all(b"\x1b[113;65ug").unwrap();
+        pty.wait_for_after(search_start, b"START_SENTINEL").unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
         assert!(pty.stderr_output.is_empty());
         pty.assert_restored();
     }

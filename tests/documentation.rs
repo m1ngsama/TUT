@@ -6,6 +6,7 @@ const PROJECT: &str = include_str!("../docs/PROJECT.md");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const CONTRIBUTING: &str = include_str!("../CONTRIBUTING.md");
 const SECURITY: &str = include_str!("../SECURITY.md");
+const SECURITY_AUDIT: &str = include_str!("../.github/workflows/security-audit.yml");
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
 fn plain_manual() -> String {
@@ -125,4 +126,25 @@ fn release_and_maintenance_contracts_ship_with_the_crate() {
     assert!(CONTRIBUTING.contains("docs/tut.1"));
     assert!(SECURITY.contains("contact@m1ng.space"));
     assert!(SECURITY.contains("Do not open a public issue"));
+}
+
+#[test]
+fn dependency_audit_commands_stay_pinned_and_discoverable() {
+    for contract in [
+        "cargo-audit --locked --version '=0.22.2'",
+        "audit --file Cargo.lock",
+    ] {
+        assert!(
+            CONTRIBUTING.contains(contract),
+            "contributor guidance omits {contract}"
+        );
+        assert!(
+            SECURITY_AUDIT.contains(contract),
+            "security audit workflow omits {contract}"
+        );
+    }
+    assert!(
+        README.contains("cargo audit --file Cargo.lock"),
+        "README local checks omit the dependency audit gate"
+    );
 }
