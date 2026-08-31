@@ -20,6 +20,8 @@ tag does not describe the present program or its compatibility.
 
 - Replaced Crossterm and its maintenance fork with a small in-tree Unix
   terminal adapter limited to TUT's input, raw-mode, and ANSI rendering needs.
+- Security audits now run for pull requests, main-branch pushes, or explicit
+  manual requests instead of on a recurring schedule.
 
 ### Fixed
 

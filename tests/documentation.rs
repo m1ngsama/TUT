@@ -6,6 +6,7 @@ const PROJECT: &str = include_str!("../docs/PROJECT.md");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const CONTRIBUTING: &str = include_str!("../CONTRIBUTING.md");
 const SECURITY: &str = include_str!("../SECURITY.md");
+const CI: &str = include_str!("../.github/workflows/ci.yml");
 const SECURITY_AUDIT: &str = include_str!("../.github/workflows/security-audit.yml");
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -148,4 +149,9 @@ fn dependency_audit_commands_stay_pinned_and_discoverable() {
         README.contains("cargo audit --file Cargo.lock"),
         "README local checks omit the dependency audit gate"
     );
+    for workflow in [CI, SECURITY_AUDIT] {
+        assert!(!workflow.contains("schedule:"));
+        assert!(!workflow.contains("cron:"));
+    }
+    assert!(!CONTRIBUTING.contains("weekly"));
 }
