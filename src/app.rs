@@ -3,7 +3,7 @@ use std::{mem::size_of, num::NonZeroU16, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    document::{Document, DocumentCache},
+    document::{BookHeading, BookSection, Document, DocumentCache},
     error::TutError,
     layout::{
         BodyHeight, ContentWidth, DOTTED_CIRCLE, DisplayColumn, DisplayProjection, GraphemeRange,
@@ -25,6 +25,9 @@ pub(super) const MIN_TERMINAL_ROWS: u16 = 4;
 pub(super) const SEARCH_DRAFT_LIMIT_BYTES: usize = MAX_SEARCH_QUERY_BYTES;
 pub(super) const MAX_REPEAT_COUNT: u16 = 9_999;
 const CHROME_ROWS: u16 = 3;
+const BOOK_BODY_MIN_COLUMNS: u16 = 40;
+const BOOK_BODY_MARGIN_COLUMNS: u16 = 2;
+const BOOK_BODY_MAX_COLUMNS: u16 = 80;
 const MAX_VISIBLE_RENDER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TRANSIENT_RENDER_TEXT_BYTES: usize =
     (u16::MAX as usize + 1) * (MAX_RENDER_GRAPHEME_BYTES + DOTTED_CIRCLE.len());
@@ -50,6 +53,23 @@ impl Geometry {
         } else {
             None
         }
+    }
+
+    const fn book_content_width(self) -> Option<ContentWidth> {
+        if !self.is_usable() {
+            return None;
+        }
+        let columns = if self.columns >= BOOK_BODY_MIN_COLUMNS {
+            let available = self.columns.saturating_sub(BOOK_BODY_MARGIN_COLUMNS * 2);
+            if available < BOOK_BODY_MAX_COLUMNS {
+                available
+            } else {
+                BOOK_BODY_MAX_COLUMNS
+            }
+        } else {
+            self.columns
+        };
+        ContentWidth::new(columns)
     }
 
     pub(super) const fn body_height(self) -> Option<BodyHeight> {
@@ -103,6 +123,8 @@ pub(super) enum Action {
     HalfPageUp,
     DocumentStart,
     DocumentEnd,
+    NextSection,
+    PreviousSection,
     BeginSearch,
     SearchInsert(char),
     SearchBackspace,
@@ -589,6 +611,8 @@ impl<'a> RenderRowsView<'a> {
 pub(super) struct RenderState<'a> {
     pub filename: &'a str,
     pub path: &'a str,
+    pub book: Option<BookState<'a>>,
+    pub body_width: u16,
     pub rows: RenderRowsView<'a>,
     pub progress: u8,
     pub current_line: Option<u64>,
@@ -603,15 +627,27 @@ pub(super) struct RenderState<'a> {
 pub(super) struct PendingState<'a> {
     pub filename: &'a str,
     pub path: &'a str,
+    pub book: Option<BookState<'a>>,
+    pub body_width: u16,
     pub status: SearchStatus<'a>,
     pub repeat: Option<RepeatStatus>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BookState<'a> {
+    pub title: Option<&'a str>,
+    pub creator: Option<&'a str>,
+    pub section_title: Option<&'a str>,
+    pub section_ordinal: Option<usize>,
+    pub section_total: usize,
+    pub heading_ranges: &'a [BookHeading],
 }
 
 #[derive(Debug)]
 pub(super) enum ViewState<'a> {
     Reader(RenderState<'a>),
     Pending(PendingState<'a>),
-    Help { q_closes: bool },
+    Help { q_closes: bool, book: bool },
 }
 
 struct RenderViewportCache {
@@ -679,6 +715,9 @@ enum ViewportRequest {
     Search {
         target: SourceOffset,
     },
+    Section {
+        target: SourceOffset,
+    },
     End,
 }
 
@@ -689,9 +728,20 @@ struct BackgroundSchedule {
 }
 
 impl ViewportRequest {
+    fn locator_height(self, viewport_height: BodyHeight) -> BodyHeight {
+        if matches!(self, Self::Section { .. }) {
+            BodyHeight::new(1).expect("section locators use one row")
+        } else {
+            viewport_height
+        }
+    }
+
     const fn target(self, source_end: SourceOffset) -> SourceOffset {
         match self {
-            Self::Reflow { target } | Self::Move { target, .. } | Self::Search { target } => target,
+            Self::Reflow { target }
+            | Self::Move { target, .. }
+            | Self::Search { target }
+            | Self::Section { target } => target,
             Self::End => source_end,
         }
     }
@@ -705,7 +755,7 @@ impl ViewportRequest {
         let delta = match self {
             Self::Move { delta, .. } => delta,
             Self::Search { .. } => RowDelta::Backward(usize::from(height.get() / 2)),
-            Self::Reflow { .. } | Self::End => RowDelta::Forward(0),
+            Self::Reflow { .. } | Self::Section { .. } | Self::End => RowDelta::Forward(0),
         };
         (target, delta)
     }
@@ -718,7 +768,7 @@ impl ViewportRequest {
                 FollowEndPolicy::AtEnd => at_end,
                 FollowEndPolicy::Always => true,
             },
-            Self::Reflow { .. } | Self::Search { .. } => false,
+            Self::Reflow { .. } | Self::Search { .. } | Self::Section { .. } => false,
         }
     }
 
@@ -734,6 +784,7 @@ pub(super) struct App {
     layout: Option<ViewportLayout>,
     anchor: SourceOffset,
     anchor_is_row_start: bool,
+    section_focus: Option<SourceOffset>,
     follow_end: bool,
     geometry: Geometry,
     mode: Mode,
@@ -966,14 +1017,16 @@ pub(super) fn app_from_text(path: &std::path::Path, text: String) -> App {
 
 impl App {
     pub(super) fn new(document: Document) -> Self {
-        let anchor = document.source_start();
+        let anchor = document.preferred_start();
+        let anchor_is_row_start = anchor == document.source_start();
         Self {
             document,
             document_cache: DocumentCache::default(),
             search_cache: DocumentCache::default(),
             layout: None,
             anchor,
-            anchor_is_row_start: true,
+            anchor_is_row_start,
+            section_focus: None,
             follow_end: false,
             geometry: Geometry::new(0, 0),
             mode: Mode::Content(ContentMode::Reading),
@@ -1086,6 +1139,36 @@ impl App {
         !self.geometry.is_usable()
     }
 
+    fn content_width_for(&self, geometry: Geometry) -> Option<ContentWidth> {
+        if self.document.book().is_some() {
+            geometry.book_content_width()
+        } else {
+            geometry.content_width()
+        }
+    }
+
+    fn body_width(&self) -> u16 {
+        self.content_width_for(self.geometry)
+            .map_or(0, |width| width.get())
+    }
+
+    fn book_state(&self, at: SourceOffset) -> Option<BookState<'_>> {
+        let book = self.document.book()?;
+        let at = self.section_focus.unwrap_or(at);
+        let sections = book.sections();
+        let section_count = sections.partition_point(|section| section.target() <= at);
+        let section_ordinal = (section_count != 0).then_some(section_count);
+        let section_title = book.section_at_or_before(at).map(BookSection::title);
+        Some(BookState {
+            title: book.title(),
+            creator: book.creator(),
+            section_title,
+            section_ordinal,
+            section_total: sections.len(),
+            heading_ranges: book.headings(),
+        })
+    }
+
     pub(super) fn mode(&self) -> &Mode {
         &self.mode
     }
@@ -1187,11 +1270,15 @@ impl App {
             self.document.validate()?;
         }
         self.prepare_search_highlights(viewport)?;
-        let line = if viewport.is_some() {
+        let book_at = viewport.map_or(self.anchor, |viewport| viewport.first_visible_start);
+        let line = if self.document.book().is_some() {
+            None
+        } else if viewport.is_some() {
             self.validated_line_position_for(viewport)?
         } else {
             self.line_position_for(viewport)?
         };
+        let book = self.book_state(book_at);
         let progress = self.progress_for(viewport);
         let (ranges, current) = if viewport.is_some() {
             let key = self
@@ -1209,6 +1296,8 @@ impl App {
         Ok(RenderState {
             filename: self.document.display_name(),
             path: self.document.display_path(),
+            book,
+            body_width: self.body_width(),
             rows: RenderRowsView::new(rows, ranges, current),
             progress,
             current_line: line.map(LinePosition::current),
@@ -1235,12 +1324,18 @@ impl App {
         if let Mode::Help { return_to } = &self.mode {
             return Ok(ViewState::Help {
                 q_closes: matches!(return_to, ContentMode::Reading),
+                book: self
+                    .document
+                    .book()
+                    .is_some_and(|book| !book.sections().is_empty()),
             });
         }
         if !self.reader_frame_ready() {
             return Ok(ViewState::Pending(PendingState {
                 filename: self.document.display_name(),
                 path: self.document.display_path(),
+                book: self.book_state(self.anchor),
+                body_width: self.body_width(),
                 status: self.search_status(),
                 repeat: self.repeat,
             }));
@@ -1251,9 +1346,11 @@ impl App {
     const fn view_activity(&self) -> Option<ViewActivity> {
         match self.viewport_request {
             Some(ViewportRequest::End) => Some(ViewActivity::GoingToEnd),
-            Some(ViewportRequest::Move { .. } | ViewportRequest::Reflow { .. }) => {
-                Some(ViewActivity::PreparingView)
-            }
+            Some(
+                ViewportRequest::Move { .. }
+                | ViewportRequest::Reflow { .. }
+                | ViewportRequest::Section { .. },
+            ) => Some(ViewActivity::PreparingView),
             Some(ViewportRequest::Search { .. }) | None => None,
         }
     }
@@ -1405,7 +1502,7 @@ impl App {
     }
 
     fn cached_viewport_location(&self, request: ViewportRequest) -> Option<LocatedViewport> {
-        let height = self.geometry.body_height()?;
+        let height = request.locator_height(self.geometry.body_height()?);
         let layout = self.layout.as_ref()?;
         let (target, delta) = request.locator_parameters(self.document.source_end(), height);
         self.row_neighborhood.locate_target(
@@ -1533,7 +1630,8 @@ impl App {
             return Ok(self.finish_viewport_request(request, located));
         }
         if self.locator.is_none() {
-            let height = self.geometry.body_height().expect("usable geometry");
+            let height =
+                request.locator_height(self.geometry.body_height().expect("usable geometry"));
             let (target, delta) = request.locator_parameters(self.document.source_end(), height);
             let row_bound =
                 source_row_bound(self.document.source_start(), self.document.source_end());
@@ -1567,11 +1665,20 @@ impl App {
         request: ViewportRequest,
         located: LocatedViewport,
     ) -> bool {
+        let previous_anchor = self.anchor;
         self.cancel_render_scan();
         self.viewport_request = None;
         self.locator = None;
         self.anchor = located.anchor;
         self.anchor_is_row_start = true;
+        match request {
+            ViewportRequest::Section { target } => self.section_focus = Some(target),
+            ViewportRequest::Search { .. } | ViewportRequest::End => self.section_focus = None,
+            ViewportRequest::Move { .. } if located.anchor != previous_anchor => {
+                self.section_focus = None;
+            }
+            ViewportRequest::Move { .. } | ViewportRequest::Reflow { .. } => {}
+        }
         self.follow_end = request.follows_end(located.at_end);
         if request.is_move() {
             self.start_queued_move();
@@ -1670,6 +1777,8 @@ impl App {
             }
             Action::DocumentStart if reading => self.document_start(),
             Action::DocumentEnd if reading => self.document_end(),
+            Action::NextSection if reading => self.move_section_repeated(true),
+            Action::PreviousSection if reading => self.move_section_repeated(false),
             Action::BeginSearch if reading => self.begin_search(),
             Action::SearchInsert(character) if editing => self.insert_search(character)?,
             Action::SearchBackspace if editing => self.backspace_search(),
@@ -1774,16 +1883,47 @@ impl App {
         self.move_rows(downward, amount) || consumed
     }
 
+    fn move_section_repeated(&mut self, forward: bool) -> bool {
+        let (count, consumed) = self.take_repeat_count();
+        let Some(book) = self.document.book() else {
+            return consumed;
+        };
+        if book.sections().is_empty() {
+            return consumed;
+        }
+        let origin = match self.viewport_request {
+            Some(ViewportRequest::Section { target }) => target,
+            _ => self.section_focus.unwrap_or(self.anchor),
+        };
+        let mut target = origin;
+        for _ in 0..count {
+            let section = if forward {
+                book.next_section(target)
+            } else {
+                book.previous_section(target)
+            };
+            let Some(section) = section else {
+                break;
+            };
+            target = section.target();
+        }
+        if target == origin {
+            return consumed;
+        }
+        self.schedule_section_jump(target) || consumed
+    }
+
     fn resize(&mut self, geometry: Geometry) -> bool {
         let geometry_changed = self.geometry != geometry;
         if !geometry_changed {
             return !geometry.is_usable() && self.cancel_repeat();
         }
+        let first_layout = self.layout.is_none();
         self.render_body = RenderBody::Empty;
         if let Some(search) = &mut self.search {
             search.invalidate_highlights();
         }
-        if self.geometry.content_width() != geometry.content_width() {
+        if self.content_width_for(self.geometry) != self.content_width_for(geometry) {
             self.row_neighborhood.clear();
             self.anchor_is_row_start = self.anchor == self.document.source_start();
         }
@@ -1799,11 +1939,12 @@ impl App {
             return true;
         }
 
+        let content_width = self.content_width_for(geometry);
         let reader = self.document.reader(&mut self.document_cache);
         let rebuilt = ensure_viewport_layout(
             &mut self.layout,
             &reader,
-            geometry.content_width(),
+            content_width,
             geometry.body_height(),
         );
         if self.viewport_request.is_some() {
@@ -1812,10 +1953,20 @@ impl App {
         if self.follow_end {
             self.follow_end = false;
             self.viewport_request = Some(ViewportRequest::End);
-        } else if rebuilt && self.anchor != self.document.source_start() {
-            self.viewport_request = Some(ViewportRequest::Reflow {
-                target: self.anchor,
-            });
+        } else if rebuilt
+            && (self.section_focus.is_some() || self.anchor != self.document.source_start())
+        {
+            self.viewport_request = Some(
+                if self.section_focus.is_some() || first_layout && self.document.book().is_some() {
+                    ViewportRequest::Section {
+                        target: self.section_focus.unwrap_or(self.anchor),
+                    }
+                } else {
+                    ViewportRequest::Reflow {
+                        target: self.anchor,
+                    }
+                },
+            );
         }
         true
     }
@@ -1844,6 +1995,7 @@ impl App {
         let canceled_repeat = self.cancel_repeat();
         let source_start = self.document.source_start();
         let anchor_changed = self.anchor != source_start;
+        let focus_changed = self.section_focus.take().is_some();
         let canceled_render = anchor_changed && self.cancel_render_scan();
         let canceled_viewport = self.cancel_viewport_request();
         let canceled_search = self.cancel_search_motion();
@@ -1851,6 +2003,7 @@ impl App {
             || canceled_viewport
             || canceled_search
             || anchor_changed
+            || focus_changed
             || self.follow_end
             || canceled_repeat;
         self.anchor = source_start;
@@ -2092,6 +2245,22 @@ impl App {
         };
         let changed =
             self.cancel_render_scan() || self.viewport_request != Some(request) || self.follow_end;
+        self.viewport_request = Some(request);
+        self.locator = None;
+        self.queued_rows = 0;
+        self.follow_end = false;
+        changed
+    }
+
+    fn schedule_section_jump(&mut self, target: SourceOffset) -> bool {
+        let request = ViewportRequest::Section { target };
+        let canceled_search = self.cancel_search_motion();
+        let canceled_render = self.cancel_render_scan();
+        let changed = canceled_search
+            || canceled_render
+            || self.viewport_request != Some(request)
+            || self.queued_rows != 0
+            || self.follow_end;
         self.viewport_request = Some(request);
         self.locator = None;
         self.queued_rows = 0;
@@ -2699,7 +2868,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{document::overwrite_with_distinct_fingerprint, layout::DisplayAtoms};
+    use crate::{
+        document::{BookStructure, overwrite_with_distinct_fingerprint},
+        layout::DisplayAtoms,
+    };
 
     const BACKGROUND_STEP_LIMIT: usize = 100_000;
 
@@ -2708,11 +2880,18 @@ mod tests {
         Move,
         End,
         Search,
+        Section,
         Reflow,
     }
 
     impl ViewportRequestCase {
-        const ALL: [Self; 4] = [Self::Move, Self::End, Self::Search, Self::Reflow];
+        const ALL: [Self; 5] = [
+            Self::Move,
+            Self::End,
+            Self::Search,
+            Self::Section,
+            Self::Reflow,
+        ];
 
         fn request(self, app: &mut App) -> ViewportRequest {
             let target = SourceOffset::new(35);
@@ -2728,6 +2907,7 @@ mod tests {
                 }
                 Self::End => ViewportRequest::End,
                 Self::Search => ViewportRequest::Search { target },
+                Self::Section => ViewportRequest::Section { target },
                 Self::Reflow => ViewportRequest::Reflow { target },
             }
         }
@@ -2739,6 +2919,482 @@ mod tests {
             .unwrap();
         settle_frame(&mut app);
         app
+    }
+
+    #[derive(Clone, Copy)]
+    struct BookOffsets {
+        section_targets: [SourceOffset; 3],
+        heading_starts: [SourceOffset; 3],
+    }
+
+    fn book_document() -> (Document, BookOffsets) {
+        let text = concat!(
+            "front matter\n\n",
+            "one starts\nONE\nfirst target\n\n",
+            "two starts\nTWO\nsecond target\n\n",
+            "three starts\nTHREE\nthird target\n",
+        );
+        let entries = [
+            ("One", "one starts", "ONE"),
+            ("Two", "two starts", "TWO"),
+            ("Three", "three starts", "THREE"),
+        ];
+        let section_targets = entries.map(|(_, marker, _)| {
+            SourceOffset::from_usize(text.find(marker).expect("book fixture section exists"))
+        });
+        let heading_starts = entries.map(|(_, _, heading)| {
+            SourceOffset::from_usize(text.find(heading).expect("book fixture heading exists"))
+        });
+        let sections = entries
+            .iter()
+            .zip(section_targets)
+            .map(|((title, _, _), target)| {
+                BookSection::new((*title).to_owned(), 1, target)
+                    .expect("book fixture section is valid")
+            })
+            .collect();
+        let headings = entries
+            .iter()
+            .zip(heading_starts)
+            .map(|((_, _, heading), start)| {
+                BookHeading::new(
+                    1,
+                    start,
+                    start
+                        .checked_add(heading.len())
+                        .expect("book fixture offsets fit"),
+                )
+                .expect("book fixture heading is valid")
+            })
+            .collect();
+        let book = BookStructure::new(
+            Some("A Test Book".to_owned()),
+            Some("Ada Reader".to_owned()),
+            sections,
+            headings,
+        );
+        (
+            Document::from_book_text(Path::new("/tmp/structured.epub"), text.to_owned(), book),
+            BookOffsets {
+                section_targets,
+                heading_starts,
+            },
+        )
+    }
+
+    fn book_reader(columns: u16, rows: u16) -> (App, BookOffsets) {
+        let (document, offsets) = book_document();
+        let mut app = App::new(document);
+        app.update(Action::Resize(Geometry::new(columns, rows)))
+            .unwrap();
+        settle_frame(&mut app);
+        (app, offsets)
+    }
+
+    fn inline_section_book() -> (Document, [SourceOffset; 3]) {
+        let text = concat!(
+            "front matter padding padding padding padding FIRST chapter text\n",
+            "second line padding padding padding padding SECOND chapter text\n",
+            "third line padding padding padding padding THIRD chapter text\n",
+        );
+        let markers = ["FIRST", "SECOND", "THIRD"];
+        let targets = markers.map(|marker| {
+            SourceOffset::from_usize(text.find(marker).expect("inline section marker exists"))
+        });
+        let sections = markers
+            .iter()
+            .zip(targets)
+            .map(|(title, target)| {
+                BookSection::new((*title).to_owned(), 1, target)
+                    .expect("inline section target is valid")
+            })
+            .collect();
+        let book = BookStructure::new(None, None, sections, Vec::new());
+        (
+            Document::from_book_text(
+                Path::new("/tmp/inline-sections.epub"),
+                text.to_owned(),
+                book,
+            ),
+            targets,
+        )
+    }
+
+    #[test]
+    fn book_body_width_is_full_on_narrow_terminals_and_bounded_on_wide_ones() {
+        for (columns, expected) in [(16, 16), (39, 39), (40, 36), (83, 79), (84, 80), (200, 80)] {
+            assert_eq!(
+                Geometry::new(columns, 4)
+                    .book_content_width()
+                    .map(ContentWidth::get),
+                Some(expected),
+            );
+        }
+        assert_eq!(Geometry::new(15, 4).book_content_width(), None);
+        assert_eq!(Geometry::new(80, 3).book_content_width(), None);
+    }
+
+    #[test]
+    fn section_actions_leave_plain_text_navigation_and_chrome_unchanged() {
+        let mut app = reader("one\ntwo\nthree\nfour\nfive\n", 80, 5);
+        let anchor = app.anchor;
+        assert_eq!(app.update(Action::NextSection).unwrap(), Outcome::Unchanged);
+        assert_eq!(
+            app.update(Action::PreviousSection).unwrap(),
+            Outcome::Unchanged
+        );
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.body_width(), 80);
+
+        let state = app.render_state().unwrap();
+        assert!(state.book.is_none());
+        assert_eq!(state.body_width, 80);
+        assert_eq!(state.current_line, Some(1));
+
+        enter_repeat(&mut app, "3");
+        assert_eq!(app.update(Action::NextSection).unwrap(), Outcome::Changed);
+        assert_eq!(app.repeat_status(), None);
+        assert_eq!(app.anchor, anchor);
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        assert_eq!(app.render_state().unwrap().current_line, Some(2));
+
+        let document = Document::from_book_text(
+            Path::new("/tmp/sectionless.epub"),
+            "book body\n".to_owned(),
+            BookStructure::new(Some("Sectionless".to_owned()), None, Vec::new(), Vec::new()),
+        );
+        let mut app = App::new(document);
+        app.update(Action::Resize(Geometry::new(80, 5))).unwrap();
+        settle_frame(&mut app);
+        let anchor = app.anchor;
+        assert_eq!(
+            app.update(Action::PreviousSection).unwrap(),
+            Outcome::Unchanged
+        );
+        enter_repeat(&mut app, "3");
+        assert_eq!(
+            app.update(Action::PreviousSection).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(app.repeat_status(), None);
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.update(Action::ShowHelp).unwrap(), Outcome::Changed);
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Help {
+                q_closes: true,
+                book: false
+            }
+        ));
+    }
+
+    #[test]
+    fn books_open_at_the_first_heading_but_document_start_reaches_front_matter() {
+        let (document, offsets) = book_document();
+        let mut app = App::new(document);
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+        assert!(!app.anchor_is_row_start);
+
+        app.update(Action::Resize(Geometry::new(120, 4))).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section {
+                target: offsets.heading_starts[0]
+            })
+        );
+        let ViewState::Pending(pending) = app.view_state().unwrap() else {
+            panic!("initial book location publishes pending book state");
+        };
+        assert_eq!(pending.body_width, 80);
+        assert_eq!(pending.book.unwrap().section_ordinal, Some(1));
+        settle_frame(&mut app);
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+
+        assert_eq!(
+            app.document.book().unwrap().sections()[0].target(),
+            offsets.section_targets[0]
+        );
+        let state = app.render_state().unwrap();
+        let book = state.book.expect("book metadata is published");
+        assert_eq!(book.title, Some("A Test Book"));
+        assert_eq!(book.creator, Some("Ada Reader"));
+        assert_eq!(book.section_title, Some("One"));
+        assert_eq!(book.section_ordinal, Some(1));
+        assert_eq!(book.section_total, 3);
+        assert_eq!(book.heading_ranges.len(), 3);
+        assert_eq!(book.heading_ranges[0].start(), offsets.heading_starts[0]);
+        assert_eq!(
+            book.heading_ranges[0].end().get(),
+            offsets.heading_starts[0].get() + 3
+        );
+        assert_eq!(book.heading_ranges[0].level(), 1);
+        assert_ne!(book.heading_ranges[0].start(), offsets.section_targets[0]);
+        assert_eq!(state.body_width, 80);
+        assert_eq!(state.current_line, None);
+        assert_eq!(state.total_lines, None);
+
+        assert_eq!(app.update(Action::DocumentStart).unwrap(), Outcome::Changed);
+        settle_frame(&mut app);
+        assert_eq!(app.anchor, app.document.source_start());
+        let state = app.render_state().unwrap();
+        let book = state.book.expect("book metadata remains available");
+        assert_eq!(book.section_title, None);
+        assert_eq!(book.section_ordinal, None);
+        assert_eq!(state.current_line, None);
+
+        app.update(Action::ShowHelp).unwrap();
+        assert!(matches!(
+            app.view_state().unwrap(),
+            ViewState::Help {
+                q_closes: true,
+                book: true
+            }
+        ));
+    }
+
+    #[test]
+    fn short_books_keep_the_preferred_heading_at_the_top() {
+        let (document, offsets) = book_document();
+        let mut app = App::new(document);
+
+        app.update(Action::Resize(Geometry::new(120, 20))).unwrap();
+        settle_frame(&mut app);
+
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+        let state = app.render_state().unwrap();
+        assert_eq!(state.rows.get(0).unwrap().text, "ONE");
+        assert!(
+            state
+                .rows
+                .iter()
+                .all(|row| !row.text.contains("front matter"))
+        );
+    }
+
+    #[test]
+    fn section_navigation_is_located_counted_and_clamped() {
+        let (mut app, offsets) = book_reader(120, 4);
+        let targets = offsets.section_targets;
+
+        assert_eq!(app.update(Action::NextSection).unwrap(), Outcome::Changed);
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[1] })
+        );
+        assert_eq!(app.update(Action::NextSection).unwrap(), Outcome::Changed);
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[2] })
+        );
+        assert_eq!(
+            app.update(Action::PreviousSection).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[1] })
+        );
+        settle(&mut app);
+        assert_eq!(app.anchor, targets[1]);
+        assert_eq!(
+            app.render_state().unwrap().book.unwrap().section_ordinal,
+            Some(2)
+        );
+
+        app.update(Action::PreviousSection).unwrap();
+        settle(&mut app);
+        assert_eq!(app.anchor, targets[0]);
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        assert!(app.anchor > targets[0] && app.anchor < targets[1]);
+        app.update(Action::PreviousSection).unwrap();
+        settle(&mut app);
+        assert_eq!(app.anchor, targets[0]);
+
+        enter_repeat(&mut app, "9");
+        app.update(Action::NextSection).unwrap();
+        assert!(!app.repeat_active());
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[2] })
+        );
+        settle(&mut app);
+        assert_eq!(app.anchor, targets[2]);
+        assert_eq!(app.update(Action::NextSection).unwrap(), Outcome::Unchanged);
+
+        enter_repeat(&mut app, "9");
+        assert_eq!(
+            app.update(Action::PreviousSection).unwrap(),
+            Outcome::Changed
+        );
+        settle(&mut app);
+        assert_eq!(app.anchor, targets[0]);
+        assert_eq!(
+            app.update(Action::PreviousSection).unwrap(),
+            Outcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn inline_section_targets_keep_precise_navigation_focus() {
+        let (document, targets) = inline_section_book();
+        let mut app = App::new(document);
+
+        app.update(Action::Resize(Geometry::new(120, 4))).unwrap();
+        settle_frame(&mut app);
+        assert!(app.anchor < targets[0]);
+        assert_eq!(app.section_focus, Some(targets[0]));
+        assert_eq!(
+            app.render_state().unwrap().book.unwrap().section_ordinal,
+            Some(1)
+        );
+
+        app.update(Action::LineUp).unwrap();
+        settle(&mut app);
+        assert_eq!(app.section_focus, Some(targets[0]));
+
+        app.update(Action::NextSection).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[1] })
+        );
+        app.update(Action::NextSection).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[2] })
+        );
+        app.update(Action::PreviousSection).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[1] })
+        );
+        settle(&mut app);
+        assert!(app.anchor < targets[1]);
+        assert_eq!(app.section_focus, Some(targets[1]));
+        assert_eq!(
+            app.render_state().unwrap().book.unwrap().section_ordinal,
+            Some(2)
+        );
+
+        app.update(Action::NextSection).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[2] })
+        );
+        app.update(Action::PreviousSection).unwrap();
+        settle(&mut app);
+
+        app.update(Action::Resize(Geometry::new(40, 4))).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[1] })
+        );
+        settle_frame(&mut app);
+        assert!(app.anchor < targets[1]);
+        assert_eq!(app.section_focus, Some(targets[1]));
+        assert_eq!(
+            app.render_state().unwrap().book.unwrap().section_ordinal,
+            Some(2)
+        );
+        app.update(Action::NextSection).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target: targets[2] })
+        );
+
+        app.update(Action::LineDown).unwrap();
+        settle(&mut app);
+        assert_eq!(app.section_focus, None);
+    }
+
+    #[test]
+    fn final_section_stays_at_the_top_instead_of_backfilling_the_previous_section() {
+        let (mut app, offsets) = book_reader(120, 20);
+
+        enter_repeat(&mut app, "9");
+        app.update(Action::NextSection).unwrap();
+        settle(&mut app);
+
+        assert_eq!(app.anchor, offsets.section_targets[2]);
+        let body_height = app.geometry.body_height().unwrap();
+        let state = app.render_state().unwrap();
+        assert_eq!(state.rows.get(0).unwrap().text, "three starts");
+        assert!(state.rows.len() < usize::from(body_height.get()));
+        assert!(
+            state
+                .rows
+                .iter()
+                .all(|row| !row.text.contains("second target"))
+        );
+    }
+
+    #[test]
+    fn book_width_reflows_and_section_motion_preserves_committed_search() {
+        let (mut app, offsets) = book_reader(120, 4);
+        let targets = offsets.section_targets;
+        assert_eq!(app.body_width(), 80);
+
+        app.update(Action::Resize(Geometry::new(100, 4))).unwrap();
+        settle_frame(&mut app);
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+        assert_eq!(app.body_width(), 80);
+
+        app.update(Action::Resize(Geometry::new(60, 4))).unwrap();
+        assert_eq!(
+            app.viewport_request,
+            Some(ViewportRequest::Section {
+                target: offsets.heading_starts[0]
+            })
+        );
+        settle_frame(&mut app);
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+        assert_eq!(app.body_width(), 56);
+
+        app.update(Action::NextSection).unwrap();
+        assert!(matches!(
+            app.viewport_request,
+            Some(ViewportRequest::Section { target }) if target == targets[1]
+        ));
+        app.update(Action::BeginSearch).unwrap();
+        assert!(app.viewport_request.is_none());
+        assert_eq!(app.anchor, offsets.heading_starts[0]);
+        app.update(Action::SearchCancel).unwrap();
+
+        commit(&mut app, "target");
+        let first_match = app.current_match().expect("the fixture has search matches");
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Committed {
+                query: "target",
+                no_matches: false,
+                searching: false,
+            }
+        ));
+
+        app.update(Action::NextSection).unwrap();
+        settle(&mut app);
+        assert_eq!(app.anchor, targets[1]);
+        assert_eq!(app.current_match(), Some(first_match));
+        assert!(matches!(
+            app.search_status(),
+            SearchStatus::Committed {
+                query: "target",
+                ..
+            }
+        ));
+
+        app.update(Action::NextMatch).unwrap();
+        settle(&mut app);
+        assert_eq!(app.section_focus, None);
+        assert_ne!(app.current_match(), Some(first_match));
+        assert_eq!(
+            app.render_state().unwrap().book.unwrap().section_ordinal,
+            Some(2)
+        );
     }
 
     fn projected_atom(text: &str) -> ProjectedAtom<'_> {
@@ -3126,8 +3782,12 @@ mod tests {
         panic!("viewport locator exceeded the test step limit");
     }
 
-    fn cache_location(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
-        let height = app.geometry.body_height().unwrap();
+    fn cache_location_at_height(
+        app: &mut App,
+        target: SourceOffset,
+        delta: RowDelta,
+        height: BodyHeight,
+    ) -> LocatedViewport {
         let row_bound = source_row_bound(app.document.source_start(), app.document.source_end());
         let mut locator = ViewportLocator::new(target, delta, height, row_bound).unwrap();
         for _ in 0..BACKGROUND_STEP_LIMIT {
@@ -3141,6 +3801,11 @@ mod tests {
             }
         }
         panic!("viewport cache priming exceeded the test step limit");
+    }
+
+    fn cache_location(app: &mut App, target: SourceOffset, delta: RowDelta) -> LocatedViewport {
+        let height = app.geometry.body_height().unwrap();
+        cache_location_at_height(app, target, delta, height)
     }
 
     #[test]
@@ -3376,9 +4041,9 @@ mod tests {
         for case in ViewportRequestCase::ALL {
             let mut app = reader(&text, 16, 7);
             let request = case.request(&mut app);
-            let height = app.geometry.body_height().unwrap();
+            let height = request.locator_height(app.geometry.body_height().unwrap());
             let (target, delta) = request.locator_parameters(app.document.source_end(), height);
-            let expected = cache_location(&mut app, target, delta);
+            let expected = cache_location_at_height(&mut app, target, delta, height);
             app.viewport_request = Some(request);
             app.locator = None;
             app.document_cache.reset_metrics();
@@ -3971,7 +4636,10 @@ mod tests {
         assert!(app.frame_ready());
         assert!(matches!(
             app.view_state().unwrap(),
-            ViewState::Help { q_closes: true }
+            ViewState::Help {
+                q_closes: true,
+                book: false
+            }
         ));
         assert_eq!(app.background_work(), Some(BackgroundWork::Render));
         assert!(!app.advance_background().unwrap());
@@ -4111,7 +4779,10 @@ mod tests {
         ));
         assert!(matches!(
             app.view_state().unwrap(),
-            ViewState::Help { q_closes: false }
+            ViewState::Help {
+                q_closes: false,
+                book: false
+            }
         ));
         assert_eq!(app.update(Action::LineDown).unwrap(), Outcome::Unchanged);
 
@@ -4135,7 +4806,10 @@ mod tests {
         app.update(Action::ShowHelp).unwrap();
         assert!(matches!(
             app.view_state().unwrap(),
-            ViewState::Help { q_closes: true }
+            ViewState::Help {
+                q_closes: true,
+                book: false
+            }
         ));
         assert_eq!(app.pending_highlight_cursors(), pending);
         app.update(Action::DismissHelp).unwrap();
@@ -4147,7 +4821,10 @@ mod tests {
         app.update(Action::ShowHelp).unwrap();
         assert!(matches!(
             app.view_state().unwrap(),
-            ViewState::Help { q_closes: true }
+            ViewState::Help {
+                q_closes: true,
+                book: false
+            }
         ));
         assert_eq!(app.published_highlight_count(), published);
     }
@@ -5835,9 +6512,9 @@ mod tests {
             let mut app = App::new(crate::document::load(path.clone()).unwrap());
             app.update(Action::Resize(Geometry::new(16, 7))).unwrap();
             let request = case.request(&mut app);
-            let height = app.geometry.body_height().unwrap();
+            let height = request.locator_height(app.geometry.body_height().unwrap());
             let (target, delta) = request.locator_parameters(app.document.source_end(), height);
-            let expected = cache_location(&mut app, target, delta);
+            let expected = cache_location_at_height(&mut app, target, delta, height);
             let key = app.layout.as_ref().unwrap().row_cache_key();
             assert_eq!(
                 app.row_neighborhood.locate_target(

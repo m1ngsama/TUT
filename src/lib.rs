@@ -11,6 +11,7 @@ use std::{
 mod app;
 mod cli;
 mod document;
+mod epub;
 mod error;
 mod layout;
 mod line_index;
@@ -65,7 +66,12 @@ fn run_open(command: OpenCommand) -> Result<RunResult, TutError> {
             }
 
             let mut handlers = tui::install_signal_handlers(lease)?;
-            let result = match document::load(path) {
+            let document = if epub::is_path(&path) {
+                epub::load(path)
+            } else {
+                document::load(path)
+            };
+            let result = match document {
                 Ok(document) => {
                     run_document(document, &mut handlers, &mut observer, InputKind::Path)
                 }

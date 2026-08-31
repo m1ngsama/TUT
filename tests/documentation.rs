@@ -6,6 +6,7 @@ const PROJECT: &str = include_str!("../docs/PROJECT.md");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const CONTRIBUTING: &str = include_str!("../CONTRIBUTING.md");
 const SECURITY: &str = include_str!("../SECURITY.md");
+const CI: &str = include_str!("../.github/workflows/ci.yml");
 const SECURITY_AUDIT: &str = include_str!("../.github/workflows/security-audit.yml");
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -37,7 +38,7 @@ fn primary_documents_cover_the_public_cli_contract() {
         assert!(manual.contains(interface), "manual omits {interface}");
     }
 
-    for interface in ["standard input", "/dev/tty", "UTF-8"] {
+    for interface in ["standard input", "/dev/tty", "UTF-8", "EPUB", "NCX"] {
         assert!(README.contains(interface), "README omits {interface}");
         assert!(manual.contains(interface), "manual omits {interface}");
     }
@@ -47,7 +48,7 @@ fn primary_documents_cover_the_public_cli_contract() {
 fn package_metadata_describes_the_documented_product() {
     assert_eq!(
         env!("CARGO_PKG_DESCRIPTION"),
-        "A local plain-text reader for the terminal"
+        "A local text and EPUB reader for the terminal"
     );
     assert_eq!(
         env!("CARGO_PKG_HOMEPAGE"),
@@ -70,6 +71,7 @@ fn user_documents_cover_the_interactive_contract() {
     for key in [
         "F1",
         "Ctrl-C",
+        "Ctrl-Z",
         "Ctrl-D",
         "Ctrl-U",
         "PageDown",
@@ -90,7 +92,7 @@ fn user_documents_cover_the_interactive_contract() {
 fn user_documents_record_supported_limits_and_exit_statuses() {
     assert_eq!(MAX_FILE_BYTES, 32 * 1024 * 1024);
     let manual = plain_manual();
-    for limit in ["32 MiB", "4096", "16 columns by 4 rows"] {
+    for limit in ["32 MiB", "128 MiB", "4096", "16 columns by 4 rows"] {
         assert!(README.contains(limit), "README omits {limit}");
         assert!(manual.contains(limit), "manual omits {limit}");
     }
@@ -147,4 +149,9 @@ fn dependency_audit_commands_stay_pinned_and_discoverable() {
         README.contains("cargo audit --file Cargo.lock"),
         "README local checks omit the dependency audit gate"
     );
+    for workflow in [CI, SECURITY_AUDIT] {
+        assert!(!workflow.contains("schedule:"));
+        assert!(!workflow.contains("cron:"));
+    }
+    assert!(!CONTRIBUTING.contains("weekly"));
 }

@@ -3,11 +3,11 @@
 [![CI](https://github.com/m1ngsama/TUT/actions/workflows/ci.yml/badge.svg)](https://github.com/m1ngsama/TUT/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-TUT is a focused plain-text reader for Unix terminals.
+TUT is a focused document reader for Unix terminals.
 
-It reads one finite UTF-8 document, presents it safely, and gets out of the
-way. TUT does not edit text, interpret document control sequences, or try to
-replace the programs that fetch, filter, decompress, and convert content. Those
+It reads one finite UTF-8 text document or reflowable EPUB book, presents it
+safely, and gets out of the way. TUT does not edit content, interpret document
+control sequences, fetch remote resources, or execute book scripts. Other
 programs compose with TUT through standard input.
 
 TUT is under active pre-1.0 development. The current product is deliberately
@@ -16,6 +16,7 @@ narrow: a reliable local reader, not yet a complete replacement for `less`.
 ## What it provides
 
 - UTF-8 and Unicode-grapheme-aware display with automatic soft wrapping.
+- EPUB 2 and EPUB 3 main-reading-order projection for DRM-free reflowable books.
 - Vim- and pager-style line, page, half-page, and document navigation.
 - Exact, case-sensitive literal search with highlighting and match navigation.
 - Bounded numeric prefixes such as `12j`, `3 Space`, and `5n`.
@@ -63,6 +64,12 @@ Read a regular file:
 tut notes.txt
 ```
 
+Read an EPUB book:
+
+```sh
+tut book.epub
+```
+
 Read finite output from another Unix program:
 
 ```sh
@@ -78,14 +85,14 @@ stream follower.
 <!-- BEGIN TUT HELP -->
 ```text
 Usage: tut [OPTION]... FILE
-Read UTF-8 text from FILE in the terminal.
+Read UTF-8 text or EPUB books in the terminal.
 
   -h, --help     display this help and exit
   -V, --version  output version information and exit
       --log-file=FILE
                   append typed session events to FILE
 
-With FILE -, read standard input.
+With FILE -, read UTF-8 text from standard input.
 Use -- before a FILE whose name begins with '-'.
 For a file named '-', use ./-.
 TUT_LOG_FILE is used when --log-file is not specified.
@@ -116,6 +123,7 @@ Press `F1` in TUT for a guide adapted to the current terminal size.
 | `Ctrl-D`, `Ctrl-U` | Half page down or up |
 | `g`, Home | Start of document |
 | `G`, End | End of document |
+| `[`, `]` | Previous or next EPUB section |
 | `/` | Enter search |
 | `n`, `N` | Next or previous match |
 | `1`-`9999` before a relative motion | Repeat the motion |
@@ -124,10 +132,11 @@ Press `F1` in TUT for a guide adapted to the current terminal size.
 | `F1` | Open or close help |
 | `q` | Quit |
 | `Ctrl-C` | Interrupt |
+| `Ctrl-Z` | Suspend through Unix job control |
 
-Counts apply to line, page, half-page, and match movement. A count starts with
-`1`-`9`; subsequent digits may include `0`. A digit that would raise the count
-above 9999 is rejected while the existing prefix is preserved.
+Counts apply to line, page, half-page, EPUB-section, and match movement. A count
+starts with `1`-`9`; subsequent digits may include `0`. A digit that would raise
+the count above 9999 is rejected while the existing prefix is preserved.
 
 ### Search input
 
@@ -151,10 +160,13 @@ from search input closes only with Esc or `F1`.
 
 | Property | Current behavior |
 | --- | --- |
-| Input | One regular file or one finite standard-input snapshot |
-| Encoding | Valid UTF-8; an initial UTF-8 BOM is accepted and hidden |
-| Maximum input size | 32 MiB, including standard input |
-| Layout | Automatic soft wrap; no horizontal scrolling or no-wrap mode |
+| Input | One regular UTF-8 text or `.epub` file, or one finite UTF-8 standard-input snapshot |
+| Text encoding | Valid UTF-8; an initial UTF-8 BOM is accepted and hidden |
+| Maximum input size | 32 MiB, including EPUB archives and standard input |
+| EPUB expansion | 4096 entries, 8 MiB per entry, and 256 MiB total |
+| EPUB linear spine | Source content across all linear-spine chapters is limited to 128 MiB combined |
+| EPUB projected text | The UTF-8 text produced from an EPUB is limited to 32 MiB |
+| Layout | Automatic soft wrap; EPUB reading columns are centered and capped at 80 cells |
 | Line endings | LF, CRLF, and CR are recognized |
 | Tabs | Expanded to four-column tab stops |
 | Control sequences | Displayed inertly; ANSI styling is not interpreted |
@@ -167,10 +179,18 @@ from search input closes only with Esc or `F1`.
 Windows is not supported. Other Unix systems may work, but are not currently
 covered by the terminal and signal test matrix.
 
+EPUB XHTML is projected to paragraphs, lists, table cells, preformatted text,
+captions, and useful image alternative text before terminal layout. EPUB 2 NCX
+and EPUB 3 navigation documents provide section movement; XHTML headings are
+the fallback. Books open at their first projected heading, while `g` reveals
+front matter. The reader follows only the linear spine and does not render CSS,
+bitmap images, fixed-layout pages, fonts, DRM-protected content, link activation,
+or a table-of-contents browser.
+
 TUT does not currently follow or reload growing files, switch between multiple
 documents, run regular-expression searches, or provide mouse and configuration
-systems. Convert other document formats to finite UTF-8 plain text before
-piping them to TUT.
+systems. Convert formats other than EPUB to finite UTF-8 text before piping
+them to TUT.
 
 ## Session logging
 

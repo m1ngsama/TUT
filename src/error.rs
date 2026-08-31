@@ -21,6 +21,13 @@ pub enum LoadError {
     NotRegular(PathBuf),
     TooLarge { path: PathBuf, limit: u64 },
     InvalidUtf8 { path: PathBuf, offset: u64 },
+    InvalidEpub { path: PathBuf, source: io::Error },
+    EpubTooManyEntries { path: PathBuf, limit: usize },
+    EpubEntryTooLarge { path: PathBuf, limit: u64 },
+    EpubExpandedTooLarge { path: PathBuf, limit: u64 },
+    EpubTextTooLarge { path: PathBuf, limit: u64 },
+    NoLinearEpubContent(PathBuf),
+    BufferEpub { path: PathBuf, source: io::Error },
     StandardInputTooLarge { limit: u64 },
     InvalidStandardInputUtf8 { offset: u64 },
     ReadStandardInput { source: io::Error },
@@ -338,6 +345,34 @@ fn load_message(error: &LoadError) -> String {
             "invalid UTF-8 at byte {offset}: '{}'",
             sanitize_os(path.as_os_str())
         ),
+        LoadError::InvalidEpub { path, source } => format!(
+            "invalid or unsupported EPUB '{}': {source}",
+            sanitize_os(path.as_os_str())
+        ),
+        LoadError::EpubTooManyEntries { path, limit } => format!(
+            "EPUB contains more than {limit} entries: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LoadError::EpubEntryTooLarge { path, limit } => format!(
+            "an EPUB entry exceeds the {limit}-byte expansion limit: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LoadError::EpubExpandedTooLarge { path, limit } => format!(
+            "EPUB expands beyond the {limit}-byte limit: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LoadError::EpubTextTooLarge { path, limit } => format!(
+            "EPUB text exceeds the {limit}-byte limit: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LoadError::NoLinearEpubContent(path) => format!(
+            "EPUB has no linear reading content: '{}'",
+            sanitize_os(path.as_os_str())
+        ),
+        LoadError::BufferEpub { path, source } => format!(
+            "cannot buffer EPUB text '{}': {source}",
+            sanitize_os(path.as_os_str())
+        ),
         LoadError::StandardInputTooLarge { limit } => {
             format!("standard input exceeds the {limit}-byte limit")
         }
@@ -403,6 +438,8 @@ impl Error for TutError {
             Self::Load(
                 LoadError::Open { source, .. }
                 | LoadError::Read { source, .. }
+                | LoadError::InvalidEpub { source, .. }
+                | LoadError::BufferEpub { source, .. }
                 | LoadError::ReadStandardInput { source }
                 | LoadError::BufferStandardInput { source },
             )
@@ -496,6 +533,15 @@ mod tests {
         assert_eq!(
             stdin.message(),
             "invalid UTF-8 in standard input at byte 16"
+        );
+
+        let epub = TutError::Load(LoadError::InvalidEpub {
+            path: PathBuf::from("bad\n.epub"),
+            source: io::Error::new(io::ErrorKind::InvalidData, "broken\npackage"),
+        });
+        assert_eq!(
+            epub.message(),
+            "invalid or unsupported EPUB 'bad\\x0a.epub': broken\\x0apackage"
         );
 
         let terminal = TutError::TerminalTooLarge {

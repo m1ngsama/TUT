@@ -8,16 +8,19 @@ license = "MIT"
 repository = "https://github.com/m1ngsama/TUT"
 homepage = "https://github.com/m1ngsama/TUT"
 readme = "README.md"
-description = "A local plain-text reader for the terminal"
+description = "A local text and EPUB reader for the terminal"
 
 [dependencies]
-crossterm = { version = "0.29", features = ["use-dev-tty"] }
 libc = "0.2"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+percent-encoding = "2"
+quick-xml = { version = "0.41", features = ["escape-html"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["std"] }
+rbook = { version = "0.7.10", default-features = false }
 rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
-rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
+rustix = { version = "1", features = ["fs", "process", "pty", "stdio", "termios"] }

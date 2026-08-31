@@ -1,12 +1,12 @@
-.TH TUT 1 "August 11, 2026" "TUT" "User Commands"
+.TH TUT 1 "August 31, 2026" "TUT" "User Commands"
 .SH NAME
-tut \- read UTF-8 text in the terminal
+tut \- read UTF-8 text and EPUB books in the terminal
 .SH SYNOPSIS
 .B tut
 .RI [ OPTION ]... " FILE"
 .SH DESCRIPTION
 .B tut
-is a full-screen reader for local, plain UTF-8 text.
+is a full-screen reader for local UTF-8 text and reflowable EPUB books.
 It displays the document with Unicode-aware soft wrapping and provides
 line, page, document, and literal-search navigation.
 .PP
@@ -21,6 +21,19 @@ output must be terminals.
 The file is checked while it is read; if it changes during the session,
 .B tut
 reports an error instead of combining inconsistent contents.
+.PP
+An EPUB path is admitted as a bounded ZIP archive and its linear spine is
+projected to UTF-8 text before terminal layout.
+Paragraphs, lists, table cells, preformatted text, captions, and useful image
+alternative text are retained.
+EPUB 2 NCX and EPUB 3 navigation documents provide section movement, with
+XHTML headings as a fallback.
+Books initially open at the first projected heading;
+.B g
+also exposes earlier front matter.
+The reading column is centered and limited to 80 terminal cells.
+CSS layout, bitmap images, fixed-layout pages, fonts, protected content, link
+activation, and a table-of-contents browser are not rendered.
 .PP
 When
 .I FILE
@@ -59,7 +72,9 @@ Use this before a pathname that begins with a hyphen.
 .SH OPERANDS
 .TP
 .I FILE
-The regular UTF-8 text file to read.
+The regular UTF-8 text or
+.B .epub
+file to read.
 Specify
 .B \-
 to read standard input.
@@ -104,6 +119,9 @@ Move to the start of the document.
 .TP
 .BR G ", " End
 Move to the end of the document.
+.TP
+.BR [ ", " ]
+Move to the previous or next EPUB section.
 .SS Search
 Searches find literal, case-sensitive, non-overlapping UTF-8 substrings.
 Match navigation wraps at the ends of the document.
@@ -150,6 +168,10 @@ reader.
 .B Ctrl-C
 Request interruption.
 After successful session logging and terminal cleanup, exit with status 130.
+.TP
+.B Ctrl-Z
+Suspend through Unix terminal job control.
+The terminal is restored before stopping and rebuilt after continuation.
 .SH ENVIRONMENT
 .TP
 .B TUT_LOG_FILE
@@ -167,8 +189,18 @@ read from nonterminal standard input.
 does not read a configuration file and does not create a default log file.
 .SH LIMITS
 .IP \(bu 2
-The input document or standard-input snapshot may contain at most 33,554,432
-bytes (32 MiB) and must be valid UTF-8.
+The input file or standard-input snapshot may contain at most 33,554,432 bytes
+(32 MiB).
+Plain text and standard input must be valid UTF-8.
+.IP \(bu 2
+An EPUB may contain at most 4096 ZIP entries, each expanding to at most 8 MiB,
+with no more than 256 MiB expanded in total.
+.IP \(bu 2
+The source content across all chapters in an EPUB's linear spine may total at
+most 134,217,728 bytes (128 MiB).
+.IP \(bu 2
+The UTF-8 text projected from an EPUB may contain at most 33,554,432 bytes
+(32 MiB).
 .IP \(bu 2
 Search queries may contain at most 4096 UTF-8 bytes.
 .IP \(bu 2
