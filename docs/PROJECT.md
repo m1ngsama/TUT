@@ -1,9 +1,10 @@
 # TUT project principles
 
-TUT is a terminal reader for finite, local, UTF-8 plain text. Its job is to
-make text comfortable to read without compromising the terminal that hosts it.
-It is intentionally a focused Unix tool rather than an editor, formatter,
-terminal emulator, or general document platform.
+TUT is a terminal reader for finite, local UTF-8 text and DRM-free, reflowable
+EPUB books. Its job is to make documents comfortable to read without
+compromising the terminal that hosts it. It is intentionally a focused Unix
+tool rather than an editor, formatter, terminal emulator, or general document
+platform.
 
 These principles are part of the project's product contract. They guide both
 implementation decisions and the acceptance of new features.

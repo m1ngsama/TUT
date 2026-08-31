@@ -8,6 +8,25 @@ tag does not describe the present program or its compatibility.
 
 ## Unreleased
 
+### Added
+
+- Bounded EPUB 2 and EPUB 3 reading through a semantic UTF-8 projection of the
+  linear spine, including paragraphs, lists, tables, preformatted text, and
+  image alternative text.
+- EPUB book chrome, an 80-cell centered reading column, heading hierarchy, and
+  bounded section navigation from EPUB 2 NCX, EPUB 3 nav, or XHTML headings.
+
+### Changed
+
+- Replaced Crossterm and its maintenance fork with a small in-tree Unix
+  terminal adapter limited to TUT's input, raw-mode, and ANSI rendering needs.
+
+### Fixed
+
+- Keyboard suspension now preserves terminal-generated signals in raw input
+  mode, so the configured suspend character restores the terminal before the
+  process stops and redraws it after continuation.
+
 ## 0.0.6 - 2026-08-13
 
 ### Fixed

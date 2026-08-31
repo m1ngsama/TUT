@@ -9,14 +9,14 @@ use crate::error::InvocationError;
 pub const USAGE: &str = "Usage: tut [OPTION]... FILE";
 pub const HELP: &str = "\
 Usage: tut [OPTION]... FILE
-Read UTF-8 text from FILE in the terminal.
+Read UTF-8 text or EPUB books in the terminal.
 
   -h, --help     display this help and exit
   -V, --version  output version information and exit
       --log-file=FILE
                   append typed session events to FILE
 
-With FILE -, read standard input.
+With FILE -, read UTF-8 text from standard input.
 Use -- before a FILE whose name begins with '-'.
 For a file named '-', use ./-.
 TUT_LOG_FILE is used when --log-file is not specified.
@@ -260,7 +260,7 @@ mod tests {
     fn help_and_version_follow_gnu_output_conventions() {
         assert!(HELP.starts_with("Usage: tut "));
         assert!(HELP.ends_with('\n'));
-        assert!(HELP.contains("With FILE -, read standard input."));
+        assert!(HELP.contains("With FILE -, read UTF-8 text from standard input."));
         assert!(HELP.contains("--log-file=FILE"));
         assert!(HELP.contains("TUT_LOG_FILE"));
         assert!(HELP.contains("For a file named '-', use ./-."));

@@ -25,11 +25,187 @@ use crate::{
 
 pub const MAX_FILE_BYTES: u64 = 33_554_432;
 pub(super) const SOURCE_WINDOW_BYTES: usize = 64 * 1024;
+pub(super) const MAX_BOOK_SECTIONS: usize = 4_096;
+pub(super) const MAX_BOOK_HEADINGS: usize = 4_096;
+pub(super) const MAX_BOOK_TITLE_BYTES: usize = 1_024;
+pub(super) const MAX_BOOK_TITLE_TOTAL_BYTES: usize = 1024 * 1024;
 const STANDARD_INPUT_NAME: &str = "standard input";
 const UTF8_BOM_BYTES: usize = 3;
 const UTF8_BOUNDARY_SLOP_BYTES: usize = 3;
 const MAX_GRAPHEME_BYTES: usize = 1024 * 1024;
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BookSection {
+    title: String,
+    level: u8,
+    target: SourceOffset,
+}
+
+impl BookSection {
+    pub(super) fn new(title: String, level: u8, target: SourceOffset) -> Option<Self> {
+        (!title.is_empty() && title.len() <= MAX_BOOK_TITLE_BYTES && level != 0).then_some(Self {
+            title,
+            level,
+            target,
+        })
+    }
+
+    pub(super) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(super) const fn level(&self) -> u8 {
+        self.level
+    }
+
+    pub(super) const fn target(&self) -> SourceOffset {
+        self.target
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BookHeading {
+    level: u8,
+    start: SourceOffset,
+    end: SourceOffset,
+}
+
+impl BookHeading {
+    pub(super) fn new(level: u8, start: SourceOffset, end: SourceOffset) -> Option<Self> {
+        ((1..=6).contains(&level) && start < end).then_some(Self { level, start, end })
+    }
+
+    pub(super) const fn level(&self) -> u8 {
+        self.level
+    }
+
+    pub(super) const fn start(&self) -> SourceOffset {
+        self.start
+    }
+
+    pub(super) const fn end(&self) -> SourceOffset {
+        self.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BookStructure {
+    title: Option<String>,
+    creator: Option<String>,
+    sections: Vec<BookSection>,
+    headings: Vec<BookHeading>,
+}
+
+impl BookStructure {
+    pub(super) fn new(
+        title: Option<String>,
+        creator: Option<String>,
+        mut sections: Vec<BookSection>,
+        mut headings: Vec<BookHeading>,
+    ) -> Self {
+        let mut title_bytes = 0_usize;
+        let title = bounded_book_field(title, &mut title_bytes);
+        let creator = bounded_book_field(creator, &mut title_bytes);
+
+        sections.sort_by_key(BookSection::target);
+        sections.truncate(MAX_BOOK_SECTIONS);
+        sections.retain(|section| {
+            if section.level() == 0 {
+                return false;
+            }
+            title_bytes
+                .checked_add(section.title.len())
+                .filter(|total| *total <= MAX_BOOK_TITLE_TOTAL_BYTES)
+                .is_some_and(|total| {
+                    title_bytes = total;
+                    true
+                })
+        });
+        headings.sort_by_key(BookHeading::start);
+        headings.truncate(MAX_BOOK_HEADINGS);
+
+        Self {
+            title,
+            creator,
+            sections,
+            headings,
+        }
+    }
+
+    pub(super) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub(super) fn creator(&self) -> Option<&str> {
+        self.creator.as_deref()
+    }
+
+    pub(super) fn sections(&self) -> &[BookSection] {
+        &self.sections
+    }
+
+    pub(super) fn headings(&self) -> &[BookHeading] {
+        &self.headings
+    }
+
+    pub(super) fn preferred_start(&self) -> Option<SourceOffset> {
+        self.headings
+            .first()
+            .map(BookHeading::start)
+            .or_else(|| self.sections.first().map(BookSection::target))
+    }
+
+    pub(super) fn section_at_or_before(&self, at: SourceOffset) -> Option<&BookSection> {
+        let index = self
+            .sections
+            .partition_point(|section| section.target <= at);
+        index
+            .checked_sub(1)
+            .and_then(|index| self.sections.get(index))
+    }
+
+    pub(super) fn previous_section(&self, at: SourceOffset) -> Option<&BookSection> {
+        let index = self.sections.partition_point(|section| section.target < at);
+        index
+            .checked_sub(1)
+            .and_then(|index| self.sections.get(index))
+    }
+
+    pub(super) fn next_section(&self, at: SourceOffset) -> Option<&BookSection> {
+        let index = self
+            .sections
+            .partition_point(|section| section.target <= at);
+        self.sections.get(index)
+    }
+
+    fn retain_source_range(&mut self, source_start: SourceOffset, source_end: SourceOffset) {
+        self.sections
+            .retain(|section| source_start <= section.target && section.target < source_end);
+        self.headings.retain(|heading| {
+            source_start <= heading.start
+                && heading.start < heading.end
+                && heading.end <= source_end
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.creator.is_none()
+            && self.sections.is_empty()
+            && self.headings.is_empty()
+    }
+}
+
+fn bounded_book_field(value: Option<String>, total: &mut usize) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty() && value.len() <= MAX_BOOK_TITLE_BYTES)?;
+    let next = total.checked_add(value.len())?;
+    if next > MAX_BOOK_TITLE_TOTAL_BYTES {
+        return None;
+    }
+    *total = next;
+    Some(value)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -65,6 +241,7 @@ pub(super) struct Document {
     path: PathBuf,
     display_path: String,
     display_name: String,
+    book: Option<BookStructure>,
 }
 
 impl Document {
@@ -99,6 +276,17 @@ impl Document {
 
     pub(super) fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    pub(super) fn book(&self) -> Option<&BookStructure> {
+        self.book.as_ref()
+    }
+
+    pub(super) fn preferred_start(&self) -> SourceOffset {
+        self.book
+            .as_ref()
+            .and_then(BookStructure::preferred_start)
+            .unwrap_or(self.source_start)
     }
 
     pub(super) fn validate(&self) -> Result<(), LoadError> {
@@ -177,6 +365,13 @@ impl Document {
     }
 
     #[cfg(test)]
+    pub(super) fn from_book_text(path: &Path, text: String, book: BookStructure) -> Self {
+        let mut document = Self::from_text(path, text);
+        document.book = Some(book);
+        document
+    }
+
+    #[cfg(test)]
     fn new(path: &Path, source: String) -> Result<Self, LoadError> {
         let store = DocumentStore::in_memory(source);
         let line_index = build_line_index(&store, path)?;
@@ -221,6 +416,7 @@ impl Document {
             path,
             display_path,
             display_name,
+            book: None,
         }
     }
 }
@@ -1172,6 +1368,28 @@ pub(super) fn load(path: PathBuf) -> Result<Document, LoadError> {
     ))
 }
 
+pub(super) fn open_source(path: PathBuf) -> Result<SourceFile, LoadError> {
+    SourceFile::open(path, MAX_FILE_BYTES)
+}
+
+pub(super) fn load_snapshot(
+    source: SourceFile,
+    file: File,
+    source_len: u64,
+    book: Option<BookStructure>,
+) -> Result<Document, LoadError> {
+    let store = source.into_snapshot(file, source_len)?;
+    let path = store.path.clone();
+    let line_index = LineIndex::new(store.source_start, store.source_end)
+        .map_err(|error| map_line_index_error(&path, error))?;
+    let mut document = Document::from_parts(&path, DocumentStore::File(store), line_index);
+    document.book = book.and_then(|mut book| {
+        book.retain_source_range(document.source_start, document.source_end);
+        (!book.is_empty()).then_some(book)
+    });
+    Ok(document)
+}
+
 #[cfg(test)]
 fn build_line_index(store: &DocumentStore, path: &Path) -> Result<LineIndex, LoadError> {
     let source_start = store.source_start();
@@ -1210,6 +1428,7 @@ struct FileStore {
     file: File,
     path: PathBuf,
     path_binding: Option<InputPathBinding>,
+    origin: Option<Box<OriginFile>>,
     source_start: SourceOffset,
     source_end: SourceOffset,
     stability: FileStability,
@@ -1233,6 +1452,20 @@ struct FileFingerprint {
     modified_nanoseconds: i64,
     changed_seconds: i64,
     changed_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+pub(super) struct SourceFile {
+    file: File,
+    path: PathBuf,
+    path_binding: InputPathBinding,
+    fingerprint: FileFingerprint,
+}
+
+#[derive(Debug)]
+struct OriginFile {
+    file: File,
+    fingerprint: FileFingerprint,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1357,7 +1590,7 @@ pub(super) fn overwrite_with_distinct_fingerprint(path: &Path, contents: impl As
     );
 }
 
-impl FileStore {
+impl SourceFile {
     fn open(path: PathBuf, limit: u64) -> Result<Self, LoadError> {
         let bound = BoundPath::capture(&path).map_err(|source| LoadError::Open {
             path: path.clone(),
@@ -1383,16 +1616,7 @@ impl FileStore {
             resolved: resolved.into_anchor(),
             lexical_location,
         };
-
-        Self::from_tracked_file_with_identity(File::from(descriptor), path, path_binding, limit)
-    }
-
-    fn from_tracked_file_with_identity(
-        file: File,
-        path: PathBuf,
-        path_binding: InputPathBinding,
-        limit: u64,
-    ) -> Result<Self, LoadError> {
+        let file = File::from(descriptor);
         let metadata = file.metadata().map_err(|source| LoadError::Read {
             path: path.clone(),
             source,
@@ -1404,13 +1628,91 @@ impl FileStore {
             return Err(LoadError::TooLarge { path, limit });
         }
 
-        Self::new(
+        Ok(Self {
             file,
             path,
-            metadata.len(),
-            FileStability::Tracked(FileFingerprint::from_metadata(&metadata)),
-            Some(path_binding),
+            path_binding,
+            fingerprint: FileFingerprint::from_metadata(&metadata),
+        })
+    }
+
+    pub(super) fn try_clone(&self) -> Result<File, LoadError> {
+        self.file.try_clone().map_err(|source| LoadError::Read {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(super) const fn len(&self) -> u64 {
+        self.fingerprint.length
+    }
+
+    pub(super) fn validate(&self) -> Result<(), LoadError> {
+        let metadata = self.file.metadata().map_err(|source| LoadError::Read {
+            path: self.path.clone(),
+            source,
+        })?;
+        if FileFingerprint::from_metadata(&metadata) != self.fingerprint {
+            return Err(LoadError::Read {
+                path: self.path.clone(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "file changed while reading"),
+            });
+        }
+        Ok(())
+    }
+
+    fn into_store(self) -> Result<FileStore, LoadError> {
+        let source_len = self.fingerprint.length;
+        FileStore::new(
+            self.file,
+            self.path,
+            source_len,
+            FileStability::Tracked(self.fingerprint),
+            Some(self.path_binding),
+            None,
         )
+    }
+
+    fn into_snapshot(self, file: File, source_len: u64) -> Result<FileStore, LoadError> {
+        let Self {
+            file: origin,
+            path,
+            path_binding,
+            fingerprint,
+        } = self;
+        FileStore::new(
+            file,
+            path,
+            source_len,
+            FileStability::PrivateSnapshot,
+            Some(path_binding),
+            Some(Box::new(OriginFile {
+                file: origin,
+                fingerprint,
+            })),
+        )
+    }
+}
+
+impl OriginFile {
+    fn validate(&self, path: &Path) -> Result<(), LoadError> {
+        let metadata = self.file.metadata().map_err(|source| LoadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if FileFingerprint::from_metadata(&metadata) != self.fingerprint {
+            return Err(LoadError::Read {
+                path: path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "file changed while reading"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl FileStore {
+    fn open(path: PathBuf, limit: u64) -> Result<Self, LoadError> {
+        SourceFile::open(path, limit)?.into_store()
     }
 
     fn from_private_snapshot(
@@ -1418,13 +1720,22 @@ impl FileStore {
         path: PathBuf,
         source_len: u64,
     ) -> Result<Self, LoadError> {
-        Self::new(file, path, source_len, FileStability::PrivateSnapshot, None)
+        Self::new(
+            file,
+            path,
+            source_len,
+            FileStability::PrivateSnapshot,
+            None,
+            None,
+        )
     }
 
     fn input_identity(&self) -> Option<InputIdentity<'_>> {
         let path = self.path_binding.as_ref()?;
-        let FileStability::Tracked(fingerprint) = self.stability else {
-            return None;
+        let fingerprint = match (&self.origin, self.stability) {
+            (Some(origin), _) => origin.fingerprint,
+            (None, FileStability::Tracked(fingerprint)) => fingerprint,
+            (None, FileStability::PrivateSnapshot) => return None,
         };
         Some(InputIdentity {
             path,
@@ -1438,15 +1749,20 @@ impl FileStore {
         source_len: u64,
         stability: FileStability,
         path_binding: Option<InputPathBinding>,
+        origin: Option<Box<OriginFile>>,
     ) -> Result<Self, LoadError> {
         debug_assert_eq!(
-            path_binding.is_some(),
-            matches!(stability, FileStability::Tracked(_))
+            (path_binding.is_some(), origin.is_some()),
+            match stability {
+                FileStability::Tracked(_) => (true, false),
+                FileStability::PrivateSnapshot => (origin.is_some(), origin.is_some()),
+            }
         );
         let mut store = Self {
             file,
             path,
             path_binding,
+            origin,
             source_start: SourceOffset::ZERO,
             source_end: SourceOffset::new(source_len),
             stability,
@@ -1740,6 +2056,9 @@ impl FileStore {
     }
 
     fn require_unchanged(&self) -> Result<(), LoadError> {
+        if let Some(origin) = &self.origin {
+            return origin.validate(&self.path);
+        }
         let FileStability::Tracked(fingerprint) = self.stability else {
             return Ok(());
         };
@@ -2276,6 +2595,144 @@ mod tests {
         let document = Document::from_text(&path, "text".to_owned());
         assert_eq!(document.display_path(), "/tmp/book.txt");
         assert_eq!(document.source().as_str(), "text");
+        assert!(document.book().is_none());
+        assert_eq!(document.preferred_start(), document.source_start());
+    }
+
+    #[test]
+    fn book_structure_orders_sections_and_locates_navigation_targets() {
+        let first = BookSection::new("First".to_owned(), 1, SourceOffset::new(4)).unwrap();
+        let second = BookSection::new("Second".to_owned(), 2, SourceOffset::new(20)).unwrap();
+        let first_heading =
+            BookHeading::new(1, SourceOffset::new(4), SourceOffset::new(9)).unwrap();
+        let second_heading =
+            BookHeading::new(2, SourceOffset::new(20), SourceOffset::new(26)).unwrap();
+        let book = BookStructure::new(
+            Some("Book".to_owned()),
+            Some("Writer".to_owned()),
+            vec![second, first],
+            vec![second_heading, first_heading],
+        );
+
+        assert_eq!(book.title(), Some("Book"));
+        assert_eq!(book.creator(), Some("Writer"));
+        assert_eq!(book.preferred_start(), Some(SourceOffset::new(4)));
+        assert_eq!(book.sections()[0].title(), "First");
+        assert_eq!(book.sections()[1].title(), "Second");
+        assert_eq!(book.sections()[0].target(), SourceOffset::new(4));
+        assert_eq!(book.headings()[0].level(), 1);
+        assert_eq!(book.headings()[0].start(), SourceOffset::new(4));
+        assert_eq!(book.headings()[0].end(), SourceOffset::new(9));
+        assert!(book.section_at_or_before(SourceOffset::new(3)).is_none());
+        assert_eq!(
+            book.section_at_or_before(SourceOffset::new(20))
+                .map(BookSection::title),
+            Some("Second")
+        );
+        assert_eq!(
+            book.previous_section(SourceOffset::new(19))
+                .map(BookSection::title),
+            Some("First")
+        );
+        assert_eq!(
+            book.previous_section(SourceOffset::new(20))
+                .map(BookSection::title),
+            Some("First")
+        );
+        assert_eq!(
+            book.previous_section(SourceOffset::new(21))
+                .map(BookSection::title),
+            Some("Second")
+        );
+        assert_eq!(
+            book.next_section(SourceOffset::new(4))
+                .map(BookSection::title),
+            Some("Second")
+        );
+        assert_eq!(
+            book.next_section(SourceOffset::new(3))
+                .map(BookSection::title),
+            Some("First")
+        );
+
+        let document = Document::from_book_text(
+            Path::new("book.txt"),
+            "xxxxFirst text.......Second text".to_owned(),
+            book,
+        );
+        assert_eq!(document.preferred_start(), SourceOffset::new(4));
+    }
+
+    #[test]
+    fn book_structure_limits_degrade_metadata_and_section_indexes() {
+        let mut sections = Vec::new();
+        for index in (0..=MAX_BOOK_SECTIONS).rev() {
+            let target = SourceOffset::from_usize(index * 2);
+            sections.push(BookSection::new("x".to_owned(), 1, target).unwrap());
+        }
+        let headings = (0..=MAX_BOOK_HEADINGS)
+            .rev()
+            .map(|index| {
+                let start = SourceOffset::from_usize(index * 2);
+                BookHeading::new(1, start, start.checked_add(1).unwrap()).unwrap()
+            })
+            .collect();
+        let book = BookStructure::new(
+            Some("x".repeat(MAX_BOOK_TITLE_BYTES + 1)),
+            Some("Writer".to_owned()),
+            sections,
+            headings,
+        );
+        assert_eq!(book.title(), None);
+        assert_eq!(book.creator(), Some("Writer"));
+        assert_eq!(book.sections().len(), MAX_BOOK_SECTIONS);
+        assert!(
+            book.sections()
+                .windows(2)
+                .all(|pair| pair[0].target() < pair[1].target())
+        );
+        assert_eq!(book.headings().len(), MAX_BOOK_HEADINGS);
+        assert!(
+            book.headings()
+                .windows(2)
+                .all(|pair| pair[0].start() < pair[1].start())
+        );
+
+        let title = "x".repeat(MAX_BOOK_TITLE_BYTES);
+        let mut sections = Vec::new();
+        for index in 0..=MAX_BOOK_TITLE_TOTAL_BYTES / MAX_BOOK_TITLE_BYTES {
+            let target = SourceOffset::from_usize(index * 2);
+            sections.push(BookSection::new(title.clone(), 1, target).unwrap());
+        }
+        let book = BookStructure::new(None, None, sections, Vec::new());
+        assert_eq!(
+            book.sections()
+                .iter()
+                .map(|section| section.title().len())
+                .sum::<usize>(),
+            MAX_BOOK_TITLE_TOTAL_BYTES
+        );
+    }
+
+    #[test]
+    fn book_structure_drops_ranges_outside_the_attached_source() {
+        let valid = BookSection::new("Valid".to_owned(), 1, SourceOffset::new(2)).unwrap();
+        let invalid = BookSection::new("Invalid".to_owned(), 1, SourceOffset::new(12)).unwrap();
+        let valid_heading =
+            BookHeading::new(1, SourceOffset::new(2), SourceOffset::new(4)).unwrap();
+        let invalid_heading =
+            BookHeading::new(1, SourceOffset::new(8), SourceOffset::new(12)).unwrap();
+        let mut book = BookStructure::new(
+            None,
+            None,
+            vec![invalid, valid],
+            vec![invalid_heading, valid_heading],
+        );
+        book.retain_source_range(SourceOffset::ZERO, SourceOffset::new(10));
+        assert_eq!(book.sections().len(), 1);
+        assert_eq!(book.sections()[0].title(), "Valid");
+        assert_eq!(book.headings().len(), 1);
+        assert_eq!(book.headings()[0].start(), SourceOffset::new(2));
     }
 
     #[test]

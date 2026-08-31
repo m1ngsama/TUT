@@ -1,30 +1,17 @@
+mod ansi;
 mod input;
 mod signals;
+mod terminal_io;
 mod view;
 
-use std::{
-    io::{self, Stdout},
-    mem::size_of,
-    time::Duration,
-};
+use std::{io, mem::size_of, time::Duration};
 
-use crossterm::{
-    cursor::{Hide, Show},
-    event::{self, Event},
-    execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        is_raw_mode_enabled,
-    },
-};
-use ratatui::{
-    Terminal, TerminalOptions, Viewport,
-    backend::{Backend, CrosstermBackend},
-    buffer::Cell,
-    layout::Rect,
-};
+use ansi::AnsiBackend;
+use input::Event;
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::Backend, buffer::Cell, layout::Rect};
 use signals::SuspendOutcome;
 pub(super) use signals::{ProcessSessionLease, SignalHandlers, SignalState};
+use terminal_io::TerminalInput;
 
 use crate::{
     app::{Action, App, BackgroundWork, Geometry, Outcome, ViewState},
@@ -237,24 +224,19 @@ impl<'a, T: TerminalDriver> TerminalSession<'a, T> {
     fn restore(&mut self) -> Option<TutError> {
         let mut first = None;
         if self.cursor_cleanup {
-            self.cursor_cleanup = false;
-            retain_first(&mut first, "show cursor", self.driver.show_cursor());
+            let result = self.driver.show_cursor();
+            self.cursor_cleanup = result.is_err();
+            retain_first(&mut first, "show cursor", result);
         }
         if self.alternate_cleanup {
-            self.alternate_cleanup = false;
-            retain_first(
-                &mut first,
-                "leave alternate screen",
-                self.driver.leave_alternate_screen(),
-            );
+            let result = self.driver.leave_alternate_screen();
+            self.alternate_cleanup = result.is_err();
+            retain_first(&mut first, "leave alternate screen", result);
         }
         if self.raw_cleanup {
-            self.raw_cleanup = false;
-            retain_first(
-                &mut first,
-                "disable raw mode",
-                self.driver.disable_raw_mode(),
-            );
+            let result = self.driver.disable_raw_mode();
+            self.raw_cleanup = result.is_err();
+            retain_first(&mut first, "disable raw mode", result);
         }
         first
     }
@@ -648,8 +630,12 @@ fn advance_background<R: RuntimeRecorder>(
     result.map_err(Primary::Error)
 }
 
-struct CrosstermDriver {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
+
+struct UnixDriver {
+    terminal: Terminal<AnsiBackend>,
+    input: TerminalInput,
 }
 
 fn try_draw_fallible<B, F>(terminal: &mut Terminal<B>, render: F) -> Result<(), TutError>
@@ -687,41 +673,47 @@ fn render_budgeted_frame(
     view::render(frame, state, &mut symbols)
 }
 
-impl CrosstermDriver {
+impl UnixDriver {
     fn new() -> io::Result<Self> {
+        let input = TerminalInput::open()?;
+        let screen = input.screen_clone()?;
         let options = TerminalOptions {
             viewport: Viewport::Fixed(Rect::default()),
         };
         Ok(Self {
-            terminal: Terminal::with_options(CrosstermBackend::new(io::stdout()), options)?,
+            terminal: Terminal::with_options(AnsiBackend::new(&screen)?, options)?,
+            input,
         })
     }
 }
 
-impl TerminalDriver for CrosstermDriver {
+impl TerminalDriver for UnixDriver {
     fn raw_mode_enabled(&mut self) -> io::Result<bool> {
-        is_raw_mode_enabled()
+        self.input.raw_mode_enabled()
     }
 
     fn size(&mut self) -> io::Result<(u16, u16)> {
-        let size = self.terminal.size()?;
-        Ok((size.width, size.height))
+        self.input.size()
     }
 
     fn resize(&mut self, size: TerminalSize) -> io::Result<()> {
-        self.terminal.resize(size.area())
+        self.terminal.resize(size.area())?;
+        self.input.record_size((size.width, size.height));
+        Ok(())
     }
 
     fn enable_raw_mode(&mut self) -> io::Result<()> {
-        enable_raw_mode()
+        self.input.enable_raw_mode()
     }
 
     fn enter_alternate_screen(&mut self) -> io::Result<()> {
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen)
+        self.terminal
+            .backend_mut()
+            .write_session(ENTER_ALTERNATE_SCREEN)
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
-        execute!(self.terminal.backend_mut(), Hide)
+        self.terminal.hide_cursor()
     }
 
     fn draw(&mut self, app: &mut App) -> Result<(), TutError> {
@@ -732,14 +724,17 @@ impl TerminalDriver for CrosstermDriver {
     }
 
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
-        event::poll(timeout)
+        self.input.poll(timeout)
     }
 
     fn read(&mut self) -> io::Result<Event> {
-        event::read()
+        self.input.read()
     }
 
     fn suspend(&mut self) -> io::Result<()> {
+        // A signal can arrive after poll has cached an event but before read consumes it. Do not
+        // replay that pre-suspension event after the terminal has been rebuilt with fresh geometry.
+        self.input.discard_buffered_events();
         // SAFETY: SIGSTOP is valid and raise has no Rust memory-safety requirements.
         let result = unsafe { libc::raise(libc::SIGSTOP) };
         if result == 0 {
@@ -752,15 +747,17 @@ impl TerminalDriver for CrosstermDriver {
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
-        execute!(self.terminal.backend_mut(), Show)
+        self.terminal.show_cursor()
     }
 
     fn leave_alternate_screen(&mut self) -> io::Result<()> {
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
+        self.terminal
+            .backend_mut()
+            .write_session(LEAVE_ALTERNATE_SCREEN)
     }
 
     fn disable_raw_mode(&mut self) -> io::Result<()> {
-        disable_raw_mode()
+        self.input.disable_raw_mode()
     }
 }
 
@@ -770,7 +767,7 @@ pub(super) fn run(
     observer: &mut Observer,
 ) -> Result<RunOutcome, TutError> {
     let signals = handlers.state().clone();
-    let mut driver = match CrosstermDriver::new() {
+    let mut driver = match UnixDriver::new() {
         Ok(driver) => driver,
         Err(source) => {
             if let Some(signal) = signals.received() {
@@ -796,7 +793,6 @@ mod tests {
         cell::Cell as StateCell, collections::VecDeque, convert::Infallible, fs, path::Path, rc::Rc,
     };
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use libc::{SIGHUP, SIGTERM};
     use ratatui::{
         backend::{ClearType, TestBackend, WindowSize},
@@ -804,6 +800,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    use super::input::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use super::*;
     use crate::app::{
         BoundedCapacityFootprint, BoundedCapacityProbe, RenderRows, RenderRowsView, RenderState,
@@ -1363,7 +1360,7 @@ mod tests {
             MAX_TERMINAL_CELLS * 2 * u64::try_from(size_of::<Cell>()).unwrap()
         );
         assert!(boundary.buffer_bytes() <= MAX_TERMINAL_BUFFER_BYTES);
-        assert_eq!(boundary.symbol_budget(), 8 * 1024 * 1024);
+        assert_eq!(boundary.symbol_budget(), 12 * 1024 * 1024);
         assert!(TerminalSize::new(1000, 300).is_ok());
         assert!(TerminalSize::new(0, u16::MAX).is_ok());
         assert!(matches!(
@@ -1433,6 +1430,8 @@ mod tests {
         let state = ViewState::Reader(RenderState {
             filename: "fixture",
             path: "fixture",
+            book: None,
+            body_width: COLUMNS,
             rows: RenderRowsView::from_rows(&rows),
             progress: 100,
             current_line: Some(1),
@@ -1455,11 +1454,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            TutError::TerminalFrameSymbolBudgetExceeded { limit: 8_388_608 }
+            TutError::TerminalFrameSymbolBudgetExceeded { limit: 12_582_912 }
         ));
         assert_eq!(
             error.message(),
-            "terminal frame symbols exceed the 8388608-byte limit"
+            "terminal frame symbols exceed the 12582912-byte limit"
         );
         assert_eq!(terminal.backend().draw_calls, 0);
         assert_eq!(terminal.backend().flush_calls, 0);
@@ -1485,7 +1484,10 @@ mod tests {
                 .all(|cell| cell == &Cell::default())
         );
 
-        let retry = ViewState::Help { q_closes: true };
+        let retry = ViewState::Help {
+            q_closes: true,
+            book: false,
+        };
         try_draw_fallible(&mut terminal, |frame| render_budgeted_frame(frame, &retry)).unwrap();
         assert_eq!(terminal.backend().draw_calls, 1);
         assert_eq!(terminal.backend().flush_calls, 1);
@@ -1500,7 +1502,10 @@ mod tests {
         let mut backend = IoTestBackend::new(16, 4);
         backend.fail_draw = true;
         let mut terminal = Terminal::with_options(backend, options).unwrap();
-        let state = ViewState::Help { q_closes: true };
+        let state = ViewState::Help {
+            q_closes: true,
+            book: false,
+        };
 
         let error = try_draw_fallible(&mut terminal, |frame| render_budgeted_frame(frame, &state))
             .unwrap_err();
@@ -2103,7 +2108,7 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.sizes.push_back((4096, 4));
-        driver.events.extend([Event::FocusGained, quit_event()]);
+        driver.events.extend([Event::Ignored, quit_event()]);
         let mut recorder = TraceRecorder::default();
         let mut app = app_from_text(Path::new("/tmp/queued-render.txt"), "x".repeat(4096));
 
@@ -2183,7 +2188,7 @@ mod tests {
         let mut app = App::new(crate::document::load(path).unwrap());
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
-        driver.events.extend([Event::FocusGained, quit_event()]);
+        driver.events.extend([Event::Ignored, quit_event()]);
         let mut recorder = TraceRecorder::default();
 
         assert_eq!(
@@ -2389,7 +2394,7 @@ mod tests {
             let signals = SignalState::empty();
             let mut driver = FakeDriver::new(&signals);
             driver.sizes.extend([(4096, 4), (resume_width, 4)]);
-            driver.events.extend([Event::FocusGained, quit_event()]);
+            driver.events.extend([Event::Ignored, quit_event()]);
             let mut recorder = TraceRecorder {
                 suspend_after_render: Some(signals.clone()),
                 ..TraceRecorder::default()
@@ -2490,7 +2495,16 @@ mod tests {
         assert!(
             driver
                 .calls
-                .ends_with(&["show_cursor", "leave_alt", "disable_raw"])
+                .windows(3)
+                .any(|calls| calls == ["show_cursor", "leave_alt", "disable_raw"])
+        );
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == "show_cursor")
+                .count(),
+            2
         );
     }
 
@@ -2709,12 +2723,9 @@ mod tests {
         let mut app = App::new(crate::document::load(path).unwrap());
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
-        driver.events.extend([
-            Event::FocusGained,
-            Event::FocusGained,
-            Event::FocusGained,
-            quit_event(),
-        ]);
+        driver
+            .events
+            .extend([Event::Ignored, Event::Ignored, Event::Ignored, quit_event()]);
 
         assert_eq!(
             run_with_driver(&mut app, &mut driver, &signals).unwrap(),
@@ -2753,11 +2764,11 @@ mod tests {
         let signals = SignalState::empty();
         let mut driver = FakeDriver::new(&signals);
         driver.events.extend([
-            Event::FocusGained,
-            Event::FocusGained,
-            Event::FocusGained,
-            Event::FocusGained,
-            Event::FocusGained,
+            Event::Ignored,
+            Event::Ignored,
+            Event::Ignored,
+            Event::Ignored,
+            Event::Ignored,
             quit_event(),
         ]);
         let mut recorder = TraceRecorder::default();

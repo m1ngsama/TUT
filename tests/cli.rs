@@ -149,7 +149,6 @@ mod pty {
         time::{Duration, Instant},
     };
 
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
     use rustix::{
         fs::{self, Mode, OFlags},
         process::{
@@ -158,7 +157,8 @@ mod pty {
         pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt},
         termios::{self, SpecialCodeIndex, Termios, Winsize},
     };
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::{Builder, NamedTempFile, tempdir};
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     use super::tut;
 
@@ -171,6 +171,43 @@ mod pty {
     const REUSABLE_RUN_FD: &str = "TUT_TEST_REUSABLE_RUN_FD";
     const FIRST_RUN_EOF: &[u8] = b"TUT_TEST_FIRST_RUN_EOF";
     const TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn epub_fixture() -> NamedTempFile {
+        let file = Builder::new().suffix(".epub").tempfile().unwrap();
+        let mut writer = ZipWriter::new(file.reopen().unwrap());
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        writer.start_file("mimetype", stored).unwrap();
+        writer.write_all(b"application/epub+zip").unwrap();
+        writer
+            .start_file("META-INF/container.xml", deflated)
+            .unwrap();
+        writer
+            .write_all(
+                br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+            )
+            .unwrap();
+        writer.start_file("content.opf", deflated).unwrap();
+        writer
+            .write_all(
+                br#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>PTY EPUB</dc:title><dc:creator>PTY AUTHOR</dc:creator></metadata><manifest><item id="linear" href="linear.xhtml" media-type="application/xhtml+xml"/><item id="aux" href="aux.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="linear"/><itemref idref="aux" linear="no"/></spine></package>"#,
+            )
+            .unwrap();
+        writer.start_file("linear.xhtml", deflated).unwrap();
+        writer
+            .write_all(
+                br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>EPUB_FRONT_SENTINEL</p><img alt="[Image: [Image unavailable.]]"/><h1>EPUB_LINEAR_SENTINEL</h1><p>terminal book text</p><img alt="PLATE_ALT_SENTINEL"/><h2>EPUB_SECOND_SECTION_SENTINEL</h2><p>second section body</p></body></html>"#,
+            )
+            .unwrap();
+        writer.start_file("aux.xhtml", deflated).unwrap();
+        writer
+            .write_all(
+                br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>EPUB_NONLINEAR_SENTINEL</p></body></html>"#,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        file
+    }
 
     fn reset_signal_state() -> io::Result<()> {
         // SAFETY: sigaction is fully initialized before each synchronous libc call.
@@ -328,7 +365,7 @@ mod pty {
             command
                 .args([
                     "--exact",
-                    "pty::nested_crossterm_raw_owner_is_preserved",
+                    "pty::nested_raw_owner_is_preserved",
                     "--nocapture",
                 ])
                 .env(NESTED_RAW_HELPER, path)
@@ -817,34 +854,51 @@ mod pty {
         ))
     }
 
-    struct RawModeGuard;
+    struct RawModeGuard {
+        terminal: File,
+        original: Termios,
+    }
+
+    impl RawModeGuard {
+        fn acquire() -> io::Result<Self> {
+            let terminal = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+            let original = termios::tcgetattr(&terminal)?;
+            let mut raw = original.clone();
+            raw.make_raw();
+            termios::tcsetattr(&terminal, termios::OptionalActions::Now, &raw)?;
+            Ok(Self { terminal, original })
+        }
+    }
 
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
-            let _ = disable_raw_mode();
+            let _ = termios::tcsetattr(
+                &self.terminal,
+                termios::OptionalActions::Now,
+                &self.original,
+            );
         }
     }
 
     fn exercise_nested_raw_rejection(path: &Path) {
-        let terminal = std::fs::OpenOptions::new()
+        let terminal = OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/tty")
             .unwrap();
         let initial = termios::tcgetattr(&terminal).unwrap();
-        enable_raw_mode().unwrap();
-        let guard = RawModeGuard;
-        assert!(is_raw_mode_enabled().unwrap());
+        let guard = RawModeGuard::acquire().unwrap();
         let owned = termios::tcgetattr(&terminal).unwrap();
+        assert!(!owned.local_modes.contains(
+            termios::LocalModes::ECHO | termios::LocalModes::ICANON | termios::LocalModes::IEXTEN
+        ));
 
         let error = tut::run([path.as_os_str().to_owned()]).unwrap_err();
 
         assert!(matches!(error, tut::TutError::TerminalInUse));
-        assert!(is_raw_mode_enabled().unwrap());
         let after = termios::tcgetattr(&terminal).unwrap();
         assert_terminal_configuration(&after, &owned);
         drop(guard);
-        assert!(!is_raw_mode_enabled().unwrap());
         let restored = termios::tcgetattr(&terminal).unwrap();
         assert_terminal_configuration(&restored, &initial);
     }
@@ -875,7 +929,7 @@ mod pty {
     }
 
     #[test]
-    fn nested_crossterm_raw_owner_is_preserved() {
+    fn nested_raw_owner_is_preserved() {
         if let Some(path) = std::env::var_os(NESTED_RAW_HELPER) {
             exercise_nested_raw_rejection(Path::new(&path));
             return;
@@ -1113,6 +1167,83 @@ mod pty {
     }
 
     #[test]
+    fn epub_linear_content_works_through_a_real_terminal() {
+        let file = epub_fixture();
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(b"PTY EPUB").unwrap();
+        pty.wait_for(b"PTY AUTHOR").unwrap();
+        pty.wait_for(b"EPUB_LINEAR_SENTINEL").unwrap();
+        pty.wait_for(b"PLATE_ALT_SENTINEL").unwrap();
+        assert!(
+            !pty.output
+                .windows(b"EPUB_FRONT_SENTINEL".len())
+                .any(|window| window == b"EPUB_FRONT_SENTINEL")
+        );
+        assert!(
+            !pty.output
+                .windows(b"Image unavailable".len())
+                .any(|window| window == b"Image unavailable")
+        );
+
+        let front_start = pty.output.len();
+        pty.write_command(b"g").unwrap();
+        pty.wait_for_after(front_start, b"EPUB_FRONT_SENTINEL")
+            .unwrap();
+        pty.wait_for_after(front_start, b"front matter").unwrap();
+        assert!(
+            !pty.output[front_start..]
+                .windows(b"Image unavailable".len())
+                .any(|window| window == b"Image unavailable")
+        );
+
+        let first_start = pty.output.len();
+        pty.write_command(b"]").unwrap();
+        pty.wait_for_after(first_start, b"EPUB_LINEAR_SENTINEL")
+            .unwrap();
+        pty.wait_for_after(first_start, b"section 1/2").unwrap();
+
+        let second_start = pty.output.len();
+        pty.write_command(b"]").unwrap();
+        pty.wait_for_after(second_start, b"EPUB_SECOND_SECTION_SENTINEL")
+            .unwrap();
+        pty.wait_for_after(second_start, b"section 2/2").unwrap();
+
+        let previous_start = pty.output.len();
+        pty.write_command(b"[").unwrap();
+        pty.wait_for_after(previous_start, b"EPUB_LINEAR_SENTINEL")
+            .unwrap();
+
+        let search_start = pty.output.len();
+        pty.write_command(b"/EPUB_NONLINEAR_SENTINEL\r").unwrap();
+        pty.wait_for_after(search_start, b"no matches").unwrap();
+        pty.write_command(b"q").unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        assert_session_terminal_restored(&pty);
+    }
+
+    #[test]
+    fn epub_input_cannot_be_reused_as_its_session_log() {
+        let file = epub_fixture();
+        let before = std::fs::read(file.path()).unwrap();
+        let mut pty = PtyChild::spawn_logged(file.path(), Some(file.path()), None).unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&pty.stderr_output)
+                .starts_with("tut: session log is the input document:")
+        );
+        assert_eq!(std::fs::read(file.path()).unwrap(), before);
+        assert!(
+            !pty.output
+                .windows(ENTER_ALT.len())
+                .any(|window| window == ENTER_ALT)
+        );
+        pty.assert_restored();
+    }
+
+    #[test]
     fn zero_mouse_coordinates_remain_bounded_through_a_real_terminal() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "coordinate input\n").unwrap();
@@ -1146,8 +1277,8 @@ mod pty {
 
         let mut pty = PtyChild::spawn(file.path()).unwrap();
         pty.wait_for(b"START_SENTINEL").unwrap();
-        // Kitty alternate-key reporting supplies the shifted codepoint and Crossterm consumes the
-        // Shift modifier. The command must still agree with legacy uppercase G.
+        // Kitty alternate-key reporting supplies the shifted codepoint and consumes the Shift
+        // modifier. The command must still agree with legacy uppercase G.
         pty.master.write_all(b"\x1b[103:71;2:2u").unwrap();
         pty.wait_for(b"END_SENTINEL").unwrap();
 
@@ -1163,7 +1294,7 @@ mod pty {
         let search_start = pty.output.len();
         // Kitty CSI-u without alternate reporting encodes shifted letters as lower-case codepoints
         // plus Shift. Repeat text is inserted, release text is ignored, and an alternate codepoint
-        // preserves shifted punctuation after Crossterm consumes its Shift modifier.
+        // preserves shifted punctuation after the protocol consumes its Shift modifier.
         pty.master
             .write_all(b"/\x1b[97;2u\x1b[108;2:2uPHA\x1b[120;1:3u\x1b[47:63;2u\r")
             .unwrap();
@@ -1237,13 +1368,9 @@ mod pty {
         pty.write_command_with_timeout(&sequence).unwrap();
 
         assert_eq!(pty.wait().unwrap().code(), Some(1));
-        assert!(
-            pty.stderr_output
-                == b"tut: failed to poll terminal events: terminal input sequence exceeded 65536 bytes\n"
-                || pty.stderr_output
-                    == b"tut: failed to poll terminal events: terminal input sequence did not finish within 2 seconds\n",
-            "unexpected terminal input bound: {:?}",
-            String::from_utf8_lossy(&pty.stderr_output)
+        assert_eq!(
+            pty.stderr_output,
+            b"tut: failed to poll terminal events: terminal input sequence exceeded 65536 bytes\n"
         );
         assert_session_terminal_restored(&pty);
         assert!(
@@ -1251,6 +1378,26 @@ mod pty {
                 .unwrap()
                 .contains("session_summary outcome=error ")
         );
+    }
+
+    #[test]
+    fn exact_limit_terminal_sequence_is_consumed_atomically() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "bounded input\n").unwrap();
+        let mut pty = PtyChild::spawn(file.path()).unwrap();
+        pty.wait_for(HIDE_CURSOR).unwrap();
+
+        let mut sequence = Vec::with_capacity(64 * 1024);
+        sequence.extend_from_slice(b"\x1b[200~");
+        sequence.resize(64 * 1024 - b"\x1b[201~".len(), b'x');
+        sequence.extend_from_slice(b"\x1b[201~");
+        assert_eq!(sequence.len(), 64 * 1024);
+        pty.write_command_with_timeout(&sequence).unwrap();
+        pty.master.write_all(b"q").unwrap();
+
+        assert_eq!(pty.wait().unwrap().code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        assert_session_terminal_restored(&pty);
     }
 
     #[test]
@@ -1591,6 +1738,38 @@ mod pty {
         pty.wait_for_after(continuation_start, b"SUSPEND_SENTINEL")
             .unwrap();
         pty.master.write_all(b"q").unwrap();
+
+        let status = pty.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(pty.stderr_output.is_empty());
+        pty.assert_restored();
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.ends_with(" terminal_sessions=2 suspensions=1\n"));
+    }
+
+    #[test]
+    fn keyboard_suspend_restores_and_continuation_reenters_the_terminal() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        let log = directory.path().join("session.log");
+        std::fs::write(&input, "KEYBOARD_SUSPEND_SENTINEL\n").unwrap();
+        let mut pty = PtyChild::spawn_logged(&input, None, Some(&log)).unwrap();
+        pty.wait_for(b"KEYBOARD_SUSPEND_SENTINEL").unwrap();
+
+        let suspension_start = pty.output.len();
+        pty.write_command(b"\x1a").unwrap();
+        pty.wait_until_stopped().unwrap();
+        pty.wait_for_after(suspension_start, SHOW_CURSOR).unwrap();
+        pty.wait_for_after(suspension_start, LEAVE_ALT).unwrap();
+        pty.assert_restored();
+
+        let continuation_start = pty.output.len();
+        pty.signal(Signal::CONT).unwrap();
+        pty.wait_for_after(continuation_start, ENTER_ALT).unwrap();
+        pty.wait_for_after(continuation_start, HIDE_CURSOR).unwrap();
+        pty.wait_for_after(continuation_start, b"KEYBOARD_SUSPEND_SENTINEL")
+            .unwrap();
+        pty.write_command(b"q").unwrap();
 
         let status = pty.wait().unwrap();
         assert_eq!(status.code(), Some(0));

@@ -10,10 +10,11 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     app::{
-        Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, PendingState,
+        BookState, Highlight, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, MatchCursor, PendingState,
         RenderProjectionKind, RenderRow, RenderRowsView, RenderSpan, RenderState, RepeatStatus,
         SearchStatus, ViewActivity, ViewState, ViewportBoundary,
     },
+    document::BookHeading,
     error::{TutError, sanitize_text},
     layout::{ContentWidth, DisplayAtoms, DisplayColumn},
     tui::FrameSymbolMeter,
@@ -62,6 +63,42 @@ const COMMITTED_SEARCH_FOOTER: &[CopyTier] = &[
     CopyTier {
         min_columns: 16,
         text: "Esc clear q quit",
+    },
+];
+const BOOK_READER_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "q quit  F1 help  / search  [/] sections  j/k lines  Space/b pages  n/N matches",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "q quit F1 help [/] sections / search",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "q quit [/] F1 help",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "q quit [/] F1",
+    },
+];
+const BOOK_COMMITTED_SEARCH_FOOTER: &[CopyTier] = &[
+    CopyTier {
+        min_columns: 80,
+        text: "Esc clear  n/N matches  [/] sections  q quit  F1 help  / new search",
+    },
+    CopyTier {
+        min_columns: 40,
+        text: "Esc clear n/N [/] sections q quit F1",
+    },
+    CopyTier {
+        min_columns: 20,
+        text: "Esc [/] n/N q",
+    },
+    CopyTier {
+        min_columns: 16,
+        text: "Esc [/] n/N q",
     },
 ];
 const SEARCH_INPUT_FOOTER: &[CopyTier] = &[
@@ -178,6 +215,9 @@ const FULL_HELP: &[&str] = &[
     "  q                    quit from reader mode",
     "  Ctrl-C               interrupt",
 ];
+const BOOK_COMPACT_HELP: &str = "[/] sections           previous / next";
+const BOOK_FULL_HELP: &str = "  [/]                  previous / next section";
+const BOOK_FULL_HELP_INDEX: usize = 10;
 
 pub(super) fn render(
     frame: &mut Frame<'_>,
@@ -198,7 +238,7 @@ pub(super) fn render(
     match state {
         ViewState::Reader(state) => render_reader(frame, state, symbols),
         ViewState::Pending(state) => render_pending(frame, state, symbols),
-        ViewState::Help { q_closes } => render_help(frame, *q_closes, symbols),
+        ViewState::Help { q_closes, book } => render_help(frame, *q_closes, *book, symbols),
     }
 }
 
@@ -208,17 +248,28 @@ fn render_reader(
     symbols: &mut FrameSymbolMeter,
 ) -> Result<(), TutError> {
     let area = frame.area();
-    let header_text = header_text(state.filename, state.path, area.width)?;
-    let status_text = status_text(state, area.width)?;
-    let help_text = footer_for(state.status, area.width);
+    let content = centered_column(area, state.body_width);
+    let header_text = view_header_text(state.filename, state.path, state.book, content.width)?;
+    let status_text = status_text(state, content.width)?;
+    let help_text = view_footer_for(
+        state.status,
+        state.book.is_some_and(|book| book.section_total != 0),
+        area.width,
+    );
     let body_height = area.height - 3;
-    let header = Rect::new(area.x, area.y, area.width, 1);
-    let body = Rect::new(area.x, area.y + 1, area.width, body_height);
-    let status = Rect::new(area.x, area.y + 1 + body_height, area.width, 1);
+    let header = Rect::new(content.x, area.y, content.width, 1);
+    let body = Rect::new(content.x, area.y + 1, content.width, body_height);
+    let status = Rect::new(content.x, area.y + 1 + body_height, content.width, 1);
     let help = Rect::new(area.x, area.y + 2 + body_height, area.width, 1);
 
     render_projected_line(frame.buffer_mut(), header, &header_text, symbols)?;
-    render_body(frame.buffer_mut(), body, state.rows, symbols)?;
+    render_body(
+        frame.buffer_mut(),
+        body,
+        state.rows,
+        state.book.map_or(&[], |book| book.heading_ranges),
+        symbols,
+    )?;
     render_projected_line(frame.buffer_mut(), status, &status_text, symbols)?;
     render_projected_line(frame.buffer_mut(), help, help_text, symbols)?;
     Ok(())
@@ -230,19 +281,34 @@ fn render_pending(
     symbols: &mut FrameSymbolMeter,
 ) -> Result<(), TutError> {
     let area = frame.area();
-    let header_text = header_text(state.filename, state.path, area.width)?;
-    let status_text = pending_status_text(state.status, state.repeat, area.width)?;
-    let footer_text = footer_for(state.status, area.width);
+    let content = centered_column(area, state.body_width);
+    let header_text = view_header_text(state.filename, state.path, state.book, content.width)?;
+    let status_text = pending_status_text(state.status, state.repeat, content.width)?;
+    let footer_text = view_footer_for(
+        state.status,
+        state.book.is_some_and(|book| book.section_total != 0),
+        area.width,
+    );
     let body_height = area.height - 3;
-    let header = Rect::new(area.x, area.y, area.width, 1);
-    let body = Rect::new(area.x, area.y + 1, area.width, body_height);
-    let status = Rect::new(area.x, area.y + 1 + body_height, area.width, 1);
+    let header = Rect::new(content.x, area.y, content.width, 1);
+    let body = Rect::new(content.x, area.y + 1, content.width, body_height);
+    let status = Rect::new(content.x, area.y + 1 + body_height, content.width, 1);
     let footer = Rect::new(area.x, area.y + 2 + body_height, area.width, 1);
 
     render_projected_line(frame.buffer_mut(), header, &header_text, symbols)?;
     render_centered_line(frame.buffer_mut(), body, PENDING_MESSAGE, symbols)?;
     render_projected_line(frame.buffer_mut(), status, &status_text, symbols)?;
     render_projected_line(frame.buffer_mut(), footer, footer_text, symbols)
+}
+
+fn centered_column(area: Rect, width: u16) -> Rect {
+    let width = width.min(area.width);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y,
+        width,
+        area.height,
+    )
 }
 
 fn pick_copy(columns: u16, tiers: &[CopyTier]) -> &'static str {
@@ -260,23 +326,38 @@ fn footer_for(status: SearchStatus<'_>, columns: u16) -> &'static str {
     }
 }
 
+fn view_footer_for(status: SearchStatus<'_>, sections: bool, columns: u16) -> &'static str {
+    if !sections || matches!(status, SearchStatus::Draft { .. }) {
+        return footer_for(status, columns);
+    }
+    match status {
+        SearchStatus::None => pick_copy(columns, BOOK_READER_FOOTER),
+        SearchStatus::Committed { .. } => pick_copy(columns, BOOK_COMMITTED_SEARCH_FOOTER),
+        SearchStatus::Draft { .. } => unreachable!("draft footer returned above"),
+    }
+}
+
 fn render_help(
     frame: &mut Frame<'_>,
     q_closes: bool,
+    book: bool,
     symbols: &mut FrameSymbolMeter,
 ) -> Result<(), TutError> {
     let area = frame.area();
     let title = Rect::new(area.x, area.y, area.width, 1);
     let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let body_height = area.height - 2;
-    let lines = if usize::from(body_height) >= FULL_HELP.len() {
-        FULL_HELP
+    let full = usize::from(body_height) >= FULL_HELP.len() + usize::from(book);
+    let line_count = if full {
+        FULL_HELP.len() + usize::from(book)
     } else {
-        COMPACT_HELP
+        COMPACT_HELP.len() + usize::from(book)
     };
 
     render_projected_line(frame.buffer_mut(), title, HELP_TITLE, symbols)?;
-    for (relative_y, line) in lines.iter().take(usize::from(body_height)).enumerate() {
+    for relative_y in 0..line_count.min(usize::from(body_height)) {
+        let line = help_line(full, book, relative_y)
+            .expect("help line indexes remain within the selected copy");
         let y = area.y + 1 + u16::try_from(relative_y).expect("help rows fit the terminal height");
         render_projected_line(
             frame.buffer_mut(),
@@ -296,18 +377,70 @@ fn render_help(
     render_projected_line(frame.buffer_mut(), footer, footer_text, symbols)
 }
 
+fn help_line(full: bool, book: bool, index: usize) -> Option<&'static str> {
+    if !full {
+        if book && index == 0 {
+            return Some(BOOK_COMPACT_HELP);
+        }
+        return COMPACT_HELP
+            .get(index.saturating_sub(usize::from(book)))
+            .copied();
+    }
+    if book && index == BOOK_FULL_HELP_INDEX {
+        return Some(BOOK_FULL_HELP);
+    }
+    let index = index.saturating_sub(usize::from(book && index > BOOK_FULL_HELP_INDEX));
+    FULL_HELP.get(index).copied()
+}
+
 fn render_body(
     buffer: &mut Buffer,
     area: Rect,
     rows: RenderRowsView<'_>,
+    heading_ranges: &[BookHeading],
     symbols: &mut FrameSymbolMeter,
 ) -> Result<(), TutError> {
     let mut highlights = rows.highlight_cursor();
+    let mut headings = HeadingCursor::new(heading_ranges);
     for (relative_y, row) in rows.iter().take(usize::from(area.height)).enumerate() {
         let y = area.y + u16::try_from(relative_y).expect("visible row count fits terminal height");
-        write_render_row(buffer, area, y, row, &mut highlights, symbols)?;
+        let heading_level = headings.level_for(row);
+        write_render_row(
+            buffer,
+            area,
+            y,
+            row,
+            heading_level,
+            &mut highlights,
+            symbols,
+        )?;
     }
     Ok(())
+}
+
+struct HeadingCursor<'a> {
+    ranges: &'a [BookHeading],
+    index: usize,
+}
+
+impl<'a> HeadingCursor<'a> {
+    const fn new(ranges: &'a [BookHeading]) -> Self {
+        Self { ranges, index: 0 }
+    }
+
+    fn level_for(&mut self, row: RenderRow<'_>) -> Option<u8> {
+        let row_start = row.spans.first()?.source().start();
+        let row_end = row.spans.last()?.source().end();
+        while self
+            .ranges
+            .get(self.index)
+            .is_some_and(|range| range.end() <= row_start)
+        {
+            self.index += 1;
+        }
+        let range = self.ranges.get(self.index)?;
+        (range.start() < row_end && row_start < range.end()).then_some(range.level())
+    }
 }
 
 fn write_render_row(
@@ -315,11 +448,21 @@ fn write_render_row(
     area: Rect,
     y: u16,
     row: RenderRow<'_>,
+    heading_level: Option<u8>,
     highlights: &mut MatchCursor<'_>,
     symbols: &mut FrameSymbolMeter,
 ) -> Result<(), TutError> {
+    let x = if matches!(heading_level, Some(1) | Some(2)) {
+        let row_width = row.spans.iter().fold(0_u32, |width, span| {
+            width.saturating_add(span.cell_width.get())
+        });
+        let row_width = u16::try_from(row_width).unwrap_or(u16::MAX);
+        area.x + area.width.saturating_sub(row_width) / 2
+    } else {
+        area.x
+    };
     let mut cursor = RowCursor {
-        x: area.x,
+        x,
         y,
         right: area.right(),
     };
@@ -339,6 +482,7 @@ fn write_render_row(
                 row,
                 &current,
                 current_highlight,
+                heading_level,
                 symbols,
             )?
         {
@@ -347,7 +491,15 @@ fn write_render_row(
         pending = Some((span.clone(), highlight));
     }
     if let Some((span, highlight)) = pending {
-        write_render_run(buffer, &mut cursor, row, &span, highlight, symbols)?;
+        write_render_run(
+            buffer,
+            &mut cursor,
+            row,
+            &span,
+            highlight,
+            heading_level,
+            symbols,
+        )?;
     }
     Ok(())
 }
@@ -364,6 +516,7 @@ fn write_render_run(
     row: RenderRow<'_>,
     span: &RenderSpan,
     highlight: Highlight,
+    heading_level: Option<u8>,
     symbols: &mut FrameSymbolMeter,
 ) -> Result<bool, TutError> {
     let width =
@@ -377,7 +530,7 @@ fn write_render_run(
         cursor.y,
         row.span_text(span),
         span,
-        highlight,
+        style_for(highlight, heading_level),
         symbols,
     )?;
     Ok(true)
@@ -389,12 +542,11 @@ fn write_render_span(
     y: u16,
     text: &str,
     span: &RenderSpan,
-    highlight: Highlight,
+    style: Style,
     symbols: &mut FrameSymbolMeter,
 ) -> Result<u16, TutError> {
     let width =
         u16::try_from(span.cell_width.get()).expect("projected width fits the terminal width");
-    let style = style_for(highlight);
     let one = NonZeroU16::new(1).expect("one is nonzero");
 
     if span.projection == RenderProjectionKind::Spaces {
@@ -430,12 +582,17 @@ fn write_render_span(
     Ok(width)
 }
 
-fn style_for(highlight: Highlight) -> Style {
-    match highlight {
+fn style_for(highlight: Highlight, heading_level: Option<u8>) -> Style {
+    let style = match highlight {
         Highlight::None => Style::default(),
         Highlight::Match => Style::default().add_modifier(Modifier::REVERSED),
         Highlight::Current => Style::default()
             .add_modifier(Modifier::REVERSED | Modifier::BOLD | Modifier::UNDERLINED),
+    };
+    match heading_level {
+        Some(1) => style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        Some(2..=6) => style.add_modifier(Modifier::BOLD),
+        _ => style,
     }
 }
 
@@ -471,7 +628,7 @@ fn render_projected_line(
             area.y,
             span.standalone_text(&row),
             &span,
-            Highlight::None,
+            Style::default(),
             symbols,
         )?;
         column = DisplayColumn::new(column.get() + u32::from(width));
@@ -525,9 +682,79 @@ fn header_text(filename: &str, path: &str, width: u16) -> Result<String, TutErro
     Ok(output)
 }
 
+fn view_header_text(
+    filename: &str,
+    path: &str,
+    book: Option<BookState<'_>>,
+    width: u16,
+) -> Result<String, TutError> {
+    match book {
+        Some(book) => book_header_text(book, filename, width),
+        None => header_text(filename, path, width),
+    }
+}
+
+fn book_header_text(
+    book: BookState<'_>,
+    fallback_name: &str,
+    width: u16,
+) -> Result<String, TutError> {
+    let title = book
+        .title
+        .map(sanitize_text)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| sanitize_text(fallback_name));
+    let Some(creator) = book
+        .creator
+        .map(sanitize_text)
+        .filter(|creator| !creator.is_empty())
+    else {
+        return ellipsize_end(&title, width);
+    };
+    const SEPARATOR: &str = " — ";
+    let separator_width = display_width(SEPARATOR);
+    if display_width(&title)
+        .saturating_add(separator_width)
+        .saturating_add(display_width(&creator))
+        <= width
+    {
+        let mut output = String::new();
+        output
+            .try_reserve_exact(title.len() + SEPARATOR.len() + creator.len())
+            .map_err(|_| TutError::Allocation("book header text"))?;
+        output.push_str(&title);
+        output.push_str(SEPARATOR);
+        output.push_str(&creator);
+        return Ok(output);
+    }
+    if width <= separator_width.saturating_add(2) {
+        return ellipsize_end(&title, width);
+    }
+
+    let title_budget = (width.saturating_mul(2) / 3)
+        .max(1)
+        .min(width - separator_width - 1);
+    let shown_title = ellipsize_end(&title, title_budget)?;
+    let creator_budget = width
+        .saturating_sub(display_width(&shown_title))
+        .saturating_sub(separator_width);
+    let shown_creator = ellipsize_end(&creator, creator_budget)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(shown_title.len() + SEPARATOR.len() + shown_creator.len())
+        .map_err(|_| TutError::Allocation("book header text"))?;
+    output.push_str(&shown_title);
+    output.push_str(SEPARATOR);
+    output.push_str(&shown_creator);
+    Ok(output)
+}
+
 fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> {
     if let Some(repeat) = state.repeat {
         return repeat_status_text(repeat);
+    }
+    if let Some(book) = state.book {
+        return book_status_text(state, book, width);
     }
     let mut prefix = String::new();
     prefix
@@ -547,6 +774,46 @@ fn status_text(state: &RenderState<'_>, width: u16) -> Result<String, TutError> 
         (None, None) => write!(prefix, "  ?/?"),
     }
     .expect("reserved String formatting is infallible");
+    compose_status(prefix, state.status, state.activity, width)
+}
+
+fn book_status_text(
+    state: &RenderState<'_>,
+    book: BookState<'_>,
+    width: u16,
+) -> Result<String, TutError> {
+    let mut prefix = String::new();
+    prefix
+        .try_reserve_exact(64)
+        .map_err(|_| TutError::Allocation("book status text"))?;
+    write!(prefix, "{}%", state.progress.min(100))
+        .expect("reserved String formatting is infallible");
+    if book.section_total != 0 {
+        match book.section_ordinal {
+            Some(ordinal) => write!(prefix, "  section {ordinal}/{}", book.section_total),
+            None => write!(prefix, "  front matter"),
+        }
+        .expect("reserved String formatting is infallible");
+    }
+
+    if book.section_total != 0
+        && let Some(title) = book.section_title
+    {
+        let title = sanitize_text(title);
+        let search_reserve = match state.status {
+            SearchStatus::None => 0,
+            SearchStatus::Committed { .. } | SearchStatus::Draft { .. } => width / 3,
+        };
+        let title_budget = width
+            .saturating_sub(display_width(&prefix))
+            .saturating_sub(2)
+            .saturating_sub(search_reserve);
+        if title_budget != 0 && !title.is_empty() {
+            let shown = ellipsize_end(&title, title_budget)?;
+            prefix.push_str("  ");
+            prefix.push_str(&shown);
+        }
+    }
     compose_status(prefix, state.status, state.activity, width)
 }
 
@@ -786,7 +1053,11 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::app::{Action, Geometry, app_from_text};
+    use crate::{
+        app::{Action, Geometry, RenderRows, app_from_text},
+        document::{BookSection, BookStructure, Document},
+        source::SourceOffset,
+    };
 
     fn prepare_frame(app: &mut crate::app::App) {
         for _ in 0..1024 {
@@ -818,6 +1089,15 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn draw_state(state: &ViewState<'_>, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut symbols = FrameSymbolMeter::new(u64::MAX);
+        terminal
+            .draw(|frame| render(frame, state, &mut symbols).unwrap())
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     fn draw_available(app: &mut crate::app::App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -831,7 +1111,7 @@ mod tests {
         prepare_frame(app);
         let state = app.render_state().unwrap();
         let mut symbols = FrameSymbolMeter::new(u64::MAX);
-        render_body(&mut buffer, area, state.rows, &mut symbols).unwrap();
+        render_body(&mut buffer, area, state.rows, &[], &mut symbols).unwrap();
         buffer
     }
 
@@ -884,6 +1164,8 @@ mod tests {
         for tiers in [
             READER_FOOTER,
             COMMITTED_SEARCH_FOOTER,
+            BOOK_READER_FOOTER,
+            BOOK_COMMITTED_SEARCH_FOOTER,
             SEARCH_INPUT_FOOTER,
             READER_HELP_FOOTER,
             SEARCH_HELP_FOOTER,
@@ -937,6 +1219,19 @@ mod tests {
         assert_eq!(pick_copy(6, TINY_COPY), "resize");
         assert_eq!(pick_copy(12, TINY_COPY), "resize q");
         assert_eq!(pick_copy(16, TINY_COPY), "resize  q quit");
+
+        assert_eq!(
+            view_footer_for(SearchStatus::None, true, 80),
+            "q quit  F1 help  / search  [/] sections  j/k lines  Space/b pages  n/N matches"
+        );
+        assert_eq!(
+            view_footer_for(committed, true, 40),
+            "Esc clear n/N [/] sections q quit F1"
+        );
+        assert_eq!(
+            view_footer_for(draft, true, 40),
+            "Esc cancel Enter Up recall Ctrl-U clear"
+        );
     }
 
     #[test]
@@ -951,7 +1246,7 @@ mod tests {
         let area = Rect::new(0, 0, 16, 1);
         let mut body = Buffer::empty(area);
         let mut body_symbols = FrameSymbolMeter::new(u64::MAX);
-        render_body(&mut body, area, state.rows, &mut body_symbols).unwrap();
+        render_body(&mut body, area, state.rows, &[], &mut body_symbols).unwrap();
         assert_eq!(body.cell((0, 0)).unwrap().symbol(), heap_grapheme);
         assert_eq!(body_symbols.used(), 32);
         assert_eq!(body_symbols.used(), actual_symbol_heap_bytes(&body));
@@ -1031,6 +1326,47 @@ mod tests {
         assert_eq!(
             row_text(&buffer, 4),
             "q quit  F1 help  / search  j/k  Space/b"
+        );
+    }
+
+    #[test]
+    fn book_chrome_and_body_share_the_centered_reading_column() {
+        let rows = RenderRows::from_prebuilt_runs("paragraph", 1, 9).unwrap();
+        let book = BookState {
+            title: Some("The Book"),
+            creator: Some("Ada Author"),
+            section_title: Some("Second Chapter"),
+            section_ordinal: Some(2),
+            section_total: 12,
+            heading_ranges: &[],
+        };
+        let state = ViewState::Reader(RenderState {
+            filename: "opaque-download-name.epub",
+            path: "/tmp/opaque-download-name.epub",
+            book: Some(book),
+            body_width: 80,
+            rows: RenderRowsView::from_rows(&rows),
+            progress: 37,
+            current_line: Some(91),
+            total_lines: Some(2_178),
+            status: SearchStatus::None,
+            activity: None,
+            boundary: Some(ViewportBoundary::Top),
+            repeat: None,
+        });
+
+        let buffer = draw_state(&state, 100, 4);
+        assert_eq!(row_text(&buffer, 0), "          The Book — Ada Author");
+        assert_eq!(row_text(&buffer, 1), "          paragraph");
+        assert_eq!(
+            row_text(&buffer, 2),
+            "          37%  section 2/12  Second Chapter"
+        );
+        assert!(!row_text(&buffer, 0).contains("opaque-download-name"));
+        assert!(!row_text(&buffer, 2).contains("91/2178"));
+        assert_eq!(
+            row_text(&buffer, 3),
+            "q quit  F1 help  / search  [/] sections  j/k lines  Space/b pages  n/N matches"
         );
     }
 
@@ -1267,6 +1603,34 @@ mod tests {
     }
 
     #[test]
+    fn book_help_adds_section_navigation_without_changing_plain_help() {
+        let full = draw_state(
+            &ViewState::Help {
+                q_closes: true,
+                book: true,
+            },
+            80,
+            24,
+        );
+        assert_eq!(
+            row_text(&full, 11),
+            "  [/]                  previous / next section"
+        );
+        assert_eq!(row_text(&full, 12), "Search");
+
+        let compact = draw_state(
+            &ViewState::Help {
+                q_closes: true,
+                book: true,
+            },
+            16,
+            4,
+        );
+        assert!(row_text(&compact, 1).starts_with("[/] sections"));
+        assert!(row_text(&compact, 2).starts_with("1-9 + j/k"));
+    }
+
+    #[test]
     fn dismissing_help_restores_reader_content_and_clears_overlay_rows() {
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1312,6 +1676,92 @@ mod tests {
         let current = buffer.cell((2, 1)).unwrap();
         assert!(current.modifier.contains(Modifier::REVERSED));
         assert!(current.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn toc_targets_and_heading_ranges_remain_independent_during_styled_rendering() {
+        let section_target = SourceOffset::from_usize(10);
+        let headings = vec![
+            BookHeading::new(1, SourceOffset::from_usize(0), SourceOffset::from_usize(4)).unwrap(),
+            BookHeading::new(2, SourceOffset::from_usize(5), SourceOffset::from_usize(9)).unwrap(),
+            BookHeading::new(
+                3,
+                SourceOffset::from_usize(16),
+                SourceOffset::from_usize(20),
+            )
+            .unwrap(),
+        ];
+        let book = BookStructure::new(
+            Some("The Book".to_owned()),
+            None,
+            vec![BookSection::new("Chapter".to_owned(), 1, section_target).unwrap()],
+            headings,
+        );
+        let document = Document::from_book_text(
+            Path::new("/tmp/book.epub"),
+            "head\nhead\nplain\nbody".to_owned(),
+            book,
+        );
+        let mut app = crate::app::App::new(document);
+        app.update(Action::Resize(Geometry::new(20, 7))).unwrap();
+        prepare_frame(&mut app);
+        app.update(Action::BeginSearch).unwrap();
+        for character in "head".chars() {
+            app.update(Action::SearchInsert(character)).unwrap();
+        }
+        app.update(Action::SearchCommit).unwrap();
+        for _ in 0..2 {
+            let _ = app.render_state().unwrap();
+            for _ in 0..32 {
+                if !app.has_background_work() {
+                    break;
+                }
+                app.advance_background().unwrap();
+            }
+            assert!(!app.has_background_work());
+        }
+
+        let state = app.render_state().unwrap();
+        let book = state.book.expect("book metadata remains attached");
+        assert_eq!(book.section_ordinal, None);
+        assert_eq!(book.heading_ranges[0].start(), SourceOffset::from_usize(0));
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        let mut symbols = FrameSymbolMeter::new(u64::MAX);
+        render_body(
+            &mut buffer,
+            area,
+            state.rows,
+            book.heading_ranges,
+            &mut symbols,
+        )
+        .unwrap();
+
+        let primary = buffer.cell((8, 0)).unwrap();
+        assert_eq!(primary.symbol(), "head");
+        assert!(primary.modifier.contains(Modifier::REVERSED));
+        assert!(primary.modifier.contains(Modifier::BOLD));
+        assert!(primary.modifier.contains(Modifier::UNDERLINED));
+
+        let secondary = buffer.cell((8, 1)).unwrap();
+        assert_eq!(secondary.symbol(), "head");
+        assert!(secondary.modifier.contains(Modifier::REVERSED));
+        assert!(secondary.modifier.contains(Modifier::BOLD));
+        assert!(!secondary.modifier.contains(Modifier::UNDERLINED));
+
+        let toc_target = buffer.cell((0, 2)).unwrap();
+        assert_eq!(toc_target.symbol(), "plain");
+        assert_eq!(toc_target.modifier, Modifier::empty());
+
+        let tertiary = buffer.cell((0, 3)).unwrap();
+        assert_eq!(tertiary.symbol(), "body");
+        assert!(tertiary.modifier.contains(Modifier::BOLD));
+        assert!(!tertiary.modifier.contains(Modifier::UNDERLINED));
+        for level in 3..=6 {
+            let style = style_for(Highlight::None, Some(level));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+            assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
+        }
     }
 
     #[test]
@@ -1379,6 +1829,8 @@ mod tests {
         let state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
+            book: None,
+            body_width: 18,
             rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
@@ -1400,6 +1852,8 @@ mod tests {
         let state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
+            book: None,
+            body_width: 48,
             rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
@@ -1431,6 +1885,8 @@ mod tests {
         let state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
+            book: None,
+            body_width: 18,
             rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
@@ -1453,6 +1909,8 @@ mod tests {
         let mut state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
+            book: None,
+            body_width: 40,
             rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
@@ -1479,6 +1937,8 @@ mod tests {
         let mut state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
+            book: None,
+            body_width: 40,
             rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
@@ -1526,6 +1986,8 @@ mod tests {
         let state = RenderState {
             filename: "book.txt",
             path: "/tmp/book.txt",
+            book: None,
+            body_width: 40,
             rows: RenderRowsView::empty(),
             progress: 12,
             current_line: Some(7),
@@ -1549,6 +2011,8 @@ mod tests {
         let state = RenderState {
             filename: "standard input",
             path: "standard input",
+            book: None,
+            body_width: 40,
             rows: RenderRowsView::empty(),
             progress: 100,
             current_line: Some(1),
@@ -1562,6 +2026,78 @@ mod tests {
             header_text(state.filename, state.path, 40).unwrap(),
             "standard input"
         );
+    }
+
+    #[test]
+    fn book_header_falls_back_to_the_sanitized_filename_without_a_title() {
+        let book = BookState {
+            title: None,
+            creator: Some("Ada Author"),
+            section_title: None,
+            section_ordinal: None,
+            section_total: 0,
+            heading_ranges: &[],
+        };
+        assert_eq!(
+            view_header_text("unsafe\u{001b}.epub", "/tmp/unsafe.epub", Some(book), 40,).unwrap(),
+            "unsafe\\x1b.epub — Ada Author"
+        );
+    }
+
+    #[test]
+    fn books_without_sections_show_progress_without_section_commands() {
+        let state = RenderState {
+            filename: "book.epub",
+            path: "/tmp/book.epub",
+            book: Some(BookState {
+                title: Some("The Book"),
+                creator: None,
+                section_title: None,
+                section_ordinal: None,
+                section_total: 0,
+                heading_ranges: &[],
+            }),
+            body_width: 40,
+            rows: RenderRowsView::empty(),
+            progress: 55,
+            current_line: None,
+            total_lines: None,
+            status: SearchStatus::None,
+            activity: None,
+            boundary: Some(ViewportBoundary::Top),
+            repeat: None,
+        };
+        assert_eq!(status_text(&state, 40).unwrap(), "55%");
+        assert_eq!(
+            view_footer_for(SearchStatus::None, false, 40),
+            "q quit  F1 help  / search  j/k  Space/b"
+        );
+    }
+
+    #[test]
+    fn book_status_names_content_before_the_first_section_as_front_matter() {
+        let state = RenderState {
+            filename: "book.epub",
+            path: "/tmp/book.epub",
+            book: Some(BookState {
+                title: Some("The Book"),
+                creator: None,
+                section_title: None,
+                section_ordinal: None,
+                section_total: 26,
+                heading_ranges: &[],
+            }),
+            body_width: 40,
+            rows: RenderRowsView::empty(),
+            progress: 4,
+            current_line: None,
+            total_lines: None,
+            status: SearchStatus::None,
+            activity: None,
+            boundary: Some(ViewportBoundary::Top),
+            repeat: None,
+        };
+        assert_eq!(status_text(&state, 40).unwrap(), "4%  front matter");
     }
 
     #[test]
