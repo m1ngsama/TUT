@@ -407,7 +407,8 @@ fn poll_milliseconds(timeout: Duration) -> libc::c_int {
     if timeout == Duration::MAX {
         return -1;
     }
-    let milliseconds = timeout.as_millis() + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    let milliseconds =
+        timeout.as_millis() + u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000));
     libc::c_int::try_from(milliseconds).unwrap_or(libc::c_int::MAX)
 }
 
@@ -992,6 +993,16 @@ mod tests {
             key_event(KeyCode::Char('q'), KeyModifiers::NONE)
         );
         terminal.disable_raw_mode().unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn poll_timeout_rounds_partial_milliseconds_up() {
+        assert_eq!(poll_milliseconds(Duration::ZERO), 0);
+        assert_eq!(poll_milliseconds(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_milliseconds(Duration::from_millis(1)), 1);
+        assert_eq!(poll_milliseconds(Duration::from_micros(1_001)), 2);
+        assert_eq!(poll_milliseconds(Duration::MAX), -1);
     }
 
     #[test]
