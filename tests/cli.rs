@@ -553,7 +553,10 @@ mod pty {
                                 "PTY child exited before accepting terminal input",
                             ));
                         }
-                        thread::sleep(Duration::from_millis(10));
+                        // Darwin PTYs expose a small input queue. Keep feeding it promptly so a
+                        // test-side backpressure sleep cannot consume the reader's sequence
+                        // deadline while sending an otherwise immediate terminal report.
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) => return Err(error),

@@ -16,6 +16,7 @@ pub(super) struct TerminalInput {
     input: File,
     screen: File,
     original_mode: Option<libc::termios>,
+    input_disconnected: bool,
     buffer: Vec<u8>,
     start: usize,
     ready: Option<Event>,
@@ -32,6 +33,7 @@ impl TerminalInput {
             input,
             screen,
             original_mode: None,
+            input_disconnected: false,
             buffer: Vec::with_capacity(READ_CHUNK_BYTES),
             start: 0,
             ready: None,
@@ -76,6 +78,7 @@ impl TerminalInput {
         raw.c_lflag |= libc::ISIG;
         set_terminal_mode(&self.input, &raw)?;
         self.original_mode = Some(original);
+        self.input_disconnected = false;
         Ok(())
     }
 
@@ -83,7 +86,21 @@ impl TerminalInput {
         let Some(original) = self.original_mode.as_ref() else {
             return Ok(());
         };
-        set_terminal_mode(&self.input, original)?;
+        if let Err(error) = set_terminal_mode(&self.input, original) {
+            // Linux returns EIO once a PTY's last master has closed. At that point the
+            // disconnected terminal can no longer observe raw mode, so there is no live state
+            // left to restore. Confirm the hangup with tcgetattr so a live background terminal's
+            // EIO remains a real cleanup failure.
+            let confirmed_disconnect = self.input_disconnected
+                && error.raw_os_error() == Some(libc::EIO)
+                && matches!(
+                    terminal_mode(&self.input),
+                    Err(probe) if probe.raw_os_error() == Some(libc::EIO)
+                );
+            if !confirmed_disconnect {
+                return Err(error);
+            }
+        }
         self.original_mode = None;
         Ok(())
     }
@@ -203,10 +220,12 @@ impl TerminalInput {
         if active_len >= MAX_SEQUENCE_BYTES {
             let mut extra = [0_u8; 1];
             return match self.input.read(&mut extra) {
-                Ok(0) => Err(input_closed()),
+                Ok(0) => Err(self.mark_input_disconnected()),
                 Ok(_) => Err(sequence_too_large()),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => Err(input_closed()),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                    Err(self.mark_input_disconnected())
+                }
                 Err(error) => Err(error),
             };
         }
@@ -216,7 +235,7 @@ impl TerminalInput {
         let mut bytes = [0_u8; READ_CHUNK_BYTES];
         let requested = available.min(bytes.len());
         match self.input.read(&mut bytes[..requested]) {
-            Ok(0) => Err(input_closed()),
+            Ok(0) => Err(self.mark_input_disconnected()),
             Ok(count) => {
                 self.buffer
                     .try_reserve(count)
@@ -225,9 +244,16 @@ impl TerminalInput {
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => Err(input_closed()),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                Err(self.mark_input_disconnected())
+            }
             Err(error) => Err(error),
         }
+    }
+
+    fn mark_input_disconnected(&mut self) -> io::Error {
+        self.input_disconnected = true;
+        input_closed()
     }
 
     fn consume(&mut self, count: usize) {
@@ -843,6 +869,7 @@ mod tests {
                 input,
                 screen,
                 original_mode: None,
+                input_disconnected: false,
                 buffer: Vec::with_capacity(READ_CHUNK_BYTES),
                 start: 0,
                 ready: None,
@@ -993,6 +1020,27 @@ mod tests {
             key_event(KeyCode::Char('q'), KeyModifiers::NONE)
         );
         terminal.disable_raw_mode().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cleanup_accepts_only_a_confirmed_pty_disconnect() {
+        let (master, mut unconfirmed) = test_terminal_input();
+        unconfirmed.enable_raw_mode().unwrap();
+        drop(master);
+        assert_eq!(
+            unconfirmed.disable_raw_mode().unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+
+        let (master, mut confirmed) = test_terminal_input();
+        confirmed.enable_raw_mode().unwrap();
+        drop(master);
+        let read_error = confirmed.read_available().unwrap_err();
+        assert_eq!(read_error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_error.to_string(), "terminal input closed");
+        confirmed.disable_raw_mode().unwrap();
+        assert!(confirmed.original_mode.is_none());
     }
 
     #[cfg(not(target_os = "macos"))]
